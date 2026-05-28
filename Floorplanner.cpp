@@ -83,9 +83,29 @@ namespace {
     // channel strip, the strip must be at least netCount / CHANNEL_DENSITY wide.
     // Example: 1500 nets need 1500 / 25 = 60um.  This prevents sliver channels
     // such as width=0.25 from being attractive to the router.
-    static constexpr double W_DIRECT_CHANNEL_CAPACITY = 120.0;
+    static constexpr double W_DIRECT_CHANNEL_CAPACITY = 45.0;
     static constexpr double DIRECT_CHANNEL_SAFETY_MARGIN = 1.0;
     static constexpr double MIN_DIRECT_CHANNEL_GUARD_NETS = 25.0;
+
+    // Q&A-aware channel reservation.
+    // A3/A5 clarify that capacity is directional: horizontal tracks consume
+    // channel height, vertical tracks consume channel width.  They also clarify
+    // that demand sharing the same channel space is accumulated, and that a tiny
+    // block-channel overlap window can itself create overflow.  Therefore this
+    // floorplanner now rewards multiple usable channels / port windows rather
+    // than forcing every high-demand pair into one direct gap.
+    static constexpr double W_PORT_WINDOW = 150.0;
+    static constexpr double W_DIRECTIONAL_CHANNEL = 65.0;
+    static constexpr double W_SPLIT_CORRIDOR = 75.0;
+    static constexpr double W_EDGE_INNER_PORT = 220.0;
+    static constexpr double PORT_WINDOW_SAFETY = 1.08;
+    static constexpr double PORT_WINDOW_MIN_NETS = 25.0;
+    static constexpr double CHANNEL_DIR_H_DEMAND_SCALE = 0.62;
+    static constexpr double CHANNEL_DIR_V_DEMAND_SCALE = 0.35;
+    static constexpr double SPLIT_CORRIDOR_H_DEMAND_SCALE = 0.70;
+    static constexpr double SPLIT_CORRIDOR_V_DEMAND_SCALE = 0.45;
+    static constexpr double CHANNEL_RESERVE_MIN_HEIGHT = 2.0;
+    static constexpr double CHANNEL_RESERVE_MIN_WIDTH = 2.0;
 
     // Global sliver guard.  Router must not treat a 0.x um whitespace as a
     // routable channel.  This term detects the actual vertical-strip channels
@@ -97,6 +117,20 @@ namespace {
     static constexpr double W_SOFT_BRIDGE = 80.0;//多容易走softblock 80
     static constexpr double W_COMMON_EDGE = 0.05;
     static constexpr double COMMON_EDGE_GAP = 80.0;
+
+    // FT-aware soft block expansion reservation.
+    // A SOFT block may need extra area after feedthrough insertion.  The existing
+    // ft area penalty tells SA that the block is too small, but it does not make
+    // neighboring whitespace available.  These terms reserve an expanded keep-out
+    // rectangle around high-FT-demand SOFT blocks, so the final router/FT updater
+    // has room to grow the SOFT block without immediately colliding with neighbors.
+    static constexpr double W_SOFT_FT_SPACE = 2.5;
+    static constexpr double SOFT_FT_SPACE_PROXY_WEIGHT = 0.35;
+    static constexpr double SOFT_FT_SPACE_SAFETY = 1.12;
+    static constexpr double SOFT_FT_DEMAND_MARGIN = 90.0;
+    static constexpr double SOFT_FT_MIN_DEMAND = 25.0;
+    static constexpr double SOFT_FT_MAX_DELTA_RATIO = 0.24;
+    static constexpr int SOFT_FT_RESERVE_PASSES = 7;
 
     struct FPState {
         vector<Rect> rects;
@@ -132,7 +166,12 @@ namespace {
         double spacing = 0.0;
         double channelCapacity = 0.0;
         double channelSliver = 0.0;
+        double portWindow = 0.0;
+        double directionalChannel = 0.0;
+        double splitCorridor = 0.0;
+        double edgeInnerPort = 0.0;
         double softBridge = 0.0;
+        double softFTSpace = 0.0;
         double commonEdgeReward = 0.0;
 
         // Fast legality summary filled by evaluateState().
@@ -1518,6 +1557,453 @@ namespace {
         return penalty;
     }
 
+
+    struct ChannelRect {
+        double x = 0.0;
+        double y = 0.0;
+        double w = 0.0;
+        double h = 0.0;
+    };
+
+    static vector<ChannelRect> buildActualChannels(
+        const vector<Rect>& rects,
+        double W,
+        double H
+    ) {
+        vector<ChannelRect> channels;
+        if (rects.empty() || W <= EPS || H <= EPS) return channels;
+
+        vector<double> xs;
+        xs.reserve(rects.size() * 2 + 2);
+        xs.push_back(0.0);
+        xs.push_back(W);
+        for (const Rect& r : rects) {
+            xs.push_back(clampDouble(r.x, 0.0, W));
+            xs.push_back(clampDouble(rectRight(r), 0.0, W));
+        }
+        sort(xs.begin(), xs.end());
+        xs.erase(unique(xs.begin(), xs.end(), [](double a, double b) { return fabs(a - b) < 1.0e-4; }), xs.end());
+
+        for (int i = 0; i + 1 < static_cast<int>(xs.size()); ++i) {
+            const double x1 = xs[i];
+            const double x2 = xs[i + 1];
+            const double cw = x2 - x1;
+            if (cw <= EPS) continue;
+
+            vector<pair<double, double>> covered;
+            covered.reserve(rects.size());
+            for (const Rect& r : rects) {
+                if (rectRight(r) <= x1 + EPS || r.x >= x2 - EPS) continue;
+                double a = clampDouble(r.y, 0.0, H);
+                double b = clampDouble(rectTop(r), 0.0, H);
+                if (b > a + EPS) covered.push_back({ a, b });
+            }
+            sort(covered.begin(), covered.end());
+            vector<pair<double, double>> merged;
+            for (auto [a, b] : covered) addMergedInterval(merged, a, b);
+
+            double yPrev = 0.0;
+            auto addFree = [&](double y1, double y2) {
+                if (y2 <= y1 + EPS) return;
+                channels.push_back(ChannelRect{ x1, y1, cw, y2 - y1 });
+                };
+
+            for (const auto& seg : merged) {
+                double a = max(0.0, seg.first);
+                double b = min(H, seg.second);
+                addFree(yPrev, a);
+                yPrev = max(yPrev, b);
+            }
+            addFree(yPrev, H);
+        }
+        return channels;
+    }
+
+    static bool isEdgeInnerSide(const Rect& r, double W, double H, int edge) {
+        // Edge numbering: 1=left, 2=top, 3=right, 4=bottom.
+        // Q4 says an EDGE block should use only the side facing chip center.
+        const double tol = 1.0e-4;
+        if (fabs(r.y) <= tol) return edge == 2;                 // bottom boundary -> top edge
+        if (fabs(rectTop(r) - H) <= tol) return edge == 4;       // top boundary -> bottom edge
+        if (fabs(r.x) <= tol) return edge == 3;                 // left boundary -> right edge
+        if (fabs(rectRight(r) - W) <= tol) return edge == 1;     // right boundary -> left edge
+
+        // Defensive fallback for corner numerical noise: use the edge whose normal
+        // points most strongly toward the chip center.
+        double cx = rectCx(r), cy = rectCy(r);
+        double distL = cx;
+        double distR = max(0.0, W - cx);
+        double distB = cy;
+        double distT = max(0.0, H - cy);
+        double best = min({ distL, distR, distB, distT });
+        if (best == distL) return edge == 3;
+        if (best == distR) return edge == 1;
+        if (best == distB) return edge == 2;
+        return edge == 4;
+    }
+
+    static bool portSideAllowed(const Design& design, const vector<Rect>& rects, double W, double H, int id, int edge) {
+        if (id < 0 || id >= static_cast<int>(rects.size())) return false;
+        if (design.blockSpecs[id].type != BlockType::EDGE) return true;
+        return isEdgeInnerSide(rects[id], W, H, edge);
+    }
+
+    static double interfaceOverlapOnSide(const Rect& r, const Rect& o, int edge, double tol) {
+        if (edge == 1) {
+            if (fabs(rectRight(o) - r.x) > tol) return 0.0;
+            return overlapLen(r.y, rectTop(r), o.y, rectTop(o));
+        }
+        if (edge == 3) {
+            if (fabs(o.x - rectRight(r)) > tol) return 0.0;
+            return overlapLen(r.y, rectTop(r), o.y, rectTop(o));
+        }
+        if (edge == 2) {
+            if (fabs(o.y - rectTop(r)) > tol) return 0.0;
+            return overlapLen(r.x, rectRight(r), o.x, rectRight(o));
+        }
+        // edge == 4
+        if (fabs(rectTop(o) - r.y) > tol) return 0.0;
+        return overlapLen(r.x, rectRight(r), o.x, rectRight(o));
+    }
+
+    static double availablePortWindowLength(
+        const Design& design,
+        const vector<Rect>& rects,
+        const vector<ChannelRect>& channels,
+        double W,
+        double H,
+        int id
+    ) {
+        if (id < 0 || id >= static_cast<int>(rects.size())) return 0.0;
+        const Rect& r = rects[id];
+        const double tol = 1.0e-3;
+        double length = 0.0;
+
+        for (int edge = 1; edge <= 4; ++edge) {
+            if (!portSideAllowed(design, rects, W, H, id, edge)) continue;
+
+            // Channel interfaces.  This is the most important term because all
+            // non-feedthrough routes must enter/leave through channels.
+            for (const ChannelRect& ch : channels) {
+                Rect cr{ ch.x, ch.y, ch.w, ch.h };
+                length += interfaceOverlapOnSide(r, cr, edge, tol);
+            }
+
+            // Direct block-to-block touching interfaces are legal/useful too.
+            // Count them with a small discount because they are less flexible than
+            // a real channel for later splitting.
+            for (int j = 0; j < static_cast<int>(rects.size()); ++j) {
+                if (j == id) continue;
+                double ov = interfaceOverlapOnSide(r, rects[j], edge, tol);
+                if (ov <= EPS) continue;
+                double scale = 0.55;
+                if (design.blockSpecs[id].type == BlockType::SOFT || design.blockSpecs[j].type == BlockType::SOFT) {
+                    scale = 0.75;
+                }
+                length += scale * ov;
+            }
+        }
+        return length;
+    }
+
+    static double endpointDemand(const Design& design, int id) {
+        double demand = 0.0;
+        for (const auto& c : design.connections) {
+            if (c.src == id || c.dst == id) demand += max(0, c.netCount);
+        }
+        return demand;
+    }
+
+    static double portWindowCapacityPenalty(
+        const Design& design,
+        const vector<Rect>& rects,
+        double W,
+        double H
+    ) {
+        // Q3-3: a 3um edge overlap cannot legally carry 100 nets if it needs 4um.
+        // Q4/Q6: nets can be split, so endpoint capacity is the SUM of usable port
+        // windows over all allowed edges, not a single forced edge.
+        if (rects.empty() || design.connections.empty()) return 0.0;
+        const vector<ChannelRect> channels = buildActualChannels(rects, W, H);
+        double p = 0.0;
+
+        vector<double> endpoint(rects.size(), 0.0);
+        for (const auto& c : design.connections) {
+            if (c.src >= 0 && c.src < static_cast<int>(endpoint.size())) endpoint[c.src] += max(0, c.netCount);
+            if (c.dst >= 0 && c.dst < static_cast<int>(endpoint.size())) endpoint[c.dst] += max(0, c.netCount);
+        }
+
+        for (int id = 0; id < static_cast<int>(rects.size()); ++id) {
+            const double nets = endpoint[id];
+            if (nets < PORT_WINDOW_MIN_NETS) continue;
+            const double reqLen = (nets / CHANNEL_DENSITY) * PORT_WINDOW_SAFETY;
+            const double availLen = availablePortWindowLength(design, rects, channels, W, H, id);
+            if (availLen + EPS < reqLen) {
+                const double miss = reqLen - availLen;
+                p += nets * sqr(miss) * (1.0 + 0.002 * nets);
+            }
+        }
+        return p;
+    }
+
+    static double edgeInnerPortAccessPenalty(
+        const Design& design,
+        const vector<Rect>& rects,
+        double W,
+        double H
+    ) {
+        if (rects.empty()) return 0.0;
+        const vector<ChannelRect> channels = buildActualChannels(rects, W, H);
+        double p = 0.0;
+        for (int id : cachedEdgeOrder(design)) {
+            const double nets = endpointDemand(design, id);
+            if (nets < PORT_WINDOW_MIN_NETS) continue;
+            const double reqLen = (nets / CHANNEL_DENSITY) * PORT_WINDOW_SAFETY;
+            const double availLen = availablePortWindowLength(design, rects, channels, W, H, id);
+            if (availLen + EPS < reqLen) {
+                const double miss = reqLen - availLen;
+                // Stronger than general portWindow because future statement/checker
+                // may disallow non-center-side edge ports.
+                p += nets * sqr(miss);
+            }
+        }
+        return p;
+    }
+
+    struct StripCapacity {
+        double x1 = 0.0;
+        double x2 = 0.0;
+        double capH = 0.0;  // horizontal left-right tracks: channel height * density
+        double capV = 0.0;  // vertical bottom-top tracks: channel width  * density
+    };
+
+    static vector<StripCapacity> buildStripCapacities(
+        const vector<ChannelRect>& channels
+    ) {
+        vector<StripCapacity> strips;
+        for (const ChannelRect& ch : channels) {
+            if (ch.w <= CHANNEL_RESERVE_MIN_WIDTH || ch.h <= CHANNEL_RESERVE_MIN_HEIGHT) continue;
+            int idx = -1;
+            for (int i = 0; i < static_cast<int>(strips.size()); ++i) {
+                if (fabs(strips[i].x1 - ch.x) < 1.0e-4 && fabs(strips[i].x2 - (ch.x + ch.w)) < 1.0e-4) {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx < 0) {
+                StripCapacity sc;
+                sc.x1 = ch.x;
+                sc.x2 = ch.x + ch.w;
+                strips.push_back(sc);
+                idx = static_cast<int>(strips.size()) - 1;
+            }
+            // Correct Q&A interpretation:
+            //   left-right flow uses height capacity, bottom-top flow uses width capacity.
+            strips[idx].capH += CHANNEL_DENSITY * ch.h;
+            strips[idx].capV += CHANNEL_DENSITY * ch.w;
+        }
+        sort(strips.begin(), strips.end(), [](const StripCapacity& a, const StripCapacity& b) {
+            if (fabs(a.x1 - b.x1) > 1.0e-6) return a.x1 < b.x1;
+            return a.x2 < b.x2;
+            });
+        return strips;
+    }
+
+    static double directionalChannelOverflowPenalty(
+        const Design& design,
+        const vector<Rect>& rects,
+        double W,
+        double H
+    ) {
+        // Global water-pipe style pressure.  For each vertical strip, horizontal
+        // demand from every connection crossing that x-cut is SUMMED, matching A3.
+        // Vertical demand is estimated more softly because a net can choose one of
+        // several strips for its vertical trunk; it is distributed across candidate
+        // strips in its bbox.
+        if (rects.empty() || design.connections.empty()) return 0.0;
+        const vector<ChannelRect> channels = buildActualChannels(rects, W, H);
+        vector<StripCapacity> strips = buildStripCapacities(channels);
+        if (strips.empty()) return 0.0;
+
+        vector<double> demandH(strips.size(), 0.0);
+        vector<double> demandV(strips.size(), 0.0);
+        for (const auto& c : design.connections) {
+            if (c.src < 0 || c.dst < 0 || c.src >= static_cast<int>(rects.size()) || c.dst >= static_cast<int>(rects.size())) continue;
+            if (c.netCount <= 0) continue;
+            double sx = rectCx(rects[c.src]);
+            double tx = rectCx(rects[c.dst]);
+            double sy = rectCy(rects[c.src]);
+            double ty = rectCy(rects[c.dst]);
+            double xl = min(sx, tx), xr = max(sx, tx);
+            double yd = fabs(sy - ty);
+
+            vector<int> crossing;
+            for (int i = 0; i < static_cast<int>(strips.size()); ++i) {
+                double mid = 0.5 * (strips[i].x1 + strips[i].x2);
+                if (mid > xl + EPS && mid < xr - EPS) {
+                    demandH[i] += CHANNEL_DIR_H_DEMAND_SCALE * static_cast<double>(c.netCount);
+                    crossing.push_back(i);
+                }
+            }
+
+            // If endpoints overlap in x, still one vertical channel may be needed.
+            if (crossing.empty()) {
+                int best = -1;
+                double bestDist = INF_COST;
+                double target = 0.5 * (sx + tx);
+                for (int i = 0; i < static_cast<int>(strips.size()); ++i) {
+                    double mid = 0.5 * (strips[i].x1 + strips[i].x2);
+                    double d = fabs(mid - target);
+                    if (d < bestDist) {
+                        bestDist = d;
+                        best = i;
+                    }
+                }
+                if (best >= 0) crossing.push_back(best);
+            }
+
+            if (yd > 1.0 && !crossing.empty()) {
+                double share = CHANNEL_DIR_V_DEMAND_SCALE * static_cast<double>(c.netCount) / static_cast<double>(crossing.size());
+                for (int idx : crossing) demandV[idx] += share;
+            }
+        }
+
+        double p = 0.0;
+        for (int i = 0; i < static_cast<int>(strips.size()); ++i) {
+            double oh = max(0.0, demandH[i] - strips[i].capH);
+            double ov = max(0.0, demandV[i] - strips[i].capV);
+            if (oh > EPS) p += sqr(oh) / max(25.0, strips[i].capH);
+            if (ov > EPS) p += sqr(ov) / max(25.0, strips[i].capV);
+        }
+        return p;
+    }
+
+    static double splitCorridorCapacityPenalty(
+        const Design& design,
+        const vector<Rect>& rects,
+        double W,
+        double H
+    ) {
+        // Per-connection bottleneck guard, split-aware.  It does not demand that a
+        // single direct channel carry all nets.  Instead, it sums capacities of all
+        // actual vertical-strip free spaces that lie between the two endpoints.
+        if (rects.empty() || design.connections.empty()) return 0.0;
+        const vector<ChannelRect> channels = buildActualChannels(rects, W, H);
+        vector<StripCapacity> strips = buildStripCapacities(channels);
+        if (strips.empty()) return 0.0;
+
+        double p = 0.0;
+        for (const auto& c : design.connections) {
+            if (c.src < 0 || c.dst < 0 || c.src >= static_cast<int>(rects.size()) || c.dst >= static_cast<int>(rects.size())) continue;
+            if (c.netCount < MIN_DIRECT_CHANNEL_GUARD_NETS) continue;
+
+            double sx = rectCx(rects[c.src]);
+            double tx = rectCx(rects[c.dst]);
+            double sy = rectCy(rects[c.src]);
+            double ty = rectCy(rects[c.dst]);
+            double xl = min(sx, tx), xr = max(sx, tx);
+            double dx = xr - xl;
+            double dy = fabs(sy - ty);
+
+            double minHCut = INF_COST;
+            double sumV = 0.0;
+            int cnt = 0;
+            for (const StripCapacity& sc : strips) {
+                const double mid = 0.5 * (sc.x1 + sc.x2);
+                if (mid > xl + EPS && mid < xr - EPS) {
+                    minHCut = min(minHCut, sc.capH);
+                    sumV += sc.capV;
+                    ++cnt;
+                }
+            }
+            if (cnt == 0) {
+                // Use nearest strip for mostly vertical connections.
+                double target = 0.5 * (sx + tx);
+                double bestDist = INF_COST;
+                for (const StripCapacity& sc : strips) {
+                    double mid = 0.5 * (sc.x1 + sc.x2);
+                    double d = fabs(mid - target);
+                    if (d < bestDist) {
+                        bestDist = d;
+                        minHCut = sc.capH;
+                        sumV = sc.capV;
+                    }
+                }
+                cnt = 1;
+            }
+
+            if (dx > 1.0 && minHCut < INF_COST * 0.5) {
+                const double needH = SPLIT_CORRIDOR_H_DEMAND_SCALE * static_cast<double>(c.netCount);
+                if (minHCut + EPS < needH) {
+                    double miss = needH - minHCut;
+                    p += sqr(miss) / max(25.0, needH);
+                }
+            }
+            if (dy > 1.0) {
+                const double needV = SPLIT_CORRIDOR_V_DEMAND_SCALE * static_cast<double>(c.netCount);
+                if (sumV + EPS < needV) {
+                    double miss = needV - sumV;
+                    p += sqr(miss) / max(25.0, needV);
+                }
+            }
+        }
+        return p;
+    }
+
+    static bool alignEndpointWindowsForConnection(
+        const Design& design,
+        FPState& st,
+        int src,
+        int dst,
+        double strength,
+        double maxStep
+    ) {
+        if (src < 0 || dst < 0 || src >= static_cast<int>(st.rects.size()) || dst >= static_cast<int>(st.rects.size()) || src == dst) return false;
+        bool ms = isMovableForSA(design.blockSpecs[src]);
+        bool md = isMovableForSA(design.blockSpecs[dst]);
+        if (!ms && !md) return false;
+
+        const Rect& a = st.rects[src];
+        const Rect& b = st.rects[dst];
+        double sepX = 0.0;
+        if (rectRight(a) <= b.x) sepX = b.x - rectRight(a);
+        else if (rectRight(b) <= a.x) sepX = a.x - rectRight(b);
+        double sepY = 0.0;
+        if (rectTop(a) <= b.y) sepY = b.y - rectTop(a);
+        else if (rectTop(b) <= a.y) sepY = a.y - rectTop(b);
+
+        bool horizontalFacing = false;
+        if (sepX > EPS && sepY <= EPS) horizontalFacing = true;
+        else if (sepY > EPS && sepX <= EPS) horizontalFacing = false;
+        else horizontalFacing = sepX <= sepY;
+
+        if (horizontalFacing) {
+            // Increase vertical overlap / port window by aligning y centers.
+            double diff = rectCy(b) - rectCy(a);
+            if (fabs(diff) <= 1.0e-3) return false;
+            double mv = clampDouble(diff * strength, -maxStep, maxStep);
+            if (ms && md) {
+                st.rects[src].y += 0.5 * mv;
+                st.rects[dst].y -= 0.5 * mv;
+            }
+            else if (ms) st.rects[src].y += mv;
+            else st.rects[dst].y -= mv;
+        }
+        else {
+            // Increase horizontal overlap / port window by aligning x centers.
+            double diff = rectCx(b) - rectCx(a);
+            if (fabs(diff) <= 1.0e-3) return false;
+            double mv = clampDouble(diff * strength, -maxStep, maxStep);
+            if (ms && md) {
+                st.rects[src].x += 0.5 * mv;
+                st.rects[dst].x -= 0.5 * mv;
+            }
+            else if (ms) st.rects[src].x += mv;
+            else st.rects[dst].x -= mv;
+        }
+        return true;
+    }
+
     static bool closeXSliverGap(const Design& design, FPState& st, int aId, int bId, double snap) {
         Rect& a = st.rects[aId];
         Rect& b = st.rects[bId];
@@ -1655,6 +2141,391 @@ namespace {
             }
         }
         return p;
+    }
+
+
+    static double softFTExpansionDelta(const Design& design, const vector<Rect>& rects, int softId, double ftDemand);
+
+    struct SoftFTGrowthShape {
+        bool active = false;
+        double delta = 0.0;
+        double grownW = 0.0;
+        double grownH = 0.0;
+        double growLeft = 0.0;
+        double growRight = 0.0;
+        double growBottom = 0.0;
+        double growTop = 0.0;
+        double aspect = 1.0;
+        double targetArea = 0.0;
+    };
+
+    static pair<double, double> legalAspectRangeForSoft(const BlockSpec& spec) {
+        double amin = max(0.05, spec.aspectMin);
+        double amax = max(amin, spec.aspectMax);
+        return { amin, amax };
+    }
+
+    static SoftFTGrowthShape softFTGrowthShapeForDemand(
+        const Design& design,
+        const vector<Rect>& rects,
+        int softId,
+        double ftDemand
+    ) {
+        SoftFTGrowthShape g;
+        if (softId < 0 || softId >= static_cast<int>(rects.size())) return g;
+        if (design.blockSpecs[softId].type != BlockType::SOFT) return g;
+
+        const double delta = softFTExpansionDelta(design, rects, softId, ftDemand);
+        if (delta <= EPS) return g;
+
+        const Rect& r = rects[softId];
+        const BlockSpec& spec = design.blockSpecs[softId];
+        auto [amin, amax] = legalAspectRangeForSoft(spec);
+
+        const double curRatioRaw = r.w / max(TINY, r.h);
+        const double curRatio = clampDouble(curRatioRaw, amin, amax);
+
+        // The contest FT equation increases SOFT area as (w + delta) * (h + delta).
+        // However, reserving exactly +delta on both dimensions may move a legal
+        // non-square SOFT block outside its ASPECT RATIO RANGE.  Therefore the
+        // reserve rectangle keeps at least the same required FT area while selecting
+        // a legal final aspect ratio.  When the current shape is legal, choosing a
+        // ratio near the current ratio preserves the user's floorplan shape and is
+        // the least disruptive reservation.
+        const double targetArea0 = max(r.w * r.h, (r.w + delta) * (r.h + delta));
+
+        // For a chosen ratio rho and target area A:
+        //   grownW = sqrt(A * rho), grownH = sqrt(A / rho).
+        // To make this a true expansion, also require grownW >= w and grownH >= h.
+        double lo = max(amin, sqr(r.w) / max(TINY, targetArea0));
+        double hi = min(amax, targetArea0 / max(TINY, sqr(r.h)));
+        double targetArea = targetArea0;
+        double rho = curRatio;
+
+        if (lo <= hi + 1.0e-12) {
+            rho = clampDouble(curRatio, lo, hi);
+        }
+        else {
+            // Rare defensive case: if the estimated target area is too small to
+            // both keep legal aspect and not shrink either dimension, enlarge the
+            // target area minimally.  This can happen only if the current SOFT
+            // shape is already close to/outside its aspect bound or due to numeric
+            // noise after previous repairs.
+            rho = clampDouble(curRatio, amin, amax);
+            targetArea = max({
+                targetArea0,
+                sqr(r.w) / max(TINY, rho),
+                sqr(r.h) * rho
+                });
+        }
+
+        double gw = sqrt(max(1.0, targetArea * rho));
+        double gh = targetArea / max(TINY, gw);
+
+        // Numerical guard: do not allow the predicted grown shape to be smaller
+        // than the current output block.  Recompute the area if this guard changes
+        // either dimension.
+        if (gw + EPS < r.w || gh + EPS < r.h) {
+            gw = max(gw, r.w);
+            gh = max(gh, r.h);
+            targetArea = max(targetArea, gw * gh);
+            rho = clampDouble(gw / max(TINY, gh), amin, amax);
+            gw = sqrt(max(1.0, targetArea * rho));
+            gh = targetArea / max(TINY, gw);
+            gw = max(gw, r.w);
+            gh = max(gh, r.h);
+        }
+
+        g.active = (gw > r.w + EPS || gh > r.h + EPS);
+        g.delta = delta;
+        g.grownW = gw;
+        g.grownH = gh;
+        g.growLeft = 0.5 * max(0.0, gw - r.w);
+        g.growRight = gw - r.w - g.growLeft;
+        g.growBottom = 0.5 * max(0.0, gh - r.h);
+        g.growTop = gh - r.h - g.growBottom;
+        g.aspect = gw / max(TINY, gh);
+        g.targetArea = gw * gh;
+        return g;
+    }
+
+    static Rect expandedSoftFTRect(const Rect& r, const SoftFTGrowthShape& g) {
+        if (!g.active) return r;
+        return Rect{
+            r.x - g.growLeft,
+            r.y - g.growBottom,
+            g.grownW,
+            g.grownH
+        };
+    }
+
+    static vector<double> estimateSoftFTDemandFromCorridors(const Design& design, const vector<Rect>& rects) {
+        // Router-independent FT demand estimate.  It complements congestionCost()
+        // because congestionCost() only returns an area penalty; this function gives
+        // each SOFT block a stable demand number that can be used both by SA cost
+        // and by deterministic whitespace reservation.
+        vector<double> demand(rects.size(), 0.0);
+        if (rects.empty() || design.connections.empty()) return demand;
+
+        for (const auto& c : design.connections) {
+            if (c.src < 0 || c.dst < 0 ||
+                c.src >= static_cast<int>(rects.size()) ||
+                c.dst >= static_cast<int>(rects.size())) {
+                continue;
+            }
+            if (c.netCount <= 0) continue;
+
+            const Rect& a = rects[c.src];
+            const Rect& b = rects[c.dst];
+            const double x1 = min(rectCx(a), rectCx(b));
+            const double x2 = max(rectCx(a), rectCx(b));
+            const double y1 = min(rectCy(a), rectCy(b));
+            const double y2 = max(rectCy(a), rectCy(b));
+
+            // High-demand paths need a wider search corridor, because the router may
+            // intentionally use a SOFT block as a bridge instead of a narrow channel.
+            const double req = requiredChannelWidthForNets(c.netCount);
+            const double margin = SOFT_FT_DEMAND_MARGIN + 0.35 * req;
+            Rect corridor{
+                x1 - margin,
+                y1 - margin,
+                (x2 - x1) + 2.0 * margin,
+                (y2 - y1) + 2.0 * margin
+            };
+
+            for (int k : cachedSoftIds(design)) {
+                if (k == c.src || k == c.dst) continue;
+                const Rect& sft = rects[k];
+                const double inter = rectOverlapArea(corridor, sft);
+                if (inter <= EPS) continue;
+
+                const double ratio = clampDouble(inter / max(1.0, sft.w * sft.h), 0.0, 1.0);
+                // 0.65 is deliberately conservative: this is not real routing, only
+                // a predictor for how much feedthrough pressure may enter the SOFT block.
+                demand[k] += 0.65 * static_cast<double>(c.netCount) * ratio;
+            }
+        }
+        return demand;
+    }
+
+    static double softFTExpansionDelta(const Design& design, const vector<Rect>& rects, int softId, double ftDemand) {
+        if (softId < 0 || softId >= static_cast<int>(rects.size())) return 0.0;
+        if (design.blockSpecs[softId].type != BlockType::SOFT) return 0.0;
+        if (ftDemand < SOFT_FT_MIN_DEMAND) return 0.0;
+
+        const BlockSpec& spec = design.blockSpecs[softId];
+        const Rect& r = rects[softId];
+        const double rate = ftRateForNets(spec, ftDemand);
+
+        // Same base as estimatedFTAreaPenalty(): delta = (nets / density) * rate / 2.
+        // Safety is slightly above 1 so the kept whitespace is usable after numeric
+        // cleanup, sliver closing, and final channel construction.
+        double delta = (ftDemand / CHANNEL_DENSITY) * rate / 2.0;
+        delta *= SOFT_FT_SPACE_SAFETY;
+
+        // Avoid one very noisy corridor estimate from blowing up the outline.
+        const double cap = max(8.0, min(r.w, r.h) * SOFT_FT_MAX_DELTA_RATIO);
+        return clampDouble(delta, 0.0, cap);
+    }
+
+    static double softFTExpansionSpacePenalty(
+        const Design& design,
+        const vector<Rect>& rects,
+        double W,
+        double H
+    ) {
+        // Penalize objects or outline boundaries inside the predicted grown SOFT
+        // rectangle.  This creates real empty whitespace around SOFT blocks instead
+        // of merely increasing their theoretical ft-area term.
+        if (rects.empty() || W <= EPS || H <= EPS) return 0.0;
+
+        vector<double> demand = estimateSoftFTDemandFromCorridors(design, rects);
+        double penalty = 0.0;
+
+        for (int sid : cachedSoftIds(design)) {
+            if (sid < 0 || sid >= static_cast<int>(rects.size())) continue;
+            const SoftFTGrowthShape growth = softFTGrowthShapeForDemand(design, rects, sid, demand[sid]);
+            if (!growth.active) continue;
+
+            const Rect grown = expandedSoftFTRect(rects[sid], growth);
+            const double demandScale = 1.0 + demand[sid] / 500.0;
+
+            const double leftViol = max(0.0, -grown.x);
+            const double botViol = max(0.0, -grown.y);
+            const double rightViol = max(0.0, rectRight(grown) - W);
+            const double topViol = max(0.0, rectTop(grown) - H);
+            const double outlineViol = leftViol + botViol + rightViol + topViol;
+            if (outlineViol > EPS) {
+                penalty += demandScale * (sqr(outlineViol) + outlineViol * max(grown.w, grown.h));
+            }
+
+            for (int j = 0; j < static_cast<int>(rects.size()); ++j) {
+                if (j == sid) continue;
+                const double inter = rectOverlapArea(grown, rects[j]);
+                if (inter <= EPS) continue;
+
+                // HARD/EDGE neighbors are more dangerous because the SOFT block
+                // cannot borrow their area later.  SOFT/SOFT conflicts are still
+                // penalized, but less aggressively because both can reshape.
+                double typeScale = 1.0;
+                if (design.blockSpecs[j].type == BlockType::EDGE ||
+                    design.blockSpecs[j].type == BlockType::HARD) {
+                    typeScale = 1.35;
+                }
+                else if (design.blockSpecs[j].type == BlockType::SOFT) {
+                    typeScale = 0.85;
+                }
+
+                penalty += typeScale * demandScale * inter;
+            }
+        }
+        return penalty;
+    }
+
+    static bool pushRectAwayFromSoft(
+        const Design& design,
+        FPState& st,
+        int softId,
+        int otherId,
+        const Rect& grown,
+        double W,
+        double H
+    ) {
+        if (softId == otherId) return false;
+        Rect& sft = st.rects[softId];
+        Rect& oth = st.rects[otherId];
+
+        const double ox = overlapLen(grown.x, rectRight(grown), oth.x, rectRight(oth));
+        const double oy = overlapLen(grown.y, rectTop(grown), oth.y, rectTop(oth));
+        if (ox <= EPS || oy <= EPS) return false;
+
+        const bool moveOther = isMovableForSA(design.blockSpecs[otherId]);
+        const bool moveSoft = isMovableForSA(design.blockSpecs[softId]);
+        if (!moveOther && !moveSoft) return false;
+
+        const double pad = 1.0;
+        bool horizontal = ox <= oy;
+        double sx = rectCx(sft);
+        double sy = rectCy(sft);
+        double oxC = rectCx(oth);
+        double oyC = rectCy(oth);
+
+        auto moveBlock = [&](int id, double dx, double dy) {
+            st.rects[id].x += dx;
+            st.rects[id].y += dy;
+            };
+
+        if (moveOther) {
+            if (horizontal) {
+                const double dir = (oxC < sx) ? -1.0 : 1.0;
+                moveBlock(otherId, dir * (ox + pad), 0.0);
+            }
+            else {
+                const double dir = (oyC < sy) ? -1.0 : 1.0;
+                moveBlock(otherId, 0.0, dir * (oy + pad));
+            }
+        }
+        else if (moveSoft) {
+            // If the other block is fixed EDGE, move the SOFT block in the opposite
+            // direction.  This is rarer, but prevents FT growth from being trapped
+            // next to a boundary macro.
+            if (horizontal) {
+                const double dir = (sx < oxC) ? -1.0 : 1.0;
+                moveBlock(softId, dir * (ox + pad), 0.0);
+            }
+            else {
+                const double dir = (sy < oyC) ? -1.0 : 1.0;
+                moveBlock(softId, 0.0, dir * (oy + pad));
+            }
+        }
+
+        normalizeOutlineInState(design, st);
+        applyEdgeAndClamp(design, st, W, H);
+        return true;
+    }
+
+    static bool reserveSoftFTExpansionSpace(const Design& design, FPState& st, int maxPasses) {
+        // Deterministic repair: after SA has decided that some SOFT blocks are good
+        // feedthrough bridges, physically reserve their predicted expansion space by
+        // pushing nearby blocks out of the grown rectangle.  It is intentionally
+        // conservative and bounded by maxPasses so it cannot dominate runtime.
+        if (cachedSoftIds(design).empty()) return false;
+
+        bool anyChanged = false;
+        for (int pass = 0; pass < maxPasses; ++pass) {
+            normalizeOutlineInState(design, st);
+            applyEdgeAndClamp(design, st, st.outlineW, st.outlineH);
+
+            vector<double> demand = estimateSoftFTDemandFromCorridors(design, st.rects);
+            vector<int> order = cachedSoftIds(design);
+            sort(order.begin(), order.end(), [&](int a, int b) {
+                return demand[a] > demand[b];
+                });
+
+            bool changed = false;
+            for (int sid : order) {
+                SoftFTGrowthShape growth = softFTGrowthShapeForDemand(design, st.rects, sid, demand[sid]);
+                if (!growth.active) continue;
+
+                Rect grown = expandedSoftFTRect(st.rects[sid], growth);
+
+                // If the grown rectangle slightly exceeds the right/top outline and
+                // legal outline budget remains, expand the outline instead of forcing
+                // a destructive move.  Left/bottom violations are handled by moving
+                // the SOFT block inward because the origin is fixed.
+                double needR = max(0.0, rectRight(grown) - st.outlineW);
+                double needT = max(0.0, rectTop(grown) - st.outlineH);
+                if (needR > EPS && st.outlineW + needR <= design.maxOutlineW + EPS) {
+                    st.outlineW = min(design.maxOutlineW, st.outlineW + needR);
+                    changed = true;
+                }
+                if (needT > EPS && st.outlineH + needT <= design.maxOutlineH + EPS) {
+                    st.outlineH = min(design.maxOutlineH, st.outlineH + needT);
+                    changed = true;
+                }
+                if (grown.x < 0.0 && isMovableForSA(design.blockSpecs[sid])) {
+                    st.rects[sid].x += -grown.x + 1.0;
+                    changed = true;
+                }
+                if (grown.y < 0.0 && isMovableForSA(design.blockSpecs[sid])) {
+                    st.rects[sid].y += -grown.y + 1.0;
+                    changed = true;
+                }
+
+                normalizeOutlineInState(design, st);
+                applyEdgeAndClamp(design, st, st.outlineW, st.outlineH);
+                growth = softFTGrowthShapeForDemand(design, st.rects, sid, demand[sid]);
+                grown = expandedSoftFTRect(st.rects[sid], growth);
+
+                // Push the worst conflicts first.
+                vector<int> others(st.rects.size());
+                iota(others.begin(), others.end(), 0);
+                sort(others.begin(), others.end(), [&](int a, int b) {
+                    if (a == sid) return false;
+                    if (b == sid) return true;
+                    return rectOverlapArea(grown, st.rects[a]) > rectOverlapArea(grown, st.rects[b]);
+                    });
+
+                for (int oid : others) {
+                    if (oid == sid) continue;
+                    if (rectOverlapArea(grown, st.rects[oid]) <= EPS) continue;
+                    if (pushRectAwayFromSoft(design, st, sid, oid, grown, st.outlineW, st.outlineH)) {
+                        changed = true;
+                        growth = softFTGrowthShapeForDemand(design, st.rects, sid, demand[sid]);
+                        grown = expandedSoftFTRect(st.rects[sid], growth);
+                    }
+                }
+            }
+
+            if (changed) {
+                anyChanged = true;
+                spreadRepair(design, st, 18);
+            }
+            else {
+                break;
+            }
+        }
+        return anyChanged;
     }
 
     static bool reserveXGapForPair(const Design& design, FPState& st, int aId, int bId, double req) {
@@ -1865,7 +2736,12 @@ namespace {
         cb.spacing = minGapPenalty(rects, 90.0);/////////////////////////////was 80.0
         cb.channelCapacity = directChannelCapacityPenalty(design, rects);
         cb.channelSliver = actualChannelSliverPenalty(design, rects, W, H);
+        cb.portWindow = portWindowCapacityPenalty(design, rects, W, H);
+        cb.directionalChannel = directionalChannelOverflowPenalty(design, rects, W, H);
+        cb.splitCorridor = splitCorridorCapacityPenalty(design, rects, W, H);
+        cb.edgeInnerPort = edgeInnerPortAccessPenalty(design, rects, W, H);
         cb.softBridge = softBridgePenalty(design, rects);
+        cb.softFTSpace = softFTExpansionSpacePenalty(design, rects, W, H);
         cb.commonEdgeReward = commonEdgeLikeScore(design, rects);
 
         // Slight center pull to avoid all blocks drifting to far edges when HPWL ties.
@@ -1890,7 +2766,12 @@ namespace {
             W_CHANNEL_SPACING * cb.spacing +
             W_DIRECT_CHANNEL_CAPACITY * cb.channelCapacity +
             W_GLOBAL_CHANNEL_SLIVER * cb.channelSliver +
-            W_SOFT_BRIDGE * cb.softBridge -
+            W_PORT_WINDOW * cb.portWindow +
+            W_DIRECTIONAL_CHANNEL * cb.directionalChannel +
+            W_SPLIT_CORRIDOR * cb.splitCorridor +
+            W_EDGE_INNER_PORT * cb.edgeInnerPort +
+            W_SOFT_BRIDGE * cb.softBridge +
+            W_SOFT_FT_SPACE * cb.softFTSpace -
             W_COMMON_EDGE * cb.commonEdgeReward +
             W_CENTER * centerCost;
 
@@ -1914,8 +2795,13 @@ namespace {
             (3.000 * sqrt(congFactor)) * cb.peak +
             0.001 * cb.ft +
             0.030 * cb.spacing +
-            25.000 * cb.channelCapacity +
-            5.000 * cb.softBridge -
+            10.000 * cb.channelCapacity +
+            8.000 * cb.portWindow +
+            12.000 * cb.directionalChannel +
+            10.000 * cb.splitCorridor +
+            12.000 * cb.edgeInnerPort +
+            5.000 * cb.softBridge +
+            SOFT_FT_SPACE_PROXY_WEIGHT * cb.softFTSpace -
             0.003 * cb.commonEdgeReward;
     }
 
@@ -2363,7 +3249,12 @@ namespace {
         if (cand.ft > anchor.ft * 2.00 + 50000.0) return false;
         if (cand.spacing > anchor.spacing * 1.50 + 3000.0) return false;
         if (cand.channelCapacity > anchor.channelCapacity * 1.15 + 1000.0) return false;
+        if (cand.portWindow > anchor.portWindow * 1.40 + 2500.0) return false;
+        if (cand.directionalChannel > anchor.directionalChannel * 1.45 + 2500.0) return false;
+        if (cand.splitCorridor > anchor.splitCorridor * 1.45 + 2500.0) return false;
+        if (cand.edgeInnerPort > anchor.edgeInnerPort * 1.35 + 1000.0) return false;
         if (cand.softBridge > anchor.softBridge * 2.50 + 100.0) return false;
+        if (cand.softFTSpace > anchor.softFTSpace * 1.35 + 2500.0) return false;
         return true;
     }
 
@@ -2559,6 +3450,7 @@ namespace {
             << " cong " << anchor.congestion << " -> " << bestCost.congestion
             << " peak " << anchor.peak << " -> " << bestCost.peak
             << " ft " << anchor.ft << " -> " << bestCost.ft
+            << " ftSpace " << anchor.softFTSpace << " -> " << bestCost.softFTSpace
             << "\n";
         return best;
     }
@@ -2672,7 +3564,183 @@ namespace {
             << " area " << anchor.area << " -> " << bestCost.area
             << " hpwl " << anchor.hpwl << " -> " << bestCost.hpwl
             << " cong " << anchor.congestion << " -> " << bestCost.congestion
-            << " ft " << anchor.ft << " -> " << bestCost.ft << "\n";
+            << " ft " << anchor.ft << " -> " << bestCost.ft
+            << " ftSpace " << anchor.softFTSpace << " -> " << bestCost.softFTSpace << "\n";
+        return best;
+    }
+
+
+    static FPState softFTExpansionPolish(const Design& design, FPState start, mt19937& rng) {
+        (void)rng;
+        normalizeOutlineInState(design, start);
+        applyEdgeAndClamp(design, start, start.outlineW, start.outlineH);
+        spreadRepair(design, start, 120);
+
+        CostBreakdown anchor = evaluateState(design, start);
+        if (!costPlacementLegal(anchor)) return start;
+
+        FPState best = start;
+        CostBreakdown bestCost = anchor;
+        double bestProxy = floorplanProxyScore(design, bestCost);
+
+        // Try a few deterministic reservation passes.  Accept a result if it really
+        // reduces predicted FT expansion conflict, or if it improves the normal proxy.
+        // A small area increase is allowed because reserving FT growth space is the
+        // goal of this polish.
+        for (int round = 0; round < 4; ++round) {
+            FPState cand = best;
+            bool changed = reserveSoftFTExpansionSpace(design, cand, SOFT_FT_RESERVE_PASSES);
+            if (!changed) break;
+
+            normalizeOutlineInState(design, cand);
+            applyEdgeAndClamp(design, cand, cand.outlineW, cand.outlineH);
+            spreadRepair(design, cand, 70);
+
+            CostBreakdown cc = evaluateState(design, cand);
+            if (!costPlacementLegal(cc)) continue;
+            if (cc.area > anchor.area * 1.045 + 1.0) continue;
+            if (cc.hpwl > anchor.hpwl * 1.120 + 8000.0) continue;
+            if (anchor.congestion < 1.0e-6) {
+                if (cc.congestion > 3500.0) continue;
+            }
+            else if (cc.congestion > anchor.congestion * 1.55 + 12000.0) {
+                continue;
+            }
+            if (anchor.peak < 1.0e-6) {
+                if (cc.peak > 65.0) continue;
+            }
+            else if (cc.peak > anchor.peak * 1.45 + 25.0) {
+                continue;
+            }
+            if (cc.channelCapacity > anchor.channelCapacity * 1.25 + 1800.0) continue;
+            if (cc.softBridge > anchor.softBridge * 2.80 + 180.0) continue;
+            if (cc.ft > anchor.ft * 1.35 + 80000.0) continue;
+
+            const double proxy = floorplanProxyScore(design, cc);
+            const bool proxyBetter = proxy + 1e-4 < bestProxy;
+            const bool ftSpaceBetter = cc.softFTSpace + 1e-4 < bestCost.softFTSpace * 0.78;
+            const bool acceptableCost = proxy <= bestProxy + anchor.area * 0.030;
+
+            if (proxyBetter || (ftSpaceBetter && acceptableCost)) {
+                best = std::move(cand);
+                bestCost = cc;
+                bestProxy = proxy;
+            }
+            else {
+                break;
+            }
+        }
+
+        cerr << "[SoftFTReserve] ftSpace " << anchor.softFTSpace
+            << " -> " << bestCost.softFTSpace
+            << " ft " << anchor.ft << " -> " << bestCost.ft
+            << " proxy " << floorplanProxyScore(design, anchor)
+            << " -> " << floorplanProxyScore(design, bestCost)
+            << " area " << anchor.area << " -> " << bestCost.area
+            << " cong " << anchor.congestion << " -> " << bestCost.congestion
+            << "\n";
+        return best;
+    }
+
+
+    static FPState channelReservationPolish(const Design& design, FPState start, mt19937& rng) {
+        (void)rng;
+        normalizeOutlineInState(design, start);
+        applyEdgeAndClamp(design, start, start.outlineW, start.outlineH);
+        spreadRepair(design, start, 120);
+
+        CostBreakdown anchor = evaluateState(design, start);
+        if (!costPlacementLegal(anchor)) return start;
+        FPState best = start;
+        CostBreakdown bestCost = anchor;
+        double bestProxy = floorplanProxyScore(design, bestCost);
+
+        vector<int> order(design.connections.size());
+        iota(order.begin(), order.end(), 0);
+        sort(order.begin(), order.end(), [&](int ia, int ib) {
+            return design.connections[ia].netCount > design.connections[ib].netCount;
+            });
+
+        const double minAllowedArea = anchor.area * 0.90;
+        vector<double> strengths = { 0.80, 0.55, 0.35, 0.22 };
+        for (double strength : strengths) {
+            bool improved = true;
+            int pass = 0;
+            while (improved && pass++ < 2) {
+                improved = false;
+
+                // First try to increase source/destination overlap windows by
+                // aligning the connected blocks.  This directly targets A3-3.
+                for (int idx : order) {
+                    const auto& c = design.connections[idx];
+                    if (c.netCount < MIN_DIRECT_CHANNEL_GUARD_NETS) continue;
+                    FPState cand = best;
+                    double maxStep = max(2.0, min(cand.outlineW, cand.outlineH) * (0.006 + 0.018 * strength));
+                    if (!alignEndpointWindowsForConnection(design, cand, c.src, c.dst, strength, maxStep)) continue;
+                    normalizeOutlineInState(design, cand);
+                    applyEdgeAndClamp(design, cand, cand.outlineW, cand.outlineH);
+                    spreadRepair(design, cand, 24);
+                    CostBreakdown cc = evaluateState(design, cand);
+                    if (!costPlacementLegal(cc)) continue;
+                    if (!shrinkQualityGuard(cc, anchor, minAllowedArea)) continue;
+                    double proxy = floorplanProxyScore(design, cc);
+                    bool channelBetter =
+                        cc.portWindow + cc.directionalChannel + cc.splitCorridor + cc.edgeInnerPort + 1e-4 <
+                        bestCost.portWindow + bestCost.directionalChannel + bestCost.splitCorridor + bestCost.edgeInnerPort;
+                    if (proxy + 1e-4 < bestProxy || (channelBetter && proxy <= bestProxy + anchor.area * 0.018)) {
+                        best = std::move(cand);
+                        bestCost = cc;
+                        bestProxy = proxy;
+                        improved = true;
+                    }
+                }
+
+                // Then try opening channel space around hot vertical strips by
+                // nudging movable blocks away from the strip center.  This is a
+                // conservative geometry-only repair; it accepts only proxy/channel
+                // improvements.
+                const vector<ChannelRect> channels = buildActualChannels(best.rects, best.outlineW, best.outlineH);
+                vector<StripCapacity> strips = buildStripCapacities(channels);
+                if (!strips.empty()) {
+                    vector<int> ids = cachedMovableIds(design);
+                    for (int id : ids) {
+                        for (const StripCapacity& sc : strips) {
+                            double mid = 0.5 * (sc.x1 + sc.x2);
+                            const Rect& r = best.rects[id];
+                            if (r.x > sc.x2 + 40.0 || rectRight(r) < sc.x1 - 40.0) continue;
+                            FPState cand = best;
+                            double dir = (rectCx(r) < mid) ? -1.0 : 1.0;
+                            double step = max(1.5, min(best.outlineW, best.outlineH) * 0.0035 * strength);
+                            cand.rects[id].x += dir * step;
+                            normalizeOutlineInState(design, cand);
+                            applyEdgeAndClamp(design, cand, cand.outlineW, cand.outlineH);
+                            spreadRepair(design, cand, 18);
+                            CostBreakdown cc = evaluateState(design, cand);
+                            if (!costPlacementLegal(cc)) continue;
+                            if (!shrinkQualityGuard(cc, anchor, minAllowedArea)) continue;
+                            double proxy = floorplanProxyScore(design, cc);
+                            bool channelBetter =
+                                cc.directionalChannel + cc.splitCorridor + 1e-4 <
+                                bestCost.directionalChannel + bestCost.splitCorridor;
+                            if (proxy + 1e-4 < bestProxy || (channelBetter && proxy <= bestProxy + anchor.area * 0.012)) {
+                                best = std::move(cand);
+                                bestCost = cc;
+                                bestProxy = proxy;
+                                improved = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        cerr << "[ChannelReservePolish] port " << anchor.portWindow << " -> " << bestCost.portWindow
+            << " dir " << anchor.directionalChannel << " -> " << bestCost.directionalChannel
+            << " split " << anchor.splitCorridor << " -> " << bestCost.splitCorridor
+            << " edgePort " << anchor.edgeInnerPort << " -> " << bestCost.edgeInnerPort
+            << " proxy " << floorplanProxyScore(design, anchor) << " -> " << floorplanProxyScore(design, bestCost)
+            << " area " << anchor.area << " -> " << bestCost.area
+            << " hpwl " << anchor.hpwl << " -> " << bestCost.hpwl << "\n";
         return best;
     }
 
@@ -2683,9 +3751,11 @@ namespace {
         // spreadRepair can move non-edge blocks; run edge legalization one more
         // time before committing the rectangles to design.blocks.
         applyEdgeAndClamp(design, st, st.outlineW, st.outlineH);
+        reserveSoftFTExpansionSpace(design, st, SOFT_FT_RESERVE_PASSES);
         closeNumericalSliverGaps(design, st, 10);
         reserveDirectConnectionChannels(design, st, 8);
         spreadRepair(design, st, 80);
+        reserveSoftFTExpansionSpace(design, st, max(2, SOFT_FT_RESERVE_PASSES / 2));
         closeNumericalSliverGaps(design, st, 6);
         reserveDirectConnectionChannels(design, st, 5);
         applyEdgeAndClamp(design, st, st.outlineW, st.outlineH);
@@ -2821,7 +3891,12 @@ void Floorplanner::run(Design& design) {
             << " peak=" << bestCost.peak
             << " overlapTerm=" << bestCost.overlap
             << " ftArea=" << bestCost.ft
+            << " ftSpace=" << bestCost.softFTSpace
             << " channelCap=" << bestCost.channelCapacity
+            << " port=" << bestCost.portWindow
+            << " dirChan=" << bestCost.directionalChannel
+            << " split=" << bestCost.splitCorridor
+            << " edgePort=" << bestCost.edgeInnerPort
             << " bridge=" << bestCost.softBridge
             << " commonEdge=" << bestCost.commonEdgeReward
             << " legal=" << (costPlacementLegal(bestCost) ? "Y" : "N")
@@ -2869,6 +3944,8 @@ void Floorplanner::run(Design& design) {
         mt19937 shrinkRng(seedBase ^ 0x5a5a1234u);
         globalBest = guardedOutlineShrink(design, globalBest, shrinkRng);
         globalBest = localProxyPolish(design, globalBest, shrinkRng);
+        globalBest = softFTExpansionPolish(design, globalBest, shrinkRng);
+        globalBest = channelReservationPolish(design, globalBest, shrinkRng);
         globalBestCost = evaluateState(design, globalBest);
         globalBestProxy = floorplanProxyScore(design, globalBestCost);
     }
