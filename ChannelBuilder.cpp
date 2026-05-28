@@ -1,9 +1,31 @@
 #include "ChannelBuilder.hpp"
 #include "Utility.hpp"
+
 #include <algorithm>
 #include <cmath>
 
 using namespace std;
+
+namespace {
+
+    // Channel geometry is produced exactly as Problem E describes:
+    // collect all block left/right x-edges, sweep each vertical strip, and emit
+    // every unblocked rectangle as one CH*.
+    //
+    // Important: direction-aware capacity is NOT fully representable by the old
+    // scalar Channel::capacity field.  The real capacities are:
+    //   LR component, edge 1 <-> 3 : rect.w * CHANNEL_DENSITY
+    //   TB component, edge 2 <-> 4 : rect.h * CHANNEL_DENSITY
+    // The evaluator/router should compute these two values from ch.rect.
+    //
+    // ChannelBuilder only owns static geometry.  It initializes the legacy scalar
+    // capacity conservatively so old diagnostics/router code does not become too
+    // optimistic before the router is upgraded to directional usage.
+    static double legacyScalarCapacity(const Rect& r) {
+        return max(0.0, min(r.w, r.h)) * CHANNEL_DENSITY;
+    }
+
+} // namespace
 
 void ChannelBuilder::build(Design& design) {
     design.channels.clear();
@@ -24,11 +46,15 @@ void ChannelBuilder::build(Design& design) {
             double a = max(0.0, seg.first);
             double b = min(design.outlineH, seg.second);
 
-            if (a - yPrev > EPS) addChannel(design, ++chCount, x1, yPrev, x2 - x1, a - yPrev);
+            if (a - yPrev > EPS) {
+                addChannel(design, ++chCount, x1, yPrev, x2 - x1, a - yPrev);
+            }
             yPrev = max(yPrev, b);
         }
 
-        if (design.outlineH - yPrev > EPS) addChannel(design, ++chCount, x1, yPrev, x2 - x1, design.outlineH - yPrev);
+        if (design.outlineH - yPrev > EPS) {
+            addChannel(design, ++chCount, x1, yPrev, x2 - x1, design.outlineH - yPrev);
+        }
     }
 }
 
@@ -45,7 +71,9 @@ vector<double> ChannelBuilder::collectXEdges(const Design& design) const {
     }
 
     sort(xs.begin(), xs.end());
-    xs.erase(unique(xs.begin(), xs.end(), [](double a, double b) { return fabs(a - b) < 1e-6; }), xs.end());
+    xs.erase(unique(xs.begin(), xs.end(), [](double a, double b) {
+        return fabs(a - b) < 1e-6;
+        }), xs.end());
     return xs;
 }
 
@@ -58,7 +86,7 @@ vector<pair<double, double>> ChannelBuilder::collectCoveredYIntervals(double x1,
 
         double y1 = max(0.0, b.rect.y);
         double y2 = min(design.outlineH, rectTop(b.rect));
-        if (y2 - y1 > EPS) intervals.push_back({y1, y2});
+        if (y2 - y1 > EPS) intervals.push_back({ y1, y2 });
     }
 
     return intervals;
@@ -72,7 +100,8 @@ vector<pair<double, double>> ChannelBuilder::mergeIntervals(vector<pair<double, 
     for (const auto& in : intervals) {
         if (merged.empty() || in.first > merged.back().second + EPS) {
             merged.push_back(in);
-        } else {
+        }
+        else {
             merged.back().second = max(merged.back().second, in.second);
         }
     }
@@ -84,7 +113,15 @@ void ChannelBuilder::addChannel(Design& design, int id, double x, double y, doub
 
     Channel ch;
     ch.name = "CH" + to_string(id);
-    ch.rect = {x, y, w, h};
-    ch.capacity = h * CHANNEL_DENSITY;
+    ch.rect = { x, y, w, h };
+
+    // Legacy scalar only.  Directional capacities are derived from ch.rect by
+    // Evaluator and, ideally, by Router:
+    //   capLR = h * CHANNEL_DENSITY;
+    //   capTB = w * CHANNEL_DENSITY.
+    ch.capacity = legacyScalarCapacity(ch.rect);
+    ch.usedNets = 0.0;
+    ch.overflow = 0.0;
+
     design.channels.push_back(ch);
 }

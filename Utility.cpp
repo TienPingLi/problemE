@@ -60,13 +60,16 @@ vector<string> splitCSVLine(const string& line) {
             if (inQuote && i + 1 < line.size() && line[i + 1] == '"') {
                 cur.push_back('"');
                 ++i;
-            } else {
+            }
+            else {
                 inQuote = !inQuote;
             }
-        } else if (c == ',' && !inQuote) {
+        }
+        else if (c == ',' && !inQuote) {
             cells.push_back(trim(cur));
             cur.clear();
-        } else {
+        }
+        else {
             cur.push_back(c);
         }
     }
@@ -81,7 +84,8 @@ vector<string> splitByCommaOrSlash(string s) {
         if (c == ',' || c == '/' || c == ';') {
             if (!trim(cur).empty()) out.push_back(trim(cur));
             cur.clear();
-        } else {
+        }
+        else {
             cur.push_back(c);
         }
     }

@@ -53,7 +53,7 @@ struct BlockSpec {
     // index 1: >3000 && <=6000
     // index 2: >6000 && <=9000
     // index 3: >9000
-    double ftRate[4] = {0.20, 0.40, 0.80, 1.00};
+    double ftRate[4] = { 0.20, 0.40, 0.80, 1.00 };
 };
 
 struct BlockInst {

@@ -28,7 +28,7 @@ bool Parser::read(const string& inputPath, Design& design) {
 
     if (design.maxOutlineW <= EPS || design.maxOutlineH <= EPS) {
         cerr << "[Parser] Invalid outline. maxOutlineW=" << design.maxOutlineW
-             << " maxOutlineH=" << design.maxOutlineH << "\n";
+            << " maxOutlineH=" << design.maxOutlineH << "\n";
         return false;
     }
 
@@ -97,7 +97,8 @@ bool Parser::parseAspectRange(const vector<string>& row, double& amin, double& a
                 if (c == ',') {
                     if (!trim(cur).empty()) parts.push_back(trim(cur));
                     cur.clear();
-                } else {
+                }
+                else {
                     cur.push_back(c);
                 }
             }
@@ -182,7 +183,8 @@ void Parser::parseBlockRows(const vector<vector<string>>& rows, Design& design) 
             spec.hasFixedSize = true;
             spec.fixedW = w;
             spec.fixedH = h;
-        } else if (w > EPS && h > EPS && fabs(w * h - spec.area) / max(1.0, spec.area) < 0.50) {
+        }
+        else if (w > EPS && h > EPS && fabs(w * h - spec.area) / max(1.0, spec.area) < 0.50) {
             spec.hasFixedSize = true;
             spec.fixedW = w;
             spec.fixedH = h;
@@ -193,10 +195,12 @@ void Parser::parseBlockRows(const vector<vector<string>>& rows, Design& design) 
         if (parseAspectRange(row, amin, amax)) {
             spec.aspectMin = amin;
             spec.aspectMax = amax;
-        } else if (type == BlockType::SOFT) {
+        }
+        else if (type == BlockType::SOFT) {
             spec.aspectMin = 0.5;
             spec.aspectMax = 2.0;
-        } else {
+        }
+        else {
             spec.aspectMin = 1.0;
             spec.aspectMax = 1.0;
         }
@@ -206,7 +210,8 @@ void Parser::parseBlockRows(const vector<vector<string>>& rows, Design& design) 
         vector<double> rates = parsePercentRates(row);
         if (rates.size() >= 4) {
             for (int i = 0; i < 4; ++i) spec.ftRate[i] = rates[i];
-        } else {
+        }
+        else {
             vector<double> maybeRates;
             for (double v : nums) {
                 if (v == 20.0 || v == 40.0 || v == 80.0 || v == 100.0) {
@@ -222,7 +227,7 @@ void Parser::parseBlockRows(const vector<vector<string>>& rows, Design& design) 
     }
 
     sort(design.blockSpecs.begin(), design.blockSpecs.end(),
-         [](const BlockSpec& a, const BlockSpec& b) { return a.name < b.name; });
+        [](const BlockSpec& a, const BlockSpec& b) { return a.name < b.name; });
 }
 
 void Parser::parseOutline(const vector<vector<string>>& rows, Design& design) {
@@ -331,7 +336,7 @@ void Parser::buildConnections(Design& design) {
     for (int i = 0; i < n; ++i) {
         for (int j = 0; j < static_cast<int>(design.connMatrix[i].size()); ++j) {
             int nets = design.connMatrix[i][j];
-            if (nets > 0) design.connections.push_back({i, j, nets});
+            if (nets > 0) design.connections.push_back({ i, j, nets });
         }
     }
 }
