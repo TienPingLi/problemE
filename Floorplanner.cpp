@@ -1723,19 +1723,105 @@ void Floorplanner::run(Design& design) {
         }
         };
 
+    struct CandidatePlan {
+        int shapeIdx = 0;
+        int orderIdx = 0;
+        double W = 0.0;
+        double H = 0.0;
+        double area = 0.0;
+        unsigned hash = 0;
+    };
+
+    int lastCandidatePool = 0;
+    int lastCandidateGroups = 0;
+    int lastRankDepth = 0;
+
     auto runPass = [&](bool strictEdge, int stopAfterTried) {
-        for (const ShapeState& st : shapes) {
+        // Balanced N^2 scheduler.
+        // Old nested order was shape -> order -> W -> H, so the first 900 trials
+        // mostly covered only the first few orders.  That made orders=38 look good
+        // in the log but effective diversity was low.  This scheduler groups by
+        // (shape, order), sorts each group's W/H candidates by area, then tries
+        // rank-0 for every group, rank-1 for every group, etc.  Therefore the same
+        // N^2 runtime budget covers many more topology/order perturbations.
+        vector<vector<CandidatePlan>> groups;
+        groups.resize(max(1, static_cast<int>(shapes.size() * orders.size())));
+
+        const double minSearchArea = totalNominalArea(design) * 1.06;
+        int pool = 0;
+        for (int si = 0; si < static_cast<int>(shapes.size()); ++si) {
+            const ShapeState& st = shapes[si];
             vector<double> widths = makeWidthTrials(design, st);
-            for (const vector<int>& order : orders) {
+            for (int oi = 0; oi < static_cast<int>(orders.size()); ++oi) {
+                int gidx = si * static_cast<int>(orders.size()) + oi;
                 for (double W : widths) {
                     vector<double> heights = makeHeightTrials(design, st, W);
                     for (double H : heights) {
-                        if (tried >= stopAfterTried && have && best.legal) return;
-                        if (tried >= maxCandidates && have) return;
-                        tryCandidate(st, order, W, H, strictEdge);
+                        if (W > design.maxOutlineW + EPS || H > design.maxOutlineH + EPS) continue;
+                        double area = W * H;
+                        if (area + EPS < minSearchArea) continue;
+                        CandidatePlan cp;
+                        cp.shapeIdx = si;
+                        cp.orderIdx = oi;
+                        cp.W = W;
+                        cp.H = H;
+                        cp.area = area;
+                        // Deterministic tie-breaker: interleave W/H choices so
+                        // same-area candidates do not all come from one width band.
+                        unsigned x = static_cast<unsigned>(si * 73856093u) ^
+                            static_cast<unsigned>(oi * 19349663u) ^
+                            static_cast<unsigned>(llround(W * 17.0)) ^
+                            static_cast<unsigned>(llround(H * 31.0));
+                        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
+                        cp.hash = x;
+                        groups[gidx].push_back(cp);
+                        ++pool;
                     }
                 }
             }
+        }
+
+        vector<int> groupOrder;
+        groupOrder.reserve(groups.size());
+        for (int g = 0; g < static_cast<int>(groups.size()); ++g) {
+            auto& vec = groups[g];
+            if (vec.empty()) continue;
+            sort(vec.begin(), vec.end(), [](const CandidatePlan& a, const CandidatePlan& b) {
+                if (fabs(a.area - b.area) > 1.0) return a.area < b.area;
+                return a.hash < b.hash;
+                });
+            groupOrder.push_back(g);
+        }
+
+        // Deterministically shuffle group order to avoid always favoring shape 0
+        // or the first deterministic orders when the pass stops at n^2.
+        mt19937 schedRng(FAST_SEED ^ (strictEdge ? 0x13572468u : 0x24681357u) ^ static_cast<unsigned>(nBlocks * 101u));
+        shuffle(groupOrder.begin(), groupOrder.end(), schedRng);
+
+        lastCandidatePool = pool;
+        lastCandidateGroups = static_cast<int>(groupOrder.size());
+        lastRankDepth = 0;
+
+        int maxRank = 0;
+        for (int g : groupOrder) maxRank = max(maxRank, static_cast<int>(groups[g].size()));
+        for (int rank = 0; rank < maxRank; ++rank) {
+            bool anyAtRank = false;
+            for (int g : groupOrder) {
+                if (rank >= static_cast<int>(groups[g].size())) continue;
+                anyAtRank = true;
+                const CandidatePlan& cp = groups[g][rank];
+                if (tried >= stopAfterTried && have && best.legal) {
+                    lastRankDepth = max(lastRankDepth, rank + 1);
+                    return;
+                }
+                if (tried >= maxCandidates && have) {
+                    lastRankDepth = max(lastRankDepth, rank + 1);
+                    return;
+                }
+                tryCandidate(shapes[cp.shapeIdx], orders[cp.orderIdx], cp.W, cp.H, strictEdge);
+            }
+            if (!anyAtRank) break;
+            lastRankDepth = rank + 1;
         }
         };
 
@@ -1747,6 +1833,9 @@ void Floorplanner::run(Design& design) {
             << " triedDelta=" << (tried - triedBefore)
             << " packedDelta=" << (packed - packedBefore)
             << " legalDelta=" << (legalNow - legalBefore)
+            << " pool=" << lastCandidatePool
+            << " groups=" << lastCandidateGroups
+            << " rankDepth=" << lastRankDepth
             << " totalTried=" << tried
             << " totalPacked=" << packed
             << " strictPacked=" << strictPacked
