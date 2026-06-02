@@ -6,8 +6,10 @@
 #include "Evaluator.hpp"
 #include "OutputWriter.hpp"
 #include "Logger.hpp"
+#include "RouterV2.hpp"
 
 #include <chrono>
+#include <cctype>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
@@ -19,19 +21,48 @@
 using namespace std;
 namespace fs = std::filesystem;
 
+enum class RouterMode {
+    Baseline,
+    RouterV2
+};
+
 struct Options {
     string inputPath;
     string outputPath = "output.cfg";
     double alpha = 0.2;
+    RouterMode routerMode = RouterMode::RouterV2;
 };
 
 static void printUsage() {
     cerr << "Usage:\n";
-    cerr << "  ./solver input.csv -o output.cfg --alpha 0.2\n";
-    cerr << "  ./solver input.csv -o output_folder --alpha 0.2\n";
+    cerr << "  ./solver input.csv -o output.cfg --alpha 0.2 --router-mode routerv2\n";
+    cerr << "  ./solver input.csv -o output_folder --alpha 0.2 --router-mode baseline\n";
+    cerr << "\n";
+    cerr << "Router modes:\n";
+    cerr << "  baseline : original floorplanner + baseline Router final output\n";
+    cerr << "  routerv2 : Phase1-6 router final output (default)\n";
     cerr << "\n";
     cerr << "If -o is a folder, output filename will be generated like:\n";
     cerr << "  07blk05240238.cfg\n";
+}
+
+static string toLowerAscii(string s) {
+    for (char& c : s) {
+        c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    }
+    return s;
+}
+
+static RouterMode parseRouterModeValue(const string& raw) {
+    const string v = toLowerAscii(raw);
+    if (v == "baseline" || v == "base" || v == "v1") return RouterMode::Baseline;
+    if (v == "routerv2" || v == "v2" || v == "phase" || v == "phase1-6") return RouterMode::RouterV2;
+    cerr << "[Warning] Unknown router mode '" << raw << "', using routerv2.\n";
+    return RouterMode::RouterV2;
+}
+
+static string routerModeName(RouterMode mode) {
+    return mode == RouterMode::Baseline ? "baseline" : "routerv2";
 }
 
 static Options parseArgs(int argc, char** argv) {
@@ -47,12 +78,14 @@ static Options parseArgs(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) {
         string arg = argv[i];
 
-        // 支援 -o / --o / --output
         if ((arg == "-o" || arg == "--o" || arg == "--output") && i + 1 < argc) {
             opt.outputPath = argv[++i];
         }
         else if (arg == "--alpha" && i + 1 < argc) {
             opt.alpha = stod(argv[++i]);
+        }
+        else if ((arg == "--router-mode" || arg == "--mode" || arg == "--router") && i + 1 < argc) {
+            opt.routerMode = parseRouterModeValue(argv[++i]);
         }
         else if (arg == "-h" || arg == "--help") {
             printUsage();
@@ -73,7 +106,6 @@ static bool endsWithCfg(const string& s) {
     for (char& c : tail) {
         c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
     }
-
     return tail == ".cfg";
 }
 
@@ -87,12 +119,9 @@ static tm getLocalTimeNow() {
 #else
     localtime_r(&tt, &localTm);
 #endif
-
     return localTm;
 }
 
-// 產生檔名：07blk05240238.cfg
-// 格式：<兩位數block數>blk<月日時分>.cfg
 static string makeAutoCfgFileName(size_t blockCount) {
     tm localTm = getLocalTimeNow();
 
@@ -105,25 +134,17 @@ static string makeAutoCfgFileName(size_t blockCount) {
         << setw(2) << localTm.tm_hour
         << setw(2) << localTm.tm_min
         << ".cfg";
-
     return oss.str();
 }
 
-// 如果 -o 給的是資料夾，例如 C:\problemE\problemE\result
-// 就自動變成 C:\problemE\problemE\result\07blk05240238.cfg
-//
-// 如果 -o 給的是完整檔名，例如 C:\problemE\problemE\result\my.cfg
-// 就照原本檔名輸出。
 static string resolveOutputPath(const string& rawOutputPath, size_t blockCount) {
     fs::path p(rawOutputPath);
 
     bool outputIsDirectory = false;
-
     if (fs::exists(p) && fs::is_directory(p)) {
         outputIsDirectory = true;
     }
     else if (!endsWithCfg(p.string())) {
-        // 沒有 .cfg 副檔名，就把它當資料夾。
         outputIsDirectory = true;
     }
 
@@ -133,10 +154,7 @@ static string resolveOutputPath(const string& rawOutputPath, size_t blockCount) 
     }
 
     fs::path parent = p.parent_path();
-    if (!parent.empty()) {
-        fs::create_directories(parent);
-    }
-
+    if (!parent.empty()) fs::create_directories(parent);
     return p.string();
 }
 
@@ -151,6 +169,7 @@ int main(int argc, char** argv) {
     Floorplanner floorplanner;
     ChannelBuilder channelBuilder;
     Router router;
+    RouterV2 routerV2;
     Evaluator evaluator;
     OutputWriter writer;
 
@@ -162,14 +181,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // 讀完 parser 後才知道 block 數量，所以在這裡決定真正 output cfg 路徑。
     opt.outputPath = resolveOutputPath(opt.outputPath, design.blockSpecs.size());
 
-    // One-way architecture:
-    // Parser -> Floorplanner -> ChannelBuilder -> Router -> Evaluator -> OutputWriter
     floorplanner.run(design);
     channelBuilder.build(design);
-    router.run(design);
+
+    cerr << "[RouterMode] " << routerModeName(opt.routerMode) << "\n";
+    if (opt.routerMode == RouterMode::Baseline) {
+        router.run(design);
+    } else {
+        RouterV2::RunResult routerV2Result = routerV2.route(design, opt.inputPath, opt.outputPath, opt.alpha);
+        if (!routerV2Result.ok) {
+            cerr << "[RouterV2] Failed to produce complete routerv2 final design.\n";
+            return 1;
+        }
+    }
 
     EvalReport rpt = evaluator.evaluate(design, opt.alpha);
 
@@ -180,6 +206,9 @@ int main(int argc, char** argv) {
     }
 
     Logger::printFinalReport(design, rpt, opt.alpha, opt.inputPath, opt.outputPath);
+    if (!Logger::writePhase0Reports(design, rpt, opt.alpha, opt.inputPath, opt.outputPath)) {
+        cerr << "[Phase0] Failed to write one or more routing truth reports.\n";
+    }
 
     if (rpt.hasFail()) return 2;
     return 0;

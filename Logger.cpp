@@ -4,19 +4,20 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <sstream>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 using namespace std;
+namespace fs = std::filesystem;
 
 namespace {
 
-    // 不需要改 main.cpp / Logger.hpp。
-    // 這個時間點會在程式啟動時建立，接近 main() 開始時間。
     const auto PROGRAM_START_TIME = chrono::steady_clock::now();
 
     double getRuntimeSeconds() {
@@ -25,120 +26,222 @@ namespace {
         return elapsed.count();
     }
 
-    // =========================================================================
-// Logger-side directional channel usage recomputation
-// -------------------------------------------------------------------------
-// Logger 的任務是「報告」，不應該依賴 Router 留下的 ch.usedNets/ch.capacity。
-// 在 direction-aware channel model 下，一個 channel 有兩個容量分量：
-//
-//   Horizontal / LR / edge 1 <-> edge 3:
-//       左右走的水平線，需要沿 y 方向並排，
-//       所以容量 = channel height * CHANNEL_DENSITY。
-//
-//   Vertical / TB / edge 2 <-> edge 4:
-//       上下走的垂直線，需要沿 x 方向並排，
-//       所以容量 = channel width * CHANNEL_DENSITY。
-//
-//   Turn / L-shape:
-//       同時吃 horizontal 與 vertical 各一次。
-//
-// 注意：這裡是 aggregate directional model，還不是 interval/cut-based
-// overlap model。也就是同一個 channel 內所有水平段先加總、所有垂直段
-// 先加總。這和目前 baseline Router / Evaluator 比較容易對齊。
-// =========================================================================
-
-    struct LoggerChannelUse {
-        double horizontalNets = 0.0; // LR: edge 1 <-> edge 3
-        double verticalNets = 0.0;   // TB: edge 2 <-> edge 4
-    };
-
-    struct LoggerChannelComponentView {
-        string channelName;
-        string directionName;
-        double used = 0.0;
-        double capacity = 0.0;
-        double utilization = 0.0;
-        double overflow = 0.0;
-        Rect rect;
-    };
-
-    bool validEdgeForLogger(int e) {
-        return e >= 1 && e <= 4;
+    string finiteOrInf(double v) {
+        if (std::isinf(v)) return "INF";
+        if (std::isnan(v)) return "NAN";
+        ostringstream oss;
+        oss << fixed << setprecision(6) << v;
+        return oss.str();
     }
 
-    bool isOppositeLRForLogger(int a, int b) {
-        return (a == 1 && b == 3) || (a == 3 && b == 1);
-    }
-
-    bool isOppositeTBForLogger(int a, int b) {
-        return (a == 2 && b == 4) || (a == 4 && b == 2);
-    }
-
-    bool isTurnForLogger(int a, int b) {
-        if (!validEdgeForLogger(a) || !validEdgeForLogger(b)) return false;
-        if (a == b) return false;
-        return !isOppositeLRForLogger(a, b) && !isOppositeTBForLogger(a, b);
-    }
-
-    double horizontalCapacityForLogger(const Channel& ch) {
-        // edge 1 <-> edge 3，左右走，吃 channel 高度。
-        return max(0.0, ch.rect.h) * CHANNEL_DENSITY;
-    }
-
-    double verticalCapacityForLogger(const Channel& ch) {
-        // edge 2 <-> edge 4，上下走，吃 channel 寬度。
-        return max(0.0, ch.rect.w) * CHANNEL_DENSITY;
-    }
-
-    vector<LoggerChannelUse> recomputeDirectionalChannelUseForLogger(const Design& design) {
-        unordered_map<string, int> channelNameToIndex;
-        channelNameToIndex.reserve(design.channels.size());
-
-        for (int i = 0; i < static_cast<int>(design.channels.size()); ++i) {
-            channelNameToIndex[design.channels[i].name] = i;
-        }
-
-        vector<LoggerChannelUse> use(design.channels.size());
-
-        for (const auto& route : design.routes) {
-            if (route.open) continue;
-            if (route.netCount <= 0) continue;
-            if (route.steps.size() < 4) continue;
-
-            // PATH 格式：
-            //   start block
-            //   intermediate rectangle in/out pair
-            //   intermediate rectangle in/out pair
-            //   end block
-            //
-            // 所以中間 rectangle 應該出現在 steps[1], steps[2]、
-            // steps[3], steps[4] ... 這種 pair。
-            for (int i = 1; i + 1 < static_cast<int>(route.steps.size()); i += 2) {
-                const auto& in = route.steps[i];
-                const auto& out = route.steps[i + 1];
-
-                // 中繼 rectangle 必須是一進一出同一個物件。
-                if (in.rectName != out.rectName) continue;
-
-                auto it = channelNameToIndex.find(in.rectName);
-                if (it == channelNameToIndex.end()) continue;
-
-                LoggerChannelUse& u = use[it->second];
-
-                if (isOppositeLRForLogger(in.edge, out.edge)) {
-                    u.horizontalNets += static_cast<double>(route.netCount);
-                }
-                else if (isOppositeTBForLogger(in.edge, out.edge)) {
-                    u.verticalNets += static_cast<double>(route.netCount);
-                }
-                else if (isTurnForLogger(in.edge, out.edge)) {
-                    u.horizontalNets += static_cast<double>(route.netCount);
-                    u.verticalNets += static_cast<double>(route.netCount);
-                }
+    string csvEscape(const string& s) {
+        bool needQuote = false;
+        for (char c : s) {
+            if (c == ',' || c == '"' || c == '\n' || c == '\r') {
+                needQuote = true;
+                break;
             }
         }
+        if (!needQuote) return s;
+        string out = "\"";
+        for (char c : s) {
+            if (c == '"') out += "\"\"";
+            else out += c;
+        }
+        out += "\"";
+        return out;
+    }
 
-        return use;
+    string boolText(bool v) {
+        return v ? "YES" : "NO";
+    }
+
+    fs::path statisticsPathFor(const string& outputPath, const string& suffix) {
+        fs::path out(outputPath);
+        fs::path dir("Router_Statistics");
+        fs::create_directories(dir);
+        string stem = out.stem().string();
+        if (stem.empty()) stem = "phase0";
+        return dir / (stem + suffix);
+    }
+
+    double totalChannelArea(const Design& design) {
+        double sum = 0.0;
+        for (const auto& ch : design.channels) sum += ch.rect.w * ch.rect.h;
+        return sum;
+    }
+
+    double totalLRUsed(const EvalReport& rpt) {
+        double sum = 0.0;
+        for (const auto& ch : rpt.channelTruth) sum += ch.lrUsed;
+        return sum;
+    }
+
+    double totalTBUsed(const EvalReport& rpt) {
+        double sum = 0.0;
+        for (const auto& ch : rpt.channelTruth) sum += ch.tbUsed;
+        return sum;
+    }
+
+    double totalLRCapacity(const EvalReport& rpt) {
+        double sum = 0.0;
+        for (const auto& ch : rpt.channelTruth) sum += ch.lrCapacity;
+        return sum;
+    }
+
+    double totalTBCapacity(const EvalReport& rpt) {
+        double sum = 0.0;
+        for (const auto& ch : rpt.channelTruth) sum += ch.tbCapacity;
+        return sum;
+    }
+
+    double totalLROverflow(const EvalReport& rpt) {
+        double sum = 0.0;
+        for (const auto& ch : rpt.channelTruth) sum += ch.lrOverflow;
+        return sum;
+    }
+
+    double totalTBOverflow(const EvalReport& rpt) {
+        double sum = 0.0;
+        for (const auto& ch : rpt.channelTruth) sum += ch.tbOverflow;
+        return sum;
+    }
+
+    vector<ChannelTruth> sortedChannelComponents(const EvalReport& rpt) {
+        vector<ChannelTruth> out = rpt.channelTruth;
+        sort(out.begin(), out.end(), [](const ChannelTruth& a, const ChannelTruth& b) {
+            double aOv = a.lrOverflow + a.tbOverflow;
+            double bOv = b.lrOverflow + b.tbOverflow;
+            if (fabs(aOv - bOv) > 1e-12) return aOv > bOv;
+            double aUtil = max(a.lrUtilization, a.tbUtilization);
+            double bUtil = max(b.lrUtilization, b.tbUtilization);
+            if (fabs(aUtil - bUtil) > 1e-12) return aUtil > bUtil;
+            return a.name < b.name;
+        });
+        return out;
+    }
+
+    bool writeRoutesCsv(const fs::path& path, const EvalReport& rpt) {
+        ofstream os(path);
+        if (!os) return false;
+        os << "route_id,net_count,src,dst,item_count,guiding_points,wirelength,explicit_open,invalid,invalid_reason,invalid_detail,channel_traversals,feedthrough_traversals\n";
+        for (const auto& r : rpt.routeTruth) {
+            os << r.routeId << ','
+                << r.netCount << ','
+                << csvEscape(r.srcBlock) << ','
+                << csvEscape(r.dstBlock) << ','
+                << r.itemCount << ','
+                << r.guidingPointCount << ','
+                << finiteOrInf(r.wireLength) << ','
+                << boolText(r.explicitOpen) << ','
+                << boolText(r.invalid) << ','
+                << csvEscape(r.invalidReason) << ','
+                << csvEscape(r.invalidDetail) << ','
+                << r.channelTraversalCount << ','
+                << r.feedthroughTraversalCount << '\n';
+        }
+        return true;
+    }
+
+    bool writeChannelsCsv(const fs::path& path, const EvalReport& rpt) {
+        ofstream os(path);
+        if (!os) return false;
+        os << "channel,x,y,w,h,lr_used,lr_capacity,lr_utilization,lr_overflow,tb_used,tb_capacity,tb_utilization,tb_overflow,lr_traversals,tb_traversals,turn_traversals,total_overflow\n";
+        for (const auto& ch : rpt.channelTruth) {
+            os << csvEscape(ch.name) << ','
+                << finiteOrInf(ch.rect.x) << ','
+                << finiteOrInf(ch.rect.y) << ','
+                << finiteOrInf(ch.rect.w) << ','
+                << finiteOrInf(ch.rect.h) << ','
+                << finiteOrInf(ch.lrUsed) << ','
+                << finiteOrInf(ch.lrCapacity) << ','
+                << finiteOrInf(ch.lrUtilization) << ','
+                << finiteOrInf(ch.lrOverflow) << ','
+                << finiteOrInf(ch.tbUsed) << ','
+                << finiteOrInf(ch.tbCapacity) << ','
+                << finiteOrInf(ch.tbUtilization) << ','
+                << finiteOrInf(ch.tbOverflow) << ','
+                << ch.lrTraversalCount << ','
+                << ch.tbTraversalCount << ','
+                << ch.turnTraversalCount << ','
+                << finiteOrInf(ch.lrOverflow + ch.tbOverflow) << '\n';
+        }
+        return true;
+    }
+
+    bool writeSegmentsCsv(const fs::path& path, const EvalReport& rpt) {
+        ofstream os(path);
+        if (!os) return false;
+        os << "route_id,channel,net_count,in_edge,out_edge,from_x,from_y,to_x,to_y,lr_demand,tb_demand,lr_span_lo,lr_span_hi,tb_span_lo,tb_span_hi\n";
+        for (const auto& seg : rpt.channelSegments) {
+            os << seg.routeId << ','
+                << csvEscape(seg.channelName) << ','
+                << seg.netCount << ','
+                << seg.inEdge << ','
+                << seg.outEdge << ','
+                << finiteOrInf(seg.fromX) << ','
+                << finiteOrInf(seg.fromY) << ','
+                << finiteOrInf(seg.toX) << ','
+                << finiteOrInf(seg.toY) << ','
+                << finiteOrInf(seg.lrDemand) << ','
+                << finiteOrInf(seg.tbDemand) << ','
+                << finiteOrInf(seg.lrSpanLo) << ','
+                << finiteOrInf(seg.lrSpanHi) << ','
+                << finiteOrInf(seg.tbSpanLo) << ','
+                << finiteOrInf(seg.tbSpanHi) << '\n';
+        }
+        return true;
+    }
+
+    bool writeFeedthroughCsv(const fs::path& path, const EvalReport& rpt) {
+        ofstream os(path);
+        if (!os) return false;
+        os << "block,used_nets,conversion_rate,side_delta,base_area,current_area,required_area,overflow_area\n";
+        for (const auto& ft : rpt.feedthroughTruth) {
+            os << csvEscape(ft.blockName) << ','
+                << finiteOrInf(ft.usedNets) << ','
+                << finiteOrInf(ft.conversionRate) << ','
+                << finiteOrInf(ft.sideDelta) << ','
+                << finiteOrInf(ft.baseArea) << ','
+                << finiteOrInf(ft.currentArea) << ','
+                << finiteOrInf(ft.requiredArea) << ','
+                << finiteOrInf(ft.overflowArea) << '\n';
+        }
+        return true;
+    }
+
+    bool writeSummaryTxt(const fs::path& path, const Design& design, const EvalReport& rpt, double alpha,
+        const string& inputPath, const string& outputPath) {
+        ofstream os(path);
+        if (!os) return false;
+        os << fixed << setprecision(6);
+        os << "Phase 0 Routing Truth Summary\n";
+        os << "input=" << inputPath << "\n";
+        os << "output=" << outputPath << "\n";
+        os << "alpha=" << alpha << "\n";
+        os << "blocks=" << design.blocks.size() << "\n";
+        os << "channels=" << design.channels.size() << "\n";
+        os << "routes=" << design.routes.size() << "\n";
+        os << "outline_area=" << rpt.outlineArea << "\n";
+        os << "total_wirelength=" << rpt.totalWireLength << "\n";
+        os << "base_cost=" << rpt.cost << "\n";
+        os << "format_failed=" << boolText(rpt.formatFailed) << "\n";
+        os << "path_invalid=" << boolText(rpt.pathInvalid) << " count=" << rpt.invalidPathCount << "\n";
+        os << "block_overlap=" << boolText(rpt.blockOverlap) << " count=" << rpt.overlapCount << "\n";
+        os << "routing_open=" << boolText(rpt.routingOpen) << " count=" << rpt.openPathCount << "\n";
+        os << "outline_violation=" << boolText(rpt.outlineViolation) << " count=" << rpt.outlineViolationCount << "\n";
+        os << "channel_overflow_total=" << rpt.totalChannelOverflow << "\n";
+        os << "channel_overflow_max=" << rpt.maxChannelOverflow << "\n";
+        os << "ft_overflow_total=" << rpt.totalFeedthroughOverflow << "\n";
+        os << "ft_overflow_max=" << rpt.maxFeedthroughOverflow << "\n";
+        os << "bad_topology=" << rpt.badTopologyCount << "\n";
+        os << "unknown_object=" << rpt.unknownObjectCount << "\n";
+        os << "bad_item=" << rpt.badItemCount << "\n";
+        os << "illegal_feedthrough=" << rpt.illegalFeedthroughCount << "\n";
+        os << "contact_fail=" << rpt.contactFailCount << "\n";
+        os << "same_object_same_edge=" << rpt.sameObjectSameEdgeCount << "\n";
+        os << "edge_port_violation=" << rpt.edgePortViolationCount << "\n";
+        return true;
     }
 
 } // namespace
@@ -155,6 +258,7 @@ void Logger::printFinalReport(const Design& design, const EvalReport& rpt, doubl
     cout << "Blocks                  : " << design.blocks.size() << '\n';
     cout << "Connections             : " << design.connections.size() << '\n';
     cout << "Channels                : " << design.channels.size() << '\n';
+    cout << "Routes                  : " << design.routes.size() << '\n';
     cout << "Alpha                   : " << alpha << '\n';
     cout << "Runtime                 : " << runtimeSec << " sec\n\n";
 
@@ -165,135 +269,66 @@ void Logger::printFinalReport(const Design& design, const EvalReport& rpt, doubl
     cout << "BlockOverlap            : " << yesNo(rpt.blockOverlap) << "  count=" << rpt.overlapCount << '\n';
     cout << "OutlineViolation        : " << yesNo(rpt.outlineViolation) << "  count=" << rpt.outlineViolationCount << "\n\n";
 
+    cout << "========== Routing Truth ==========" << '\n';
+    cout << "Route paths             : " << design.routes.size() << '\n';
+    cout << "Open paths              : " << rpt.openPathCount << '\n';
+    cout << "Invalid paths           : " << rpt.invalidPathCount << '\n';
+    cout << "  bad topology          : " << rpt.badTopologyCount << '\n';
+    cout << "  unknown object        : " << rpt.unknownObjectCount << '\n';
+    cout << "  bad item              : " << rpt.badItemCount << '\n';
+    cout << "  illegal feedthrough   : " << rpt.illegalFeedthroughCount << '\n';
+    cout << "  contact fail          : " << rpt.contactFailCount << '\n';
+    cout << "  same object same edge : " << rpt.sameObjectSameEdgeCount << '\n';
+    cout << "  edge port violation   : " << rpt.edgePortViolationCount << '\n';
+    cout << "TotalWireLength         : " << rpt.totalWireLength << "\n\n";
+
     cout << "========== Channel ==========" << '\n';
     cout << "Channel count           : " << design.channels.size() << '\n';
+    cout << "Total channel area      : " << totalChannelArea(design) << '\n';
+    cout << "LR capacity             : " << totalLRCapacity(rpt)
+        << "  used=" << totalLRUsed(rpt)
+        << "  overflow=" << totalLROverflow(rpt) << '\n';
+    cout << "TB capacity             : " << totalTBCapacity(rpt)
+        << "  used=" << totalTBUsed(rpt)
+        << "  overflow=" << totalTBOverflow(rpt) << '\n';
     cout << "Total channel overflow  : " << rpt.totalChannelOverflow << '\n';
     cout << "Max channel overflow    : " << rpt.maxChannelOverflow << '\n';
 
-    // -------------------------------------------------------------------------
-    // Direction-aware channel report
-    // -------------------------------------------------------------------------
-    // 舊版 Logger 直接加總 ch.capacity / ch.usedNets。
-    // 但現在 channel capacity 已經拆成水平、垂直兩個方向，因此這裡重新
-    // 從 PATH 掃描一次，避免誤把 legacy scalar 欄位當作正式容量。
-    // -------------------------------------------------------------------------
-    vector<LoggerChannelUse> dirUse = recomputeDirectionalChannelUseForLogger(design);
-
-    double totalChannelArea = 0.0;
-
-    double totalHorizontalCapacity = 0.0;
-    double totalVerticalCapacity = 0.0;
-    double totalHorizontalUsed = 0.0;
-    double totalVerticalUsed = 0.0;
-    double totalHorizontalOverflow = 0.0;
-    double totalVerticalOverflow = 0.0;
-
-    vector<LoggerChannelComponentView> componentViews;
-    componentViews.reserve(design.channels.size() * 2);
-
-    for (int i = 0; i < static_cast<int>(design.channels.size()); ++i) {
-        const Channel& ch = design.channels[i];
-        const LoggerChannelUse& u = dirUse[i];
-
-        const double hCap = horizontalCapacityForLogger(ch);
-        const double vCap = verticalCapacityForLogger(ch);
-
-        const double hUsed = u.horizontalNets;
-        const double vUsed = u.verticalNets;
-
-        const double hOverflow = max(0.0, hUsed - hCap);
-        const double vOverflow = max(0.0, vUsed - vCap);
-
-        const double hUtil = hCap > EPS ? hUsed / hCap : numeric_limits<double>::infinity();
-        const double vUtil = vCap > EPS ? vUsed / vCap : numeric_limits<double>::infinity();
-
-        totalChannelArea += ch.rect.w * ch.rect.h;
-
-        totalHorizontalCapacity += hCap;
-        totalVerticalCapacity += vCap;
-        totalHorizontalUsed += hUsed;
-        totalVerticalUsed += vUsed;
-        totalHorizontalOverflow += hOverflow;
-        totalVerticalOverflow += vOverflow;
-
-        componentViews.push_back(LoggerChannelComponentView{
-            ch.name,
-            "Horizontal/LR(edge1<->edge3)",
-            hUsed,
-            hCap,
-            hUtil,
-            hOverflow,
-            ch.rect
-            });
-
-        componentViews.push_back(LoggerChannelComponentView{
-            ch.name,
-            "Vertical/TB(edge2<->edge4)",
-            vUsed,
-            vCap,
-            vUtil,
-            vOverflow,
-            ch.rect
-            });
-    }
-
-    const double totalDirectionalOverflow = totalHorizontalOverflow + totalVerticalOverflow;
-
-    cout << "Total channel area      : " << totalChannelArea << '\n';
-
-    cout << "Horizontal capacity     : " << totalHorizontalCapacity
-        << "  used=" << totalHorizontalUsed
-        << "  overflow=" << totalHorizontalOverflow << '\n';
-
-    cout << "Vertical capacity       : " << totalVerticalCapacity
-        << "  used=" << totalVerticalUsed
-        << "  overflow=" << totalVerticalOverflow << '\n';
-
-    cout << "Directional overflow    : " << totalDirectionalOverflow << '\n';
-
-    // 如果這裡和 rpt.totalChannelOverflow 不一致，代表 Evaluator 的 channel
-    // overflow 計算模型尚未和 Logger/Router 對齊。
-    if (fabs(totalDirectionalOverflow - rpt.totalChannelOverflow) > 1e-3) {
-        cout << "Directional overflow note: logger recompute differs from evaluator report by "
-            << fabs(totalDirectionalOverflow - rpt.totalChannelOverflow)
-            << '\n';
-    }
-
-    sort(componentViews.begin(), componentViews.end(),
-        [](const LoggerChannelComponentView& a, const LoggerChannelComponentView& b) {
-            if (fabs(a.overflow - b.overflow) > 1e-12) return a.overflow > b.overflow;
-            if (fabs(a.utilization - b.utilization) > 1e-12) return a.utilization > b.utilization;
-            return a.used > b.used;
-        });
-
+    vector<ChannelTruth> topChannels = sortedChannelComponents(rpt);
     cout << "Top channel components  :\n";
-    const int topLimit = min(10, static_cast<int>(componentViews.size()));
+    const int topLimit = min(10, static_cast<int>(topChannels.size()));
     for (int i = 0; i < topLimit; ++i) {
-        const auto& c = componentViews[i];
-
-        cout << "  " << c.channelName
-            << " " << c.directionName
-            << " used=" << c.used
-            << " cap=" << c.capacity
-            << " util=" << c.utilization
-            << " overflow=" << c.overflow
-            << " rect=(" << c.rect.x << "," << c.rect.y
-            << "," << c.rect.w << "," << c.rect.h << ")"
+        const auto& ch = topChannels[i];
+        cout << "  " << ch.name
+            << " LR used=" << ch.lrUsed << "/" << ch.lrCapacity
+            << " ov=" << ch.lrOverflow
+            << " TB used=" << ch.tbUsed << "/" << ch.tbCapacity
+            << " ov=" << ch.tbOverflow
+            << " rect=(" << ch.rect.x << "," << ch.rect.y << "," << ch.rect.w << "," << ch.rect.h << ")"
             << '\n';
     }
-
     cout << "\n";
 
-    cout << "========== Routing ==========" << '\n';
-    cout << "Route paths             : " << design.routes.size() << '\n';
-    cout << "Open paths              : " << rpt.openPathCount << '\n';
-    cout << "TotalWireLength         : " << rpt.totalWireLength << '\n';
+    cout << "========== Feedthrough ==========" << '\n';
     cout << "Total FT overflow       : " << rpt.totalFeedthroughOverflow << '\n';
-    cout << "Max FT overflow         : " << rpt.maxFeedthroughOverflow << "\n\n";
+    cout << "Max FT overflow         : " << rpt.maxFeedthroughOverflow << '\n';
+    for (const auto& ft : rpt.feedthroughTruth) {
+        if (ft.usedNets <= EPS && ft.overflowArea <= EPS) continue;
+        cout << "  " << ft.blockName
+            << " used=" << ft.usedNets
+            << " rate=" << ft.conversionRate
+            << " delta=" << ft.sideDelta
+            << " currentArea=" << ft.currentArea
+            << " requiredArea=" << ft.requiredArea
+            << " overflow=" << ft.overflowArea
+            << '\n';
+    }
+    cout << "\n";
 
     cout << "========== Cost ==========" << '\n';
     cout << "Cost                    : " << rpt.cost << '\n';
-    cout << "Formula                 : OutlineArea + alpha * TotalWireLength\n\n";
+    cout << "Formula                 : OutlineArea + alpha * TotalWireLength\n";
+    cout << "Overflow penalty        : not included in public formula; reported separately\n\n";
 
     cout << "========== Penalty condition ==========" << '\n';
     cout << "Channel overflow        : " << passFail(rpt.totalChannelOverflow > EPS) << '\n';
@@ -301,6 +336,7 @@ void Logger::printFinalReport(const Design& design, const EvalReport& rpt, doubl
 
     cout << "========== Fail condition ==========" << '\n';
     cout << "Format failed           : " << passFail(rpt.formatFailed) << '\n';
+    cout << "Path invalid            : " << passFail(rpt.pathInvalid) << '\n';
     cout << "Block overlap           : " << passFail(rpt.blockOverlap) << '\n';
     cout << "Routing open            : " << passFail(rpt.routingOpen) << '\n';
     cout << "Outline violation       : " << passFail(rpt.outlineViolation) << "\n\n";
@@ -315,6 +351,33 @@ void Logger::printFinalReport(const Design& design, const EvalReport& rpt, doubl
     else {
         cout << "Status                  : LEGAL\n";
     }
-
     cout << "Runtime                 : " << runtimeSec << " sec\n";
+}
+
+bool Logger::writePhase0Reports(const Design& design, const EvalReport& rpt, double alpha,
+    const string& inputPath, const string& outputPath) {
+    fs::path summary = statisticsPathFor(outputPath, "_phase0_summary.txt");
+    fs::path routes = statisticsPathFor(outputPath, "_phase0_routes.csv");
+    fs::path channels = statisticsPathFor(outputPath, "_phase0_channels.csv");
+    fs::path segments = statisticsPathFor(outputPath, "_phase0_channel_segments.csv");
+    fs::path feedthrough = statisticsPathFor(outputPath, "_phase0_feedthrough.csv");
+
+    fs::create_directories(summary.parent_path());
+
+    bool ok = true;
+    ok = writeSummaryTxt(summary, design, rpt, alpha, inputPath, outputPath) && ok;
+    ok = writeRoutesCsv(routes, rpt) && ok;
+    ok = writeChannelsCsv(channels, rpt) && ok;
+    ok = writeSegmentsCsv(segments, rpt) && ok;
+    ok = writeFeedthroughCsv(feedthrough, rpt) && ok;
+
+    if (ok) {
+        cerr << "[Phase0] Wrote routing truth reports:\n";
+        cerr << "  " << summary.string() << "\n";
+        cerr << "  " << routes.string() << "\n";
+        cerr << "  " << channels.string() << "\n";
+        cerr << "  " << segments.string() << "\n";
+        cerr << "  " << feedthrough.string() << "\n";
+    }
+    return ok;
 }

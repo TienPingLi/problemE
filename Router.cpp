@@ -1,5 +1,6 @@
-#include "Router.hpp"
+ï»¿#include "Router.hpp"
 #include "Utility.hpp"
+#include "CongestionMapBuilder.hpp"
 
 #include <algorithm>
 #include <array>
@@ -11,6 +12,7 @@
 #include <map>
 #include <queue>
 #include <set>
+#include <filesystem>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -21,70 +23,70 @@ using namespace std;
 namespace {
 
     // ============================================================================
-    // ¤¤¤åµù¸Ñª© Router.cpp¡GDirectional-capacity + Bottleneck-aware Step1-4
+    // ä¸­æ–‡è¨»è§£ç‰ˆ Router.cppï¼šDirectional-capacity + Bottleneck-aware Step1-4
     // ----------------------------------------------------------------------------
-    // ¥»ÀÉ®×ªº©w¦ì¡G
-    //   ³o¬O¤@ª©¡u¥i·í baseline ¨Ï¥Î¡vªº Router¡C¥DÅé¤´µM¬O Step1~4 ªº
-    //   Dijkstra-based global route¡AStep5 ¥u§@¬° deferred fallback¡G
-    //   channel-only whole route + allow overflow¡C
+    // æœ¬æª”æ¡ˆçš„å®šä½ï¼š
+    //   é€™æ˜¯ä¸€ç‰ˆã€Œå¯ç•¶ baseline ä½¿ç”¨ã€çš„ Routerã€‚ä¸»é«”ä»ç„¶æ˜¯ Step1~4 çš„
+    //   Dijkstra-based global routeï¼ŒStep5 åªä½œç‚º deferred fallbackï¼š
+    //   channel-only whole route + allow overflowã€‚
     //
-    // ¬°¤°»ò­n§ï¦¨ directional capacity¡H
-    //   ©x¤è Q&A ¤w½T»{ channel ªº¤ô¥­»P««ª½¤è¦V®e¶q­n¤À¶}¬İ¡G
-    //     1) ¤ô¥­¨«½u¡Gedge 1 <-> edge 3¡A¦b channel ¸Ì¥ª¥k¨«¡A
-    //        ®e¶q = channel °ª«× h * CHANNEL_DENSITY¡C
-    //     2) ««ª½¨«½u¡Gedge 2 <-> edge 4¡A¦b channel ¸Ì¤W¤U¨«¡A
-    //        ®e¶q = channel ¼e«× w * CHANNEL_DENSITY¡C
-    //     3) L-shape / turn¡G­Y¦b¦P¤@­Ó channel ¤¤¥Ñ¬Û¾F edge ¶i¥X¡A
-    //        ·|¦P®É²£¥Í¤ô¥­¬q»P««ª½¬q¡A¦]¦¹¤ô¥­¡B««ª½¦U¦Y¤@¦¸®e¶q¡C
+    // ç‚ºä»€éº¼è¦æ”¹æˆ directional capacityï¼Ÿ
+    //   å®˜æ–¹ Q&A å·²ç¢ºèª channel çš„æ°´å¹³èˆ‡å‚ç›´æ–¹å‘å®¹é‡è¦åˆ†é–‹çœ‹ï¼š
+    //     1) æ°´å¹³èµ°ç·šï¼šedge 1 <-> edge 3ï¼Œåœ¨ channel è£¡å·¦å³èµ°ï¼Œ
+    //        å®¹é‡ = channel é«˜åº¦ h * CHANNEL_DENSITYã€‚
+    //     2) å‚ç›´èµ°ç·šï¼šedge 2 <-> edge 4ï¼Œåœ¨ channel è£¡ä¸Šä¸‹èµ°ï¼Œ
+    //        å®¹é‡ = channel å¯¬åº¦ w * CHANNEL_DENSITYã€‚
+    //     3) L-shape / turnï¼šè‹¥åœ¨åŒä¸€å€‹ channel ä¸­ç”±ç›¸é„° edge é€²å‡ºï¼Œ
+    //        æœƒåŒæ™‚ç”¢ç”Ÿæ°´å¹³æ®µèˆ‡å‚ç›´æ®µï¼Œå› æ­¤æ°´å¹³ã€å‚ç›´å„åƒä¸€æ¬¡å®¹é‡ã€‚
     //
-    // ¥Ø«e¤´±Ä¥Î baseline ªº¡u¤è¦V¥[Á`¼Ò«¬¡v¡G
-    //   ¹ï¨C­Ó channel ²Î­p horizontalUsed / verticalUsed¡AµM«á¤À§O»P
-    //   h*25 / w*25 ¤ñ¸û¡C³o¤ñÂÂª© scalar capacity ¥¿½T«Ü¦h¡A¦ı©|¥¼°µ¨ì
-    //   interval-based ªº¡u­«Å|°Ï¡vºëºâ¼Ò«¬¡C
+    // ç›®å‰ä»æ¡ç”¨ baseline çš„ã€Œæ–¹å‘åŠ ç¸½æ¨¡å‹ã€ï¼š
+    //   å°æ¯å€‹ channel çµ±è¨ˆ horizontalUsed / verticalUsedï¼Œç„¶å¾Œåˆ†åˆ¥èˆ‡
+    //   h*25 / w*25 æ¯”è¼ƒã€‚é€™æ¯”èˆŠç‰ˆ scalar capacity æ­£ç¢ºå¾ˆå¤šï¼Œä½†å°šæœªåšåˆ°
+    //   interval-based çš„ã€Œé‡ç–Šå€ã€ç²¾ç®—æ¨¡å‹ã€‚
     //
-    // Router µ¦²¤Á`Äı¡G
-    //   Step1A¡GChannel-only whole route¡AcapacityScale=0.85¡A¥ı«O¯d®e¶q¡C
-    //   Step1B¡GChannel-only whole route¡AcapacityScale=1.00¡A©ñ¼e®e¶q¡C
-    //   Step2A¡GChannel-only limited split¡AcapacityScale=0.90¡C
-    //   Step2B¡GChannel-only limited split¡AcapacityScale=1.00¡C
-    //   Step3 ¡GFT-enabled whole route¡A¥u¦³ soft block ¯à§@¬°¤¤Ä~ feedthrough¡C
-    //   Step4 ¡GFT-enabled limited split¡C
-    //   Step5 ¡GDeferred channel-only whole route + allow overflow¡C
+    // Router ç­–ç•¥ç¸½è¦½ï¼š
+    //   Step1Aï¼šChannel-only whole routeï¼ŒcapacityScale=0.85ï¼Œå…ˆä¿ç•™å®¹é‡ã€‚
+    //   Step1Bï¼šChannel-only whole routeï¼ŒcapacityScale=1.00ï¼Œæ”¾å¯¬å®¹é‡ã€‚
+    //   Step2Aï¼šChannel-only limited splitï¼ŒcapacityScale=0.90ã€‚
+    //   Step2Bï¼šChannel-only limited splitï¼ŒcapacityScale=1.00ã€‚
+    //   Step3 ï¼šFT-enabled whole routeï¼Œåªæœ‰ soft block èƒ½ä½œç‚ºä¸­ç¹¼ feedthroughã€‚
+    //   Step4 ï¼šFT-enabled limited splitã€‚
+    //   Step5 ï¼šDeferred channel-only whole route + allow overflowã€‚
     //
-    // Dijkstra ªº®Ö¤ß·Qªk¡G
-    //   ÂÂª© Dijkstra ¥u§â¡urectangle¡v·í¦¨ node¡A¦]¦¹¨«¶i channel ®É¤£ª¾¹D
-    //   ¬O±q­ş­Ó edge ¶i¡B±q­ş­Ó edge ¥X¡A¤]´NµLªk§PÂ_¤ô¥­/««ª½®e¶q¡C
-    //   ¥»ª©¨Ï¥Î edge-state Dijkstra¡Gstate=(nodeId, inEdge)¡C
-    //   ·í Dijkstra ±q¤@­Ó channel state Â÷¶}®É¡A¤w¸gª¾¹D¡G
-    //       inEdge  = ±q­ş­Ó edge ¶i¤J¸Ó channel
-    //       outEdge = ±q­ş­Ó edge Â÷¶}¸Ó channel
-    //   ¦]¦¹¥i¥H§PÂ_³o¦¸ traversal ¬O¡G
-    //       1<->3¡G¤ô¥­ LR ¨Ï¥Î¶q + nets
-    //       2<->4¡G««ª½ TB ¨Ï¥Î¶q + nets
-    //       turn ¡G¤ô¥­»P««ª½¨Ï¥Î¶q¦U + nets
+    // Dijkstra çš„æ ¸å¿ƒæƒ³æ³•ï¼š
+    //   èˆŠç‰ˆ Dijkstra åªæŠŠã€Œrectangleã€ç•¶æˆ nodeï¼Œå› æ­¤èµ°é€² channel æ™‚ä¸çŸ¥é“
+    //   æ˜¯å¾å“ªå€‹ edge é€²ã€å¾å“ªå€‹ edge å‡ºï¼Œä¹Ÿå°±ç„¡æ³•åˆ¤æ–·æ°´å¹³/å‚ç›´å®¹é‡ã€‚
+    //   æœ¬ç‰ˆä½¿ç”¨ edge-state Dijkstraï¼šstate=(nodeId, inEdge)ã€‚
+    //   ç•¶ Dijkstra å¾ä¸€å€‹ channel state é›¢é–‹æ™‚ï¼Œå·²ç¶“çŸ¥é“ï¼š
+    //       inEdge  = å¾å“ªå€‹ edge é€²å…¥è©² channel
+    //       outEdge = å¾å“ªå€‹ edge é›¢é–‹è©² channel
+    //   å› æ­¤å¯ä»¥åˆ¤æ–·é€™æ¬¡ traversal æ˜¯ï¼š
+    //       1<->3ï¼šæ°´å¹³ LR ä½¿ç”¨é‡ + nets
+    //       2<->4ï¼šå‚ç›´ TB ä½¿ç”¨é‡ + nets
+    //       turn ï¼šæ°´å¹³èˆ‡å‚ç›´ä½¿ç”¨é‡å„ + nets
     //
-    // Dijkstra cost ²Õ¦¨¡G
+    // Dijkstra cost çµ„æˆï¼š
     //   path edge cost = wireCost + resourcePenalty
-    //   wireCost = ROUTER_WIRE_WEIGHT * ´X¦ó¶ZÂ÷ * netCount
-    //   resourcePenalty ¹ï channel ¥]§t¡G
-    //       * projected utilization penalty¡G¶V±µªñº¡¸ü¶V¶Q
-    //       * near-full convex penalty¡G¶W¹L 60%¡B85% «á¥[³tÅÜ¶Q
-    //       * narrow-component penalty¡G¤p®e¶q¤è¦V¤À¶q·|³Q±j¯PÃg»@
-    //       * criticality penalty¡G¹w¦ô·|³Q«Ü¦h connection ¸g¹Lªº bottleneck ¸û¶Q
-    //       * Step5 overflow penalty¡Gallow overflow ®É¡A·s¼W overflow ·|·¥ºİ©ù¶Q
-    //   resourcePenalty ¹ï soft block ¥]§t¡G
-    //       * ©T©w FT penalty
+    //   wireCost = ROUTER_WIRE_WEIGHT * å¹¾ä½•è·é›¢ * netCount
+    //   resourcePenalty å° channel åŒ…å«ï¼š
+    //       * projected utilization penaltyï¼šè¶Šæ¥è¿‘æ»¿è¼‰è¶Šè²´
+    //       * near-full convex penaltyï¼šè¶…é 60%ã€85% å¾ŒåŠ é€Ÿè®Šè²´
+    //       * narrow-component penaltyï¼šå°å®¹é‡æ–¹å‘åˆ†é‡æœƒè¢«å¼·çƒˆæ‡²ç½°
+    //       * criticality penaltyï¼šé ä¼°æœƒè¢«å¾ˆå¤š connection ç¶“éçš„ bottleneck è¼ƒè²´
+    //       * Step5 overflow penaltyï¼šallow overflow æ™‚ï¼Œæ–°å¢ overflow æœƒæ¥µç«¯æ˜‚è²´
+    //   resourcePenalty å° soft block åŒ…å«ï¼š
+    //       * å›ºå®š FT penalty
     //       * per-net FT penalty
-    //       * feedthrough ©Ò»İ­±¿n¼W¥[ªº¦ô­p penalty
+    //       * feedthrough æ‰€éœ€é¢ç©å¢åŠ çš„ä¼°è¨ˆ penalty
     //
-    // Split ªº©w¦ì¡G
-    //   Split ¤£¬O¥D router¡A¥u¬O®e¶q­×¸É¤u¨ã¡C­Y whole route ¹L¤£¤F¡A¤~¤¹³\
-    //   limited split¡CSplit ¤£¤¹³\©î¤Ó¦h±ø¡B¤£¯à¨«·¥¯¶¤è¦V¤À¶q¡B¤£¯à¥u¬O¦b
-    //   ¦P¤@­Ó bottleneck ¸Ì¶ë¤p chunk¡C
+    // Split çš„å®šä½ï¼š
+    //   Split ä¸æ˜¯ä¸» routerï¼Œåªæ˜¯å®¹é‡ä¿®è£œå·¥å…·ã€‚è‹¥ whole route éä¸äº†ï¼Œæ‰å…è¨±
+    //   limited splitã€‚Split ä¸å…è¨±æ‹†å¤ªå¤šæ¢ã€ä¸èƒ½èµ°æ¥µçª„æ–¹å‘åˆ†é‡ã€ä¸èƒ½åªæ˜¯åœ¨
+    //   åŒä¸€å€‹ bottleneck è£¡å¡å° chunkã€‚
     //
-    // Report ªº¤è¦V¸ê°T¡G
-    //   ³Ì«á·|¦L¥X¨C­Ó top channel ªº LR/TB used/cap/util/overflow¡A¨Ã«ü¥X
-    //   maxUtil ¬O­ş¤@­Ó channel ªº­ş¤@­Ó¤è¦V¤À¶q¡C
+    // Report çš„æ–¹å‘è³‡è¨Šï¼š
+    //   æœ€å¾Œæœƒå°å‡ºæ¯å€‹ top channel çš„ LR/TB used/cap/util/overflowï¼Œä¸¦æŒ‡å‡º
+    //   maxUtil æ˜¯å“ªä¸€å€‹ channel çš„å“ªä¸€å€‹æ–¹å‘åˆ†é‡ã€‚
     // ============================================================================
 
     static constexpr bool ROUTER_DIAG_ENABLE = true;
@@ -151,6 +153,15 @@ namespace {
     static bool   g_splitRouting = false;
     static double g_capacityScale = CAP_SCALE_FULL;
     static vector<double> g_channelCriticality;
+    // V7.3-HMï¼šStep0 amplified congestion guide ç”¢ç”Ÿçš„ ambient demandã€‚
+    // Router åªåœ¨ cost ä¸­ä½¿ç”¨ ambientï¼Œä¸ç”¨å®ƒåš hard capacity feasibilityã€‚
+    static vector<double> g_channelAmbientLR;
+    static vector<double> g_channelAmbientTB;
+
+    // V6.1ï¼šStep0 å°æ¯æ¢ connection ç”¢ç”Ÿçš„ routing priorityã€‚
+    // Router ä¸»æ¶æ§‹ä»ç¶­æŒ Step1~5ï¼ŒåªæŠŠ route order å¾å–®ç´” netCount æ”¹æˆ
+    // ã€ŒStep0 é¢¨éšªå„ªå…ˆï¼ŒnetCount æ¬¡ä¹‹ã€ã€‚è‹¥æ­¤å‘é‡ç‚ºç©ºï¼Œæœƒè‡ªå‹•é€€å› netCount æ’åºã€‚
+    static vector<double> g_step0ConnectionPriority;
 
     string modeName(RouteMode mode) {
         return mode == RouteMode::CHANNEL_ONLY ? "CHANNEL_ONLY" : "FT_ENABLED";
@@ -189,12 +200,12 @@ namespace {
         return -1;
     }
 
-    // ¤ô¥­/««ª½®e¶q©w¸q¡]¨Ì·Ó Q&A ­×¥¿¡^¡G
-    //   * LR / horizontal¡Gedge 1 <-> edge 3¡A¥Nªí½u¦b channel ¤º¥ª¥k¨«¡C
-    //     ¥ª¥k¨«ªº¤ô¥­½u»İ­nªu y ¤è¦V±Æ¶}¡A¦]¦¹®e¶q¨ú channel °ª«× h * 25¡C
-    //   * TB / vertical¡Gedge 2 <-> edge 4¡A¥Nªí½u¦b channel ¤º¤W¤U¨«¡C
-    //     ¤W¤U¨«ªº««ª½½u»İ­nªu x ¤è¦V±Æ¶}¡A¦]¦¹®e¶q¨ú channel ¼e«× w * 25¡C
-    // ª`·N¡G³o¸Ì¤´¬O baseline ªº¡u¤è¦V¥[Á`¼Ò«¬¡v¡A©|¥¼°µ interval / cut-based ­«Å|°Ï¼Ò«¬¡C
+    // æ°´å¹³/å‚ç›´å®¹é‡å®šç¾©ï¼ˆä¾ç…§ Q&A ä¿®æ­£ï¼‰ï¼š
+    //   * LR / horizontalï¼šedge 1 <-> edge 3ï¼Œä»£è¡¨ç·šåœ¨ channel å…§å·¦å³èµ°ã€‚
+    //     å·¦å³èµ°çš„æ°´å¹³ç·šéœ€è¦æ²¿ y æ–¹å‘æ’é–‹ï¼Œå› æ­¤å®¹é‡å– channel é«˜åº¦ h * 25ã€‚
+    //   * TB / verticalï¼šedge 2 <-> edge 4ï¼Œä»£è¡¨ç·šåœ¨ channel å…§ä¸Šä¸‹èµ°ã€‚
+    //     ä¸Šä¸‹èµ°çš„å‚ç›´ç·šéœ€è¦æ²¿ x æ–¹å‘æ’é–‹ï¼Œå› æ­¤å®¹é‡å– channel å¯¬åº¦ w * 25ã€‚
+    // æ³¨æ„ï¼šé€™è£¡ä»æ˜¯ baseline çš„ã€Œæ–¹å‘åŠ ç¸½æ¨¡å‹ã€ï¼Œå°šæœªåš interval / cut-based é‡ç–Šå€æ¨¡å‹ã€‚
     double capLR(const Channel& ch) { return max(0.0, ch.rect.h) * CHANNEL_DENSITY; }
     double capTB(const Channel& ch) { return max(0.0, ch.rect.w) * CHANNEL_DENSITY; }
 
@@ -312,17 +323,17 @@ namespace {
         return out;
     }
 
-    // ±N¥Ø«e design.routes ­«·s´«ºâ¦^ DataModel ªº legacy Äæ¦ì¡C
+    // å°‡ç›®å‰ design.routes é‡æ–°æ›ç®—å› DataModel çš„ legacy æ¬„ä½ã€‚
     //
-    // ¬°¤°»ò­n­«ºâ¡H
-    //   Router.hpp / DataModel ¥Ø«e¨S¦³¥¿¦¡ªº channel.horizontalUsed / verticalUsed Äæ¦ì¡A
-    //   ¥u¦³ÂÂª© scalar¡GusedNets¡Bcapacity¡Boverflow¡C
-    //   ¬°¤F¤£§ï header¡A¥» baseline ¨C¦¸±µ¨ü¤@±ø route «á¡A´N±q©Ò¦³ routes ±½¤@¹M¡A
-    //   ­«·s­pºâ¨C­Ó channel ªº LR/TB ¨Ï¥Î¶q¡A¦A§â¡u¥D¾É²~ÀV¤è¦V¡v¼g¦^ legacy Äæ¦ì¡G
-    //       usedNets  = max-util ¨º­Ó¤è¦Vªº used
-    //       capacity  = max-util ¨º­Ó¤è¦Vªº cap
+    // ç‚ºä»€éº¼è¦é‡ç®—ï¼Ÿ
+    //   Router.hpp / DataModel ç›®å‰æ²’æœ‰æ­£å¼çš„ channel.horizontalUsed / verticalUsed æ¬„ä½ï¼Œ
+    //   åªæœ‰èˆŠç‰ˆ scalarï¼šusedNetsã€capacityã€overflowã€‚
+    //   ç‚ºäº†ä¸æ”¹ headerï¼Œæœ¬ baseline æ¯æ¬¡æ¥å—ä¸€æ¢ route å¾Œï¼Œå°±å¾æ‰€æœ‰ routes æƒä¸€éï¼Œ
+    //   é‡æ–°è¨ˆç®—æ¯å€‹ channel çš„ LR/TB ä½¿ç”¨é‡ï¼Œå†æŠŠã€Œä¸»å°ç“¶é ¸æ–¹å‘ã€å¯«å› legacy æ¬„ä½ï¼š
+    //       usedNets  = max-util é‚£å€‹æ–¹å‘çš„ used
+    //       capacity  = max-util é‚£å€‹æ–¹å‘çš„ cap
     //       overflow  = LR overflow + TB overflow
-    //   ³o¼Ë Logger ÂÂÄæ¦ì¤´¥i¥Î¡A¦ı§ó¸Ô²Óªº¤è¦V report ·|¥t¥~¦L¥X LR/TB¡C
+    //   é€™æ¨£ Logger èˆŠæ¬„ä½ä»å¯ç”¨ï¼Œä½†æ›´è©³ç´°çš„æ–¹å‘ report æœƒå¦å¤–å°å‡º LR/TBã€‚
     void recomputeRouterUsageFields(Design& design) {
         vector<DirUse> usage = computeDirectionalChannelUseFromRoutes(design);
 
@@ -447,9 +458,22 @@ namespace {
 
             const double capSafe = max(1.0, cap);
             const double projected = used + delta;
-            const double util = projected / capSafe;
-            if (util > info.maxProjectedUtil) {
-                info.maxProjectedUtil = util;
+            double ambient = 0.0;
+            if (chIndex >= 0) {
+                if (comp == DirComponent::LR && chIndex < static_cast<int>(g_channelAmbientLR.size())) {
+                    ambient = max(0.0, g_channelAmbientLR[chIndex]);
+                }
+                else if (comp == DirComponent::TB && chIndex < static_cast<int>(g_channelAmbientTB.size())) {
+                    ambient = max(0.0, g_channelAmbientTB[chIndex]);
+                }
+            }
+            // Hadsell-Madden ambient demandï¼šcost ä½¿ç”¨ actual + ambientï¼Œ
+            // ä½† hard feasibility ä»ä½¿ç”¨ actual projectedï¼Œé¿å… Step0 estimate ç›´æ¥å°é–è·¯å¾‘ã€‚
+            const double costProjected = projected + ambient;
+            const double actualUtil = projected / capSafe;
+            const double util = costProjected / capSafe;
+            if (actualUtil > info.maxProjectedUtil) {
+                info.maxProjectedUtil = actualUtil;
                 info.maxUtilComponent = ch.name + " " + compName(comp);
             }
 
@@ -468,7 +492,7 @@ namespace {
                     info.penalty = numeric_limits<double>::infinity();
                     return;
                 }
-                if (util > SPLIT_MAX_PROJECTED_UTIL + 1e-12) {
+                if (actualUtil > SPLIT_MAX_PROJECTED_UTIL + 1e-12) {
                     info.feasible = false;
                     info.penalty = numeric_limits<double>::infinity();
                     return;
@@ -625,40 +649,91 @@ namespace {
     }
 
     void buildChannelCriticalityLocal(const Design& design) {
+        // ---------------------------------------------------------------------
+        // Step0ï¼šç¨ç«‹ CongestionMapBuilder ä¸­é–“å±¤
+        // ---------------------------------------------------------------------
+        // èˆŠç‰ˆ Router åœ¨é€™è£¡ç”¨ connection bbox ç²—ç•¥ä¼° channel criticalityã€‚
+        // æ–°ç‰ˆæ”¹æˆå‘¼å«ç¨ç«‹çš„ CongestionMapBuilderï¼š
+        //   1. ä½¿ç”¨ ChannelBuilder ç”¢ç”Ÿçš„ actual channel rectanglesã€‚
+        //   2. å°‡ channel æ‹†æˆ LR/TB æ–¹å‘å®¹é‡ã€‚
+        //   3. ç”¨ Straight / L / Z pattern å° connection matrix åš demand projectionã€‚
+        //   4. åš 1 è¼ª cheap pattern rerouteï¼Œè®“ map å…·å‚™åŸºæœ¬é¿å¡è¡Œç‚ºã€‚
+        //   5. è¼¸å‡º step0_congestion_map.csv / .svgã€‚
+        //   6. å°‡ result.channelCriticality() é¤µå› g_channelCriticalityï¼Œä¾› Dijkstra cost ä½¿ç”¨ã€‚
+        //
+        // æ³¨æ„ï¼šStep0 ä¸æ˜¯æ­£å¼ Routerï¼Œä¸è¼¸å‡º PATHï¼Œä¹Ÿä¸ä¿è­‰ pattern åˆæ³•ï¼›
+        //      å®ƒåªæä¾› routing health check èˆ‡ global bottleneck guideã€‚
+        // ---------------------------------------------------------------------
         g_channelCriticality.assign(design.channels.size(), 0.0);
-        double maxDemand = 0.0;
-        for (int ci = 0; ci < static_cast<int>(design.channels.size()); ++ci) {
-            const Rect& cr = design.channels[ci].rect;
-            double demand = 0.0;
-            for (const auto& conn : design.connections) {
-                if (conn.src < 0 || conn.src >= static_cast<int>(design.blocks.size()) ||
-                    conn.dst < 0 || conn.dst >= static_cast<int>(design.blocks.size())) continue;
-                const Rect& sr = design.blocks[conn.src].rect;
-                const Rect& dr = design.blocks[conn.dst].rect;
-                double x1 = min(rectCx(sr), rectCx(dr));
-                double x2 = max(rectCx(sr), rectCx(dr));
-                double y1 = min(rectCy(sr), rectCy(dr));
-                double y2 = max(rectCy(sr), rectCy(dr));
-                const double pad = 150.0;
-                x1 -= pad; x2 += pad; y1 -= pad; y2 += pad;
-                if (rectIntersectsLoose(cr, x1, y1, x2, y2)) demand += static_cast<double>(conn.netCount);
-            }
-            g_channelCriticality[ci] = demand;
-            maxDemand = max(maxDemand, demand);
+        g_channelAmbientLR.assign(design.channels.size(), 0.0);
+        g_channelAmbientTB.assign(design.channels.size(), 0.0);
+        if (design.channels.empty() || design.connections.empty()) return;
+
+        CongestionMapBuilder::Options opt;
+        const std::filesystem::path cmbDir("CMB_report");
+        std::filesystem::create_directories(cmbDir);
+        auto inCmbDir = [&](const string& fileName) {
+            return (cmbDir / fileName).string();
+        };
+
+        opt.enableZPattern = true;
+        opt.reroutePasses = 1;
+        opt.exportFiles = true;
+        opt.csvPath = inCmbDir("step0_congestion_map.csv");
+        opt.svgPath = inCmbDir("step0_congestion_map.svg");
+        opt.exportConnectionRiskCSV = true;
+        opt.connectionRiskCsvPath = inCmbDir("step0_connection_risk.csv");
+        opt.exportConnectionGuideCSV = true;
+        opt.connectionGuideCsvPath = inCmbDir("step0_connection_guide.csv");
+        opt.congestedRegionsCsvPath = inCmbDir("step0_congested_regions.csv");
+        opt.floorplanHealthCsvPath = inCmbDir("step0_floorplan_health.csv");
+        opt.floorplanActionsCsvPath = inCmbDir("step0_floorplan_actions.csv");
+        opt.blockAccessPressureCsvPath = inCmbDir("step0_block_access_pressure.csv");
+        opt.floorplanMoveHintsCsvPath = inCmbDir("step0_floorplan_move_hints.csv");
+        opt.floorplanDeltaCsvPath = inCmbDir("step0_floorplan_delta.csv");
+        opt.previousFloorplanHealthCsvPath = inCmbDir("step0_floorplan_health_prev.csv");
+        opt.risaSupplyDemandCsvPath = inCmbDir("step0_risa_supply_demand.csv");
+        opt.amplifiedGuideCsvPath = inCmbDir("step0_amplified_guide.csv");
+        opt.patternPredictabilityCsvPath = inCmbDir("step0_pattern_predictability.csv");
+        opt.rudyBackgroundCsvPath = inCmbDir("step0_rudy_background.csv");
+        opt.dashboardCsvPath = inCmbDir("step0_dashboard.csv");
+        opt.signalConflictCsvPath = inCmbDir("step0_signal_conflicts.csv");
+        opt.textReportPath = inCmbDir("step0_cmb_report.txt");
+        opt.verbose = ROUTER_DIAG_ENABLE;
+        opt.topPrintCount = ROUTER_DIAG_TOP_CHANNELS;
+        opt.narrowComponentCap = NARROW_COMPONENT_CAP;
+
+        CongestionMapBuilder builder(opt);
+        Step0CongestionMapResult result = builder.build(design);
+        g_channelCriticality = result.channelCriticality();
+        g_channelAmbientLR = result.channelAmbientDemandLR();
+        g_channelAmbientTB = result.channelAmbientDemandTB();
+        g_step0ConnectionPriority = result.connectionRoutePriority();
+
+        if (g_channelCriticality.size() != design.channels.size()) {
+            g_channelCriticality.assign(design.channels.size(), 0.0);
         }
-        if (maxDemand > EPS) for (double& v : g_channelCriticality) v /= maxDemand;
+        if (g_channelAmbientLR.size() != design.channels.size()) {
+            g_channelAmbientLR.assign(design.channels.size(), 0.0);
+        }
+        if (g_channelAmbientTB.size() != design.channels.size()) {
+            g_channelAmbientTB.assign(design.channels.size(), 0.0);
+        }
+        if (g_step0ConnectionPriority.size() != design.connections.size()) {
+            g_step0ConnectionPriority.assign(design.connections.size(), 0.0);
+        }
     }
 
-    // ³Ì²× router-side diagnosis¡C
+    // æœ€çµ‚ router-side diagnosisã€‚
     //
-    // ³o¸Ì¦L¥Xªº¤£¬O©x¤è evaluator ªº³Ì²×¤À¼Æ¡A¦Ó¬O Router ¦Û¤v®Ú¾Ú¥Ø«e PATH
-    // ­«·s­pºâ¥Xªº directional usage summary¡C­«ÂI¬OÀ°§A debug¡G
-    //   1. ­ş¨Ç soft block ³Q FT ¬ï¶V¡A¦ô­p»İ­n¦h¤Ö­±¿nÂX¼W¡C
-    //   2. ­ş¨Ç channel ªº LR/TB ¤è¦V usage / capacity / overflow ³Ì°ª¡C
-    //   3. maxUtilComp ·|©ú½T«ü¥X²~ÀV¬O¤ô¥­ LR ÁÙ¬O««ª½ TB¡C
+    // é€™è£¡å°å‡ºçš„ä¸æ˜¯å®˜æ–¹ evaluator çš„æœ€çµ‚åˆ†æ•¸ï¼Œè€Œæ˜¯ Router è‡ªå·±æ ¹æ“šç›®å‰ PATH
+    // é‡æ–°è¨ˆç®—å‡ºçš„ directional usage summaryã€‚é‡é»æ˜¯å¹«ä½  debugï¼š
+    //   1. å“ªäº› soft block è¢« FT ç©¿è¶Šï¼Œä¼°è¨ˆéœ€è¦å¤šå°‘é¢ç©æ“´å¢ã€‚
+    //   2. å“ªäº› channel çš„ LR/TB æ–¹å‘ usage / capacity / overflow æœ€é«˜ã€‚
+    //   3. maxUtilComp æœƒæ˜ç¢ºæŒ‡å‡ºç“¶é ¸æ˜¯æ°´å¹³ LR é‚„æ˜¯å‚ç›´ TBã€‚
     //
-    // ­Y evaluator ¤]§ï¦¨¦P¼Ë directional ¼Ò«¬¡A³o¸Ìªº¤è¦V overflow À³¸Ó·|»P
-    // evaluator report ¶V¨Ó¶V¤@­P¡C
+    // è‹¥ evaluator ä¹Ÿæ”¹æˆåŒæ¨£ directional æ¨¡å‹ï¼Œé€™è£¡çš„æ–¹å‘ overflow æ‡‰è©²æœƒèˆ‡
+    // evaluator report è¶Šä¾†è¶Šä¸€è‡´ã€‚
     void printFinalDiagnosis(const Design& design) {
         if (!ROUTER_DIAG_ENABLE) return;
         cerr << fixed << setprecision(3);
@@ -744,25 +819,25 @@ namespace {
 // -----------------------------------------------------------------------------
 // Router::run
 // -----------------------------------------------------------------------------
-// ¾ãÅé routing ¥D¬yµ{¡G
+// æ•´é«” routing ä¸»æµç¨‹ï¼š
 //
-// 0. ²MªÅ routes¡Bchannel usage¡Bsoft block FT usage¡C
-// 1. «Ø¥ß channel criticality¡G¥Î connection bbox ²Ê¦ô­ş¨Ç channel ¥i¯à¬O¥ş§½ bottleneck¡C
-// 2. ¥Ø«e baseline ¤´±Ä¥Î netCount ¤j¨ì¤pªº greedy routing order¡C
-// 3. ¹ï¨C±ø connection ¥ı¶] Step1~4 strict routing¡G
+// 0. æ¸…ç©º routesã€channel usageã€soft block FT usageã€‚
+// 1. å»ºç«‹ channel criticalityï¼šç”¨ connection bbox ç²—ä¼°å“ªäº› channel å¯èƒ½æ˜¯å…¨å±€ bottleneckã€‚
+// 2. ç›®å‰ baseline ä»æ¡ç”¨ netCount å¤§åˆ°å°çš„ greedy routing orderã€‚
+// 3. å°æ¯æ¢ connection å…ˆè·‘ Step1~4 strict routingï¼š
 //      Step1A: channel-only whole, 85% capacity reservation
 //      Step1B: channel-only whole, full capacity
 //      Step2A: channel-only limited split, 90% reservation
 //      Step2B: channel-only limited split, full capacity
 //      Step3 : FT-enabled whole
 //      Step4 : FT-enabled limited split
-// 4. Step1~4 ¥ş¥¢±ÑªÌ¥ı©ñ¤J deferred¡A¤£¥ß¨è overflow¡C
-// 5. ©Ò¦³ strict-routable connection ³£ route §¹«á¡A¤~¹ï deferred connection ¶] Step5¡C
-//      Step5: channel-only whole + allow overflow¡C
-// 6. ³Ì«á¦L¥X directional channel report »P FT report¡C
+// 4. Step1~4 å…¨å¤±æ•—è€…å…ˆæ”¾å…¥ deferredï¼Œä¸ç«‹åˆ» overflowã€‚
+// 5. æ‰€æœ‰ strict-routable connection éƒ½ route å®Œå¾Œï¼Œæ‰å° deferred connection è·‘ Step5ã€‚
+//      Step5: channel-only whole + allow overflowã€‚
+// 6. æœ€å¾Œå°å‡º directional channel report èˆ‡ FT reportã€‚
 //
-// ª`·N¡G³oª©¤´µM¬O baseline¡A¤£§t rip-up/reroute¡A¤]¨S¦³¦h routing order rerun¡C
-// ¦]¦¹¥¦¤´¥i¯à¦]«e­±ªº greedy commit ¾É­P«á­± connection ³Q­¢ deferred¡C
+// æ³¨æ„ï¼šé€™ç‰ˆä»ç„¶æ˜¯ baselineï¼Œä¸å« rip-up/rerouteï¼Œä¹Ÿæ²’æœ‰å¤š routing order rerunã€‚
+// å› æ­¤å®ƒä»å¯èƒ½å› å‰é¢çš„ greedy commit å°è‡´å¾Œé¢ connection è¢«è¿« deferredã€‚
 // -----------------------------------------------------------------------------
 void Router::run(Design& design) {
     design.routes.clear();
@@ -780,10 +855,40 @@ void Router::run(Design& design) {
 
     buildChannelCriticalityLocal(design);
 
-    vector<Connection> conns = design.connections;
-    sort(conns.begin(), conns.end(), [](const Connection& a, const Connection& b) {
-        return a.netCount > b.netCount;
+    // V6.1ï¼šrouting order æ”¹ç”¨ Step0 routePriorityã€‚
+    // é€™æ˜¯ NTHU-Route 2.0ã€Œordering mattersã€ç²¾ç¥åœ¨ Problem E çš„ç°¡åŒ–è½‰è­¯ï¼š
+    // å…ˆ route é«˜éœ€æ±‚ã€æ›¿ä»£è·¯å°‘ã€open-risk / bottleneck-risk è¼ƒé«˜çš„ connectionï¼Œ
+    // é¿å…å®¹æ˜“ç¹çš„ net å…ˆä½”ä½ critical channelã€‚
+    vector<int> connOrder(design.connections.size());
+    for (int i = 0; i < static_cast<int>(connOrder.size()); ++i) connOrder[i] = i;
+
+    sort(connOrder.begin(), connOrder.end(), [&](int ia, int ib) {
+        const double pa = (ia >= 0 && ia < static_cast<int>(g_step0ConnectionPriority.size())) ? g_step0ConnectionPriority[ia] : 0.0;
+        const double pb = (ib >= 0 && ib < static_cast<int>(g_step0ConnectionPriority.size())) ? g_step0ConnectionPriority[ib] : 0.0;
+        if (fabs(pa - pb) > 1.0e-9) return pa > pb;
+        const Connection& a = design.connections[ia];
+        const Connection& b = design.connections[ib];
+        if (a.netCount != b.netCount) return a.netCount > b.netCount;
+        if (a.src != b.src) return a.src < b.src;
+        return a.dst < b.dst;
         });
+
+    vector<Connection> conns;
+    conns.reserve(connOrder.size());
+    for (int idx : connOrder) conns.push_back(design.connections[idx]);
+
+    if (ROUTER_DIAG_ENABLE) {
+        cerr << "[RouterRefined][STEP0_ORDER] using Step0 routePriority order";
+        const int lim = min(10, static_cast<int>(connOrder.size()));
+        for (int k = 0; k < lim; ++k) {
+            int idx = connOrder[k];
+            const Connection& c = design.connections[idx];
+            const double p = (idx < static_cast<int>(g_step0ConnectionPriority.size())) ? g_step0ConnectionPriority[idx] : 0.0;
+            cerr << " #" << idx << "(" << design.blocks[c.src].spec.name << "->" << design.blocks[c.dst].spec.name
+                << ",nets=" << c.netCount << ",prio=" << fixed << setprecision(1) << p << ")";
+        }
+        cerr << "\n";
+    }
 
     auto routeWithPolicy = [&](const Design& d, const Connection& c, RouteMode mode, bool allowOverflow,
         double capacityScale, bool splitRouting) -> RoutePath {
@@ -829,12 +934,12 @@ void Router::run(Design& design) {
         int ftPathCountAdded = 0;
     };
 
-    // split health check¡C
+    // split health checkã€‚
 //
-// ³o­ÓÀË¬d¥Î¨ÓÁ×§K unhealthy split¡G
-//   1. split route ÁöµM¨C±ø³£¨S¦³ overflow¡A¦ı³Ì«á§â¦P¤@­Ó channel component ¶ë¨ì«Üº¡¡C
-//   2. ¦h¼Æ split chunks ³£¸g¹L¦P¤@­Ó bottleneck¡A¥Nªí¥¦¨S¦³¯u¥¿¤À¬y¡C
-//   3. ¤À¬y«á¨Ï¥Î·¥¯¶ component¡A¥¼¨Ó«Ü®e©ö¾É­P¨ä¥L connection open/overflow¡C
+// é€™å€‹æª¢æŸ¥ç”¨ä¾†é¿å… unhealthy splitï¼š
+//   1. split route é›–ç„¶æ¯æ¢éƒ½æ²’æœ‰ overflowï¼Œä½†æœ€å¾ŒæŠŠåŒä¸€å€‹ channel component å¡åˆ°å¾ˆæ»¿ã€‚
+//   2. å¤šæ•¸ split chunks éƒ½ç¶“éåŒä¸€å€‹ bottleneckï¼Œä»£è¡¨å®ƒæ²’æœ‰çœŸæ­£åˆ†æµã€‚
+//   3. åˆ†æµå¾Œä½¿ç”¨æ¥µçª„ componentï¼Œæœªä¾†å¾ˆå®¹æ˜“å°è‡´å…¶ä»– connection open/overflowã€‚
     auto splitTrialHealthy = [&](const Design& base, const Design& trial, const map<pair<int, DirComponent>, int>& hitCount,
         const map<pair<int, DirComponent>, double>& splitLoad, int addedRoutes) -> bool {
             if (addedRoutes <= 0) return false;
@@ -861,18 +966,18 @@ void Router::run(Design& design) {
             return true;
         };
 
-    // limited split ¹Á¸Õ¡C
+    // limited split å˜—è©¦ã€‚
 //
-// Split ªº¥Øªº¤£¬O¡u§â connection ¤Á¨ì«Ü¸H´N¤@©w¶ë¶i¥h¡v¡A¦Ó¬O¡G
-//   ¤j connection whole route ¹L¤£¤F®É¡A¹Á¸Õ§â¥¦¤Á¦¨¤Ö¼Æ´X±ø¸û¤jªº chunk¡A
-//   Åı¤£¦P chunk ¥i¥H¨«¤£¦P°·±d³q¹D¡C
+// Split çš„ç›®çš„ä¸æ˜¯ã€ŒæŠŠ connection åˆ‡åˆ°å¾ˆç¢å°±ä¸€å®šå¡é€²å»ã€ï¼Œè€Œæ˜¯ï¼š
+//   å¤§ connection whole route éä¸äº†æ™‚ï¼Œå˜—è©¦æŠŠå®ƒåˆ‡æˆå°‘æ•¸å¹¾æ¢è¼ƒå¤§çš„ chunkï¼Œ
+//   è®“ä¸åŒ chunk å¯ä»¥èµ°ä¸åŒå¥åº·é€šé“ã€‚
 //
-// ¥»ª©­­¨î¡G
-//   - chunk ¥u¤¹³\ 300 / 100 / 50 / 20¡C
-//   - split «á route ¼Æ¤£¯à¶W¹L MAX_SPLIT_ROUTES¡C
-//   - ¨C±ø chunk path ¤£­ã³y¦¨ directional overflow¡C
-//   - ¨C±ø chunk path ¤£­ã¸g¹L narrow component¡C
-//   - splitTrialHealthy() ·|©Úµ´¡u¦h¼Æ chunk ³£¶ë¦P¤@­Ó bottleneck¡vªº°²¤À¬y¡C
+// æœ¬ç‰ˆé™åˆ¶ï¼š
+//   - chunk åªå…è¨± 300 / 100 / 50 / 20ã€‚
+//   - split å¾Œ route æ•¸ä¸èƒ½è¶…é MAX_SPLIT_ROUTESã€‚
+//   - æ¯æ¢ chunk path ä¸å‡†é€ æˆ directional overflowã€‚
+//   - æ¯æ¢ chunk path ä¸å‡†ç¶“é narrow componentã€‚
+//   - splitTrialHealthy() æœƒæ‹’çµ•ã€Œå¤šæ•¸ chunk éƒ½å¡åŒä¸€å€‹ bottleneckã€çš„å‡åˆ†æµã€‚
     auto trySplit = [&](const Design& base, const Connection& conn, RouteMode mode, double splitCapScale) -> TrialResult {
         const int chunkCandidates[] = { SPLIT_CHUNK_SIZE_1, SPLIT_CHUNK_SIZE_2, SPLIT_CHUNK_SIZE_3, SPLIT_CHUNK_SIZE_4 };
         TrialResult best;
@@ -997,16 +1102,16 @@ void Router::run(Design& design) {
             << " diagnosis=" << diagnosis << "\n";
         };
 
-    // ¹Á¸Õ Step1~4 strict routing¡C
-// ¦^¶Ç true ¥Nªí¦¹ connection ¤w¸g³Q¦¨¥\ route ¨Ã commit ¨ì design¡C
-// ¦^¶Ç false ¥Nªí strict routing ¥ş¥¢±Ñ¡A»İ­n¥æµ¹ deferred Step5¡C
+    // å˜—è©¦ Step1~4 strict routingã€‚
+// å›å‚³ true ä»£è¡¨æ­¤ connection å·²ç¶“è¢«æˆåŠŸ route ä¸¦ commit åˆ° designã€‚
+// å›å‚³ false ä»£è¡¨ strict routing å…¨å¤±æ•—ï¼Œéœ€è¦äº¤çµ¦ deferred Step5ã€‚
 //
-// ³o¸Ìªº©Ò¦³ Step1~4 ³£¤£¤¹³\ channel overflow¡G
-//   - Dijkstra ¹Lµ{¤¤ directionalChannelPenalty() ·|¥H g_capacityScale ÀË¬d
-//     projected LR/TB usage ¬O§_¶W¹L¦³®Ä®e¶q¡C
-//   - §ä¨ì path «á analyzeRoute() ¤´·|¦A°µ projected overflow ÀË¬d¡C
+// é€™è£¡çš„æ‰€æœ‰ Step1~4 éƒ½ä¸å…è¨± channel overflowï¼š
+//   - Dijkstra éç¨‹ä¸­ directionalChannelPenalty() æœƒä»¥ g_capacityScale æª¢æŸ¥
+//     projected LR/TB usage æ˜¯å¦è¶…éæœ‰æ•ˆå®¹é‡ã€‚
+//   - æ‰¾åˆ° path å¾Œ analyzeRoute() ä»æœƒå†åš projected overflow æª¢æŸ¥ã€‚
 //
-// Step1/2 ¬O¥D­n router¡FStep3/4 ¥u¦³¦b soft block ´X¦ó¤W¥i§@¬°¤¤Ä~®É¤~·|µo´§¡C
+// Step1/2 æ˜¯ä¸»è¦ routerï¼›Step3/4 åªæœ‰åœ¨ soft block å¹¾ä½•ä¸Šå¯ä½œç‚ºä¸­ç¹¼æ™‚æ‰æœƒç™¼æ®ã€‚
     auto tryStrictStep1To4 = [&](Design& d, const Connection& conn) -> bool {
         RoutePath chWhole = routeWithPolicy(d, conn, RouteMode::CHANNEL_ONLY, false, CAP_SCALE_CH_WHOLE_RESERVED, false);
         RouteMetrics chWholeM = analyzeRoute(d, chWhole);
@@ -1128,23 +1233,23 @@ void Router::run(Design& design) {
 // Node and graph construction
 // -----------------------------------------------------------------------------
 // buildNodes():
-//   ±N©Ò¦³ block »P channel ³£Âà¦¨ Dijkstra graph ªº node¡C
-//   node.index ªº·N¸q¨Ì isBlock ¨M©w¡G
-//     isBlock=true  -> index ¹ïÀ³ design.blocks[index]
-//     isBlock=false -> index ¹ïÀ³ design.channels[index]
+//   å°‡æ‰€æœ‰ block èˆ‡ channel éƒ½è½‰æˆ Dijkstra graph çš„ nodeã€‚
+//   node.index çš„æ„ç¾©ä¾ isBlock æ±ºå®šï¼š
+//     isBlock=true  -> index å°æ‡‰ design.blocks[index]
+//     isBlock=false -> index å°æ‡‰ design.channels[index]
 //
 // buildGraph():
-//   ¹ï¨C¤@¹ï node ÀË¬d¥¦­Ìªº rectangle ¬O§_¦³¦Xªk edge contact¡C
-//   ­Y¨â­Ó rectangle ¶KÃä¥B§ë¼v overlap > TOUCH_OVERLAP_EPS¡A´N«Ø¥ßÂù¦VÃä¡C
-//   AdjEdge ·|°O¿ı¡G
-//     to       : ¾F©~ node id
-//     edgeFrom : ±q¥Ø«e node ªº­ş­Ó edge Â÷¶}
-//     edgeTo   : ¶i¤J¾F©~ node ªº­ş­Ó edge
-//     baseCost : ´X¦ó¶ZÂ÷ªñ¦ü¡A¨Ñ Dijkstra wireCost ¨Ï¥Î
+//   å°æ¯ä¸€å° node æª¢æŸ¥å®ƒå€‘çš„ rectangle æ˜¯å¦æœ‰åˆæ³• edge contactã€‚
+//   è‹¥å…©å€‹ rectangle è²¼é‚Šä¸”æŠ•å½± overlap > TOUCH_OVERLAP_EPSï¼Œå°±å»ºç«‹é›™å‘é‚Šã€‚
+//   AdjEdge æœƒè¨˜éŒ„ï¼š
+//     to       : é„°å±… node id
+//     edgeFrom : å¾ç›®å‰ node çš„å“ªå€‹ edge é›¢é–‹
+//     edgeTo   : é€²å…¥é„°å±… node çš„å“ªå€‹ edge
+//     baseCost : å¹¾ä½•è·é›¢è¿‘ä¼¼ï¼Œä¾› Dijkstra wireCost ä½¿ç”¨
 //
 // touchWithEdges():
-//   ­t³d§PÂ_¥|ºØ±µÄ²¡Gright-left¡Bleft-right¡Btop-bottom¡Bbottom-top¡C
-//   edge ½s¸¹¿í´`ÃD¥Ø¡G1=left, 2=top, 3=right, 4=bottom¡C
+//   è² è²¬åˆ¤æ–·å››ç¨®æ¥è§¸ï¼šright-leftã€left-rightã€top-bottomã€bottom-topã€‚
+//   edge ç·¨è™Ÿéµå¾ªé¡Œç›®ï¼š1=left, 2=top, 3=right, 4=bottomã€‚
 // -----------------------------------------------------------------------------
 vector<Router::Node> Router::buildNodes(const Design& design) const {
     vector<Node> nodes;
@@ -1218,38 +1323,38 @@ double Router::nodePenalty(const Design& design, const Node& node, int netCount)
 // -----------------------------------------------------------------------------
 // Directional edge-state Dijkstra
 // -----------------------------------------------------------------------------
-// ³o¬O¥» Router ³Ì­«­nªº¨ç¦¡¡G¹ï¡u¤@²Õ connection¡v¥Î Dijkstra §ä¸ô¡C
+// é€™æ˜¯æœ¬ Router æœ€é‡è¦çš„å‡½å¼ï¼šå°ã€Œä¸€çµ„ connectionã€ç”¨ Dijkstra æ‰¾è·¯ã€‚
 //
-// ¬°¤°»ò¤£¬O´¶³q Dijkstra¡H
-//   ´¶³q Dijkstra state ¥u¦³ nodeId¡A¨Ò¦p CH10¡C³o¼Ë¥uª¾¹D¸ô®|¸g¹L CH10¡A
-//   ¦ı¤£ª¾¹D¦b CH10 ¤º¬O left->right¡Btop->bottom¡AÁÙ¬O L-shape turn¡C
-//   ¤è¦V®e¶q¥²¶·ª¾¹D inEdge/outEdge¡A©Ò¥H¥»ª© state §ï¬°¡G
+// ç‚ºä»€éº¼ä¸æ˜¯æ™®é€š Dijkstraï¼Ÿ
+//   æ™®é€š Dijkstra state åªæœ‰ nodeIdï¼Œä¾‹å¦‚ CH10ã€‚é€™æ¨£åªçŸ¥é“è·¯å¾‘ç¶“é CH10ï¼Œ
+//   ä½†ä¸çŸ¥é“åœ¨ CH10 å…§æ˜¯ left->rightã€top->bottomï¼Œé‚„æ˜¯ L-shape turnã€‚
+//   æ–¹å‘å®¹é‡å¿…é ˆçŸ¥é“ inEdge/outEdgeï¼Œæ‰€ä»¥æœ¬ç‰ˆ state æ”¹ç‚ºï¼š
 //       state = (nodeId, inEdge)
-//   ¨ä¤¤ inEdge=0 ¥u¥Nªí source °_ÂI©|¥¼¶i¤J¥ô¦ó rectangle¡C
+//   å…¶ä¸­ inEdge=0 åªä»£è¡¨ source èµ·é»å°šæœªé€²å…¥ä»»ä½• rectangleã€‚
 //
-// Dijkstra transition ªº·N¸q¡G
-//   ¥Ø«e state ¦b node u¡A¥B uIn ªí¥Ü¡u¶i¤J u ªº edge¡v¡C
-//   ¹Á¸Õ¨«¨ì¾F©~ v ®É¡AAdjEdge ·|´£¨Ñ¡G
-//       e.edgeFrom = ±q u ªº­ş­Ó edge Â÷¶}
-//       e.edgeTo   = ±q v ªº­ş­Ó edge ¶i¤J
-//   ­Y u ¬O¤¤Ä~ channel¡AuIn + e.edgeFrom ´N§Î¦¨¤@¦¸ channel ¤º³¡ traversal¡A
-//   ¦¹®É¥ß¨è­pºâ¸Ó traversal ¹ï LR/TB ®e¶qªº¨Ï¥Î»P cost¡C
+// Dijkstra transition çš„æ„ç¾©ï¼š
+//   ç›®å‰ state åœ¨ node uï¼Œä¸” uIn è¡¨ç¤ºã€Œé€²å…¥ u çš„ edgeã€ã€‚
+//   å˜—è©¦èµ°åˆ°é„°å±… v æ™‚ï¼ŒAdjEdge æœƒæä¾›ï¼š
+//       e.edgeFrom = å¾ u çš„å“ªå€‹ edge é›¢é–‹
+//       e.edgeTo   = å¾ v çš„å“ªå€‹ edge é€²å…¥
+//   è‹¥ u æ˜¯ä¸­ç¹¼ channelï¼ŒuIn + e.edgeFrom å°±å½¢æˆä¸€æ¬¡ channel å…§éƒ¨ traversalï¼Œ
+//   æ­¤æ™‚ç«‹åˆ»è¨ˆç®—è©² traversal å° LR/TB å®¹é‡çš„ä½¿ç”¨èˆ‡ costã€‚
 //
-// Cost ²Ó¸`¡G
+// Cost ç´°ç¯€ï¼š
 //   wireCost = ROUTER_WIRE_WEIGHT * e.baseCost * netCount
-//     e.baseCost ¥Ø«e¨Ï¥Î¨â­Ó rectangle center ªº Manhattan ¶ZÂ÷¡AÄİ©ó global
-//     routing ªñ¦ü¡F³Ì«á¿é¥Xªº wireLength ·|¥Ñ calcRouteWireLength() ­«·s­pºâ¡C
-//   resourcePenalty¡G
-//     - ­Y¤¤Ä~¬O channel¡G©I¥s directionalChannelPenalty()¡A®Ú¾Ú in/out edge
-//       ¨M©w¦Y LR¡BTB ©Î¨âªÌ¡A¨ÃÀË¬d capacity reservation / split guard / Step5 overflow¡C
-//     - ­Y¤¤Ä~¬O soft block¡G¦b FT_ENABLED mode ¤U¤¹³\¡A¨Ã¥[¤J softFTPenaltyLocal()¡C
-//     - hard / edge block ¤£¯à·í¤¤Ä~¡C
+//     e.baseCost ç›®å‰ä½¿ç”¨å…©å€‹ rectangle center çš„ Manhattan è·é›¢ï¼Œå±¬æ–¼ global
+//     routing è¿‘ä¼¼ï¼›æœ€å¾Œè¼¸å‡ºçš„ wireLength æœƒç”± calcRouteWireLength() é‡æ–°è¨ˆç®—ã€‚
+//   resourcePenaltyï¼š
+//     - è‹¥ä¸­ç¹¼æ˜¯ channelï¼šå‘¼å« directionalChannelPenalty()ï¼Œæ ¹æ“š in/out edge
+//       æ±ºå®šåƒ LRã€TB æˆ–å…©è€…ï¼Œä¸¦æª¢æŸ¥ capacity reservation / split guard / Step5 overflowã€‚
+//     - è‹¥ä¸­ç¹¼æ˜¯ soft blockï¼šåœ¨ FT_ENABLED mode ä¸‹å…è¨±ï¼Œä¸¦åŠ å…¥ softFTPenaltyLocal()ã€‚
+//     - hard / edge block ä¸èƒ½ç•¶ä¸­ç¹¼ã€‚
 //
-// ¿é¥X path ®æ¦¡¡G
-//   ÃD¥Ø­n¨D°£¤F°_ÂI»P²×ÂI¤§¥~¡A¤¤¶¡¨C­Ó rectangle ³£¥²¶·¤@¶i¤@¥X¡C
-//   ¥»¨ç¦¡¦b¦^·¹ parent state ®É¡A¹ï¨C¤@¬q u->v ¿é¥X¡G
+// è¼¸å‡º path æ ¼å¼ï¼š
+//   é¡Œç›®è¦æ±‚é™¤äº†èµ·é»èˆ‡çµ‚é»ä¹‹å¤–ï¼Œä¸­é–“æ¯å€‹ rectangle éƒ½å¿…é ˆä¸€é€²ä¸€å‡ºã€‚
+//   æœ¬å‡½å¼åœ¨å›æº¯ parent state æ™‚ï¼Œå°æ¯ä¸€æ®µ u->v è¼¸å‡ºï¼š
 //       {u, edgeOutOfU}, {v, edgeIntoV}
-//   ¦]¦¹¤¤¶¡ rectangle ·|¦ÛµM§Î¦¨¡GCHx in, CHx out ªº pair ®æ¦¡¡C
+//   å› æ­¤ä¸­é–“ rectangle æœƒè‡ªç„¶å½¢æˆï¼šCHx in, CHx out çš„ pair æ ¼å¼ã€‚
 // -----------------------------------------------------------------------------
 RoutePath Router::routeOneConnection(const Design& design, const Connection& conn) const {
     RoutePath result;
@@ -1392,14 +1497,13 @@ double Router::calcRouteWireLength(const Design& design, const RoutePath& path) 
 }
 
 // updateUsage():
-//   ÂÂª©¬O¥u§â path ¸g¹Lªº¨C­Ó channel usedNets += netCount¡C
-//   ³o¦b directional capacity ¤U¤£°÷¡A¦]¬°¦P¤@­Ó channel ªº LR/TB ¨Ï¥Î¶q¤£¦P¡C
+//   èˆŠç‰ˆæ˜¯åªæŠŠ path ç¶“éçš„æ¯å€‹ channel usedNets += netCountã€‚
+//   é€™åœ¨ directional capacity ä¸‹ä¸å¤ ï¼Œå› ç‚ºåŒä¸€å€‹ channel çš„ LR/TB ä½¿ç”¨é‡ä¸åŒã€‚
 //
-//   ¥»ª©°µªk¡G±µ¨ü route «á¡Aª½±µ±q design.routes ­«ºâ©Ò¦³ directional usage¡A
-//   ¦A¦^¶ñ legacy scalar Äæ¦ì¡CÁöµM®Ä²v¤£¬O³Ì¨Î¡A¦ı§@¬° baseline ³Ì¦w¥ş¡A
-//   ¤]Á×§K incremental update º|ºâ L-shape / FT pair¡C
+//   æœ¬ç‰ˆåšæ³•ï¼šæ¥å— route å¾Œï¼Œç›´æ¥å¾ design.routes é‡ç®—æ‰€æœ‰ directional usageï¼Œ
+//   å†å›å¡« legacy scalar æ¬„ä½ã€‚é›–ç„¶æ•ˆç‡ä¸æ˜¯æœ€ä½³ï¼Œä½†ä½œç‚º baseline æœ€å®‰å…¨ï¼Œ
+//   ä¹Ÿé¿å… incremental update æ¼ç®— L-shape / FT pairã€‚
 void Router::updateUsage(Design& design, const RoutePath& path) const {
     (void)path;
     recomputeRouterUsageFields(design);
 }
-
