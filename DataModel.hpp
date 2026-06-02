@@ -53,7 +53,7 @@ struct BlockSpec {
     // index 1: >3000 && <=6000
     // index 2: >6000 && <=9000
     // index 3: >9000
-    double ftRate[4] = { 0.20, 0.40, 0.80, 1.00 };
+    double ftRate[4] = {0.20, 0.40, 0.80, 1.00};
 };
 
 struct BlockInst {
@@ -95,6 +95,67 @@ struct RoutePath {
     double wireLength = 0.0;
 };
 
+struct RouteTruth {
+    int routeId = -1;
+    int netCount = 0;
+    std::string srcBlock;
+    std::string dstBlock;
+    int itemCount = 0;
+    int guidingPointCount = 0;
+    int channelTraversalCount = 0;
+    int feedthroughTraversalCount = 0;
+    bool explicitOpen = false;
+    bool invalid = false;
+    std::string invalidReason;
+    std::string invalidDetail;
+    double wireLength = 0.0;
+};
+
+struct ChannelTruth {
+    std::string name;
+    Rect rect;
+    double lrUsed = 0.0;
+    double tbUsed = 0.0;
+    double lrCapacity = 0.0;
+    double tbCapacity = 0.0;
+    double lrUtilization = 0.0;
+    double tbUtilization = 0.0;
+    double lrOverflow = 0.0;
+    double tbOverflow = 0.0;
+    int lrTraversalCount = 0;
+    int tbTraversalCount = 0;
+    int turnTraversalCount = 0;
+};
+
+struct ChannelSegmentTruth {
+    int routeId = -1;
+    std::string channelName;
+    int netCount = 0;
+    int inEdge = 0;
+    int outEdge = 0;
+    double fromX = 0.0;
+    double fromY = 0.0;
+    double toX = 0.0;
+    double toY = 0.0;
+    double lrDemand = 0.0;
+    double tbDemand = 0.0;
+    double lrSpanLo = 0.0;
+    double lrSpanHi = 0.0;
+    double tbSpanLo = 0.0;
+    double tbSpanHi = 0.0;
+};
+
+struct FeedthroughTruth {
+    std::string blockName;
+    double usedNets = 0.0;
+    double conversionRate = 0.0;
+    double sideDelta = 0.0;
+    double baseArea = 0.0;
+    double currentArea = 0.0;
+    double requiredArea = 0.0;
+    double overflowArea = 0.0;
+};
+
 struct Design {
     double maxOutlineW = 0.0;
     double maxOutlineH = 0.0;
@@ -126,6 +187,7 @@ struct EvalReport {
     double maxFeedthroughOverflow = 0.0;
 
     bool formatFailed = false;
+    bool pathInvalid = false;
     bool blockOverlap = false;
     bool routingOpen = false;
     bool outlineViolation = false;
@@ -133,6 +195,19 @@ struct EvalReport {
     int overlapCount = 0;
     int openPathCount = 0;
     int outlineViolationCount = 0;
+    int invalidPathCount = 0;
+    int badTopologyCount = 0;
+    int unknownObjectCount = 0;
+    int badItemCount = 0;
+    int illegalFeedthroughCount = 0;
+    int contactFailCount = 0;
+    int sameObjectSameEdgeCount = 0;
+    int edgePortViolationCount = 0;
+
+    std::vector<RouteTruth> routeTruth;
+    std::vector<ChannelTruth> channelTruth;
+    std::vector<ChannelSegmentTruth> channelSegments;
+    std::vector<FeedthroughTruth> feedthroughTruth;
 
     bool hasPenalty() const;
     bool hasFail() const;
