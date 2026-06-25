@@ -1,6 +1,7 @@
 #include "Parser.hpp"
 #include "Utility.hpp"
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <fstream>
 #include <iostream>
@@ -8,6 +9,50 @@
 #include <unordered_map>
 
 using namespace std;
+
+namespace {
+
+string stripUtf8Bom(string s) {
+    if (s.size() >= 3 &&
+        static_cast<unsigned char>(s[0]) == 0xEF &&
+        static_cast<unsigned char>(s[1]) == 0xBB &&
+        static_cast<unsigned char>(s[2]) == 0xBF) {
+        s.erase(0, 3);
+    }
+    return s;
+}
+
+string normalizedHeaderCell(const string& cell) {
+    string u = upperStr(trim(cell));
+    string out;
+    for (unsigned char c : u) {
+        if (isalnum(c)) out.push_back(static_cast<char>(c));
+    }
+    return out;
+}
+
+bool cellAt(const vector<string>& row, int col, string& out) {
+    if (col < 0 || col >= static_cast<int>(row.size())) return false;
+    out = trim(row[col]);
+    return !out.empty();
+}
+
+bool tryParseCellDouble(const vector<string>& row, int col, double& out) {
+    string cell;
+    return cellAt(row, col, cell) && tryParseDouble(cell, out);
+}
+
+bool isAlphaLabelCell(const string& cell) {
+    string t = trim(cell);
+    string key = normalizedHeaderCell(t);
+    if (key == "ALPHA") return true;
+
+    // UTF-8 Greek alpha, lower/upper.  Keep this as byte escapes so the
+    // parser does not depend on the source file encoding.
+    return t.find("\xCE\xB1") != string::npos || t.find("\xCE\x91") != string::npos;
+}
+
+} // namespace
 
 bool Parser::read(const string& inputPath, Design& design) {
     vector<vector<string>> rows;
@@ -18,6 +63,7 @@ bool Parser::read(const string& inputPath, Design& design) {
 
     parseBlockRows(rows, design);
     parseOutline(rows, design);
+    parseAlpha(rows, design);
     parseConnectionMatrix(rows, design);
     buildConnections(design);
 
@@ -28,7 +74,7 @@ bool Parser::read(const string& inputPath, Design& design) {
 
     if (design.maxOutlineW <= EPS || design.maxOutlineH <= EPS) {
         cerr << "[Parser] Invalid outline. maxOutlineW=" << design.maxOutlineW
-             << " maxOutlineH=" << design.maxOutlineH << "\n";
+            << " maxOutlineH=" << design.maxOutlineH << "\n";
         return false;
     }
 
@@ -47,17 +93,64 @@ bool Parser::read(const string& inputPath, Design& design) {
 }
 
 bool Parser::readCSV(const string& path, vector<vector<string>>& rows) {
-    ifstream fin(path);
+    ifstream fin(path, ios::binary);
     if (!fin) return false;
 
-    string line;
-    while (getline(fin, line)) {
-        if (!line.empty() && static_cast<unsigned char>(line[0]) == 0xEF) {
-            if (line.size() >= 3) line = line.substr(3);
+    string record;
+    bool inQuote = false;
+    char ch = '\0';
+    while (fin.get(ch)) {
+        if (ch == '"') {
+            record.push_back(ch);
+            if (inQuote && fin.peek() == '"') {
+                char escaped = '\0';
+                fin.get(escaped);
+                record.push_back(escaped);
+            }
+            else {
+                inQuote = !inQuote;
+            }
         }
-        rows.push_back(splitCSVLine(line));
+        else if ((ch == '\n' || ch == '\r') && !inQuote) {
+            if (ch == '\r' && fin.peek() == '\n') {
+                char lf = '\0';
+                fin.get(lf);
+            }
+            rows.push_back(splitCSVLine(stripUtf8Bom(record)));
+            record.clear();
+        }
+        else {
+            record.push_back(ch);
+        }
     }
+
+    if (!record.empty()) {
+        rows.push_back(splitCSVLine(stripUtf8Bom(record)));
+    }
+
     return true;
+}
+
+Parser::BlockColumns Parser::detectBlockColumns(const vector<vector<string>>& rows) {
+    for (const auto& row : rows) {
+        BlockColumns cols;
+        for (int i = 0; i < static_cast<int>(row.size()); ++i) {
+            string key = normalizedHeaderCell(row[i]);
+            if (key == "BLOCK") cols.name = i;
+            else if (key == "AREA") cols.area = i;
+            else if (key == "WIDTH") cols.width = i;
+            else if (key == "HEIGHT") cols.height = i;
+            else if (key == "ASPECTRATIORANGE") cols.aspect = i;
+            else if (key == "EDGEHARDMACROSOFT" || key == "EDGEHARDMACROSOFTTYPE") cols.type = i;
+            else if (key == "LOCATION") cols.location = i;
+            else if (key == "PORTEDGE") cols.portEdge = i;
+            else if (key == "FTCONVERSION") cols.ftConversion = i;
+        }
+
+        if (cols.valid()) return cols;
+    }
+
+    return {};
 }
 
 BlockType Parser::parseBlockTypeFromRow(const vector<string>& row) {
@@ -85,6 +178,43 @@ vector<double> Parser::numericValuesInRow(const vector<string>& row) {
     return nums;
 }
 
+bool Parser::parseAspectRangeCell(const string& cell, double& amin, double& amax) {
+    string t = trim(cell);
+    if (t.empty()) return false;
+
+    vector<string> parts;
+    string cur;
+    for (char c : t) {
+        if (c == ',' || c == '~' || c == '-') {
+            if (!trim(cur).empty()) parts.push_back(trim(cur));
+            cur.clear();
+        }
+        else {
+            cur.push_back(c);
+        }
+    }
+    if (!trim(cur).empty()) parts.push_back(trim(cur));
+
+    if (parts.size() >= 2) {
+        double a = 0.0;
+        double b = 0.0;
+        if (tryParseDouble(parts[0], a) && tryParseDouble(parts[1], b)) {
+            amin = min(a, b);
+            amax = max(a, b);
+            return true;
+        }
+    }
+
+    double v = 0.0;
+    if (tryParseDouble(t, v) && v > EPS) {
+        amin = v;
+        amax = v;
+        return true;
+    }
+
+    return false;
+}
+
 bool Parser::parseAspectRange(const vector<string>& row, double& amin, double& amax) {
     for (const string& cell : row) {
         string t = trim(cell);
@@ -97,7 +227,8 @@ bool Parser::parseAspectRange(const vector<string>& row, double& amin, double& a
                 if (c == ',') {
                     if (!trim(cur).empty()) parts.push_back(trim(cur));
                     cur.clear();
-                } else {
+                }
+                else {
                     cur.push_back(c);
                 }
             }
@@ -133,6 +264,20 @@ vector<string> Parser::parseLocationsFromRow(const vector<string>& row) {
     return locs;
 }
 
+vector<int> Parser::parsePortEdgesFromCell(const string& cell) {
+    vector<int> edges;
+    for (string part : splitByCommaOrSlash(cell)) {
+        double v = 0.0;
+        if (!tryParseDouble(part, v)) continue;
+        int edge = static_cast<int>(llround(v));
+        if (edge >= 1 && edge <= 4 && find(edges.begin(), edges.end(), edge) == edges.end()) {
+            edges.push_back(edge);
+        }
+    }
+    sort(edges.begin(), edges.end());
+    return edges;
+}
+
 vector<double> Parser::parsePercentRates(const vector<string>& row) {
     vector<double> rates;
     for (const string& cell : row) {
@@ -146,32 +291,69 @@ vector<double> Parser::parsePercentRates(const vector<string>& row) {
     return rates;
 }
 
+vector<double> Parser::parsePercentRatesFromColumns(const vector<string>& row, int startCol) {
+    vector<double> rates;
+    if (startCol < 0) return rates;
+
+    for (int i = startCol; i < static_cast<int>(row.size()) && rates.size() < 4; ++i) {
+        string t = trim(row[i]);
+        if (t.empty()) continue;
+
+        double v = 0.0;
+        if (!tryParseDouble(t, v)) continue;
+        if (t.find('%') != string::npos || v > 1.0) v /= 100.0;
+        rates.push_back(v);
+    }
+
+    return rates;
+}
+
 void Parser::parseBlockRows(const vector<vector<string>>& rows, Design& design) {
     design.blockSpecs.clear();
+    const BlockColumns cols = detectBlockColumns(rows);
 
     for (const auto& row : rows) {
         int first = firstNonEmptyIndex(row);
         if (first < 0) continue;
 
         string name = trim(row[first]);
+        if (cols.valid() && cols.name < static_cast<int>(row.size())) {
+            name = trim(row[cols.name]);
+        }
         if (!startsWithBlockName(name)) continue;
 
-        BlockType type = parseBlockTypeFromRow(row);
+        BlockType type = BlockType::UNKNOWN;
+        if (cols.valid() && cols.type < static_cast<int>(row.size())) {
+            type = parseBlockTypeFromRow(vector<string>{ row[cols.type] });
+        }
+        if (type == BlockType::UNKNOWN) type = parseBlockTypeFromRow(row);
         if (type == BlockType::UNKNOWN) continue;
 
         vector<double> nums = numericValuesInRow(row);
-        if (nums.empty()) continue;
 
         BlockSpec spec;
         spec.name = name;
         spec.type = type;
-        spec.area = nums[0];
+        if (cols.valid()) {
+            if (!tryParseCellDouble(row, cols.area, spec.area)) continue;
+        }
+        else {
+            if (nums.empty()) continue;
+            spec.area = nums[0];
+        }
 
         double w = 0.0;
         double h = 0.0;
-        if (nums.size() >= 3) {
+        if (cols.valid()) {
+            tryParseCellDouble(row, cols.width, w);
+            tryParseCellDouble(row, cols.height, h);
+        }
+        else if (nums.size() >= 3) {
             w = nums[1];
             h = nums[2];
+        }
+
+        if (w > EPS && h > EPS) {
             if (type == BlockType::SOFT && (w <= 100.0 || h <= 100.0)) {
                 w = 0.0;
                 h = 0.0;
@@ -182,7 +364,8 @@ void Parser::parseBlockRows(const vector<vector<string>>& rows, Design& design) 
             spec.hasFixedSize = true;
             spec.fixedW = w;
             spec.fixedH = h;
-        } else if (w > EPS && h > EPS && fabs(w * h - spec.area) / max(1.0, spec.area) < 0.50) {
+        }
+        else if (w > EPS && h > EPS && fabs(w * h - spec.area) / max(1.0, spec.area) < 0.50) {
             spec.hasFixedSize = true;
             spec.fixedW = w;
             spec.fixedH = h;
@@ -190,23 +373,47 @@ void Parser::parseBlockRows(const vector<vector<string>>& rows, Design& design) 
 
         double amin = 1.0;
         double amax = 1.0;
-        if (parseAspectRange(row, amin, amax)) {
+        bool aspectOk = false;
+        if (cols.valid() && cols.aspect >= 0 && cols.aspect < static_cast<int>(row.size())) {
+            aspectOk = parseAspectRangeCell(row[cols.aspect], amin, amax);
+        }
+        if (!aspectOk && !cols.valid()) {
+            aspectOk = parseAspectRange(row, amin, amax);
+        }
+
+        if (aspectOk) {
             spec.aspectMin = amin;
             spec.aspectMax = amax;
-        } else if (type == BlockType::SOFT) {
+        }
+        else if (type == BlockType::SOFT) {
             spec.aspectMin = 0.5;
             spec.aspectMax = 2.0;
-        } else {
+        }
+        else {
             spec.aspectMin = 1.0;
             spec.aspectMax = 1.0;
         }
 
-        spec.locations = parseLocationsFromRow(row);
+        if (cols.valid() && cols.location >= 0 && cols.location < static_cast<int>(row.size())) {
+            spec.locations = parseLocationsFromRow(vector<string>{ row[cols.location] });
+        }
+        else {
+            spec.locations = parseLocationsFromRow(row);
+        }
 
-        vector<double> rates = parsePercentRates(row);
+        if (cols.valid() && cols.portEdge >= 0 && cols.portEdge < static_cast<int>(row.size())) {
+            spec.portEdges = parsePortEdgesFromCell(row[cols.portEdge]);
+        }
+
+        vector<double> rates;
+        if (cols.valid() && cols.ftConversion >= 0) {
+            rates = parsePercentRatesFromColumns(row, cols.ftConversion);
+        }
+        if (rates.empty()) rates = parsePercentRates(row);
         if (rates.size() >= 4) {
             for (int i = 0; i < 4; ++i) spec.ftRate[i] = rates[i];
-        } else {
+        }
+        else {
             vector<double> maybeRates;
             for (double v : nums) {
                 if (v == 20.0 || v == 40.0 || v == 80.0 || v == 100.0) {
@@ -222,7 +429,7 @@ void Parser::parseBlockRows(const vector<vector<string>>& rows, Design& design) 
     }
 
     sort(design.blockSpecs.begin(), design.blockSpecs.end(),
-         [](const BlockSpec& a, const BlockSpec& b) { return a.name < b.name; });
+        [](const BlockSpec& a, const BlockSpec& b) { return a.name < b.name; });
 }
 
 void Parser::parseOutline(const vector<vector<string>>& rows, Design& design) {
@@ -253,6 +460,24 @@ void Parser::parseOutline(const vector<vector<string>>& rows, Design& design) {
                 design.maxOutlineW = nums[0];
                 design.maxOutlineH = nums[1];
                 return;
+            }
+        }
+    }
+}
+
+void Parser::parseAlpha(const vector<vector<string>>& rows, Design& design) {
+    design.alpha = 1.0;
+
+    for (const auto& row : rows) {
+        for (int c = 0; c < static_cast<int>(row.size()); ++c) {
+            if (!isAlphaLabelCell(row[c])) continue;
+
+            for (int k = c + 1; k < static_cast<int>(row.size()); ++k) {
+                double v = 0.0;
+                if (tryParseDouble(row[k], v)) {
+                    design.alpha = v;
+                    return;
+                }
             }
         }
     }
@@ -331,7 +556,7 @@ void Parser::buildConnections(Design& design) {
     for (int i = 0; i < n; ++i) {
         for (int j = 0; j < static_cast<int>(design.connMatrix[i].size()); ++j) {
             int nets = design.connMatrix[i][j];
-            if (nets > 0) design.connections.push_back({i, j, nets});
+            if (nets > 0) design.connections.push_back({ i, j, nets });
         }
     }
 }

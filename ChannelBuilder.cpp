@@ -14,8 +14,8 @@ namespace {
     //
     // Important: direction-aware capacity is NOT fully representable by the old
     // scalar Channel::capacity field.  The real capacities are:
-    //   LR component, edge 1 <-> 3 : rect.w * CHANNEL_DENSITY
-    //   TB component, edge 2 <-> 4 : rect.h * CHANNEL_DENSITY
+    //   LR component, edge 1 <-> 3 : rect.h * CHANNEL_DENSITY
+    //   TB component, edge 2 <-> 4 : rect.w * CHANNEL_DENSITY
     // The evaluator/router should compute these two values from ch.rect.
     //
     // ChannelBuilder only owns static geometry.  It initializes the legacy scalar

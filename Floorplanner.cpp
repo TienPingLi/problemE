@@ -8,6 +8,7 @@
 #include <limits>
 #include <numeric>
 #include <random>
+#include <queue>
 #include <string>
 #include <vector>
 
@@ -37,6 +38,22 @@ namespace {
     static constexpr int FAST_HEIGHT_BISECT = 3; // used only by optional local refinement
     static constexpr int FAST_RANDOM_ORDERS = 2; // base; makeOrders() scales this with block count
     static constexpr int FAST_RANDOM_SHAPES = 0;
+    // SOFT shape perturbation + predicted feedthrough reserve.
+    // The current engine is not a full SA loop, so these are implemented as
+    // deterministic / stochastic shape-state perturbations before each pack.
+    static constexpr bool ENABLE_SOFT_SHAPE_PERTURB = true;
+    static constexpr bool ENABLE_FT_SOFT_RESERVE = true;
+    static constexpr int SOFT_SHAPE_TARGET_STATES = 18;
+    static constexpr int SOFT_SHAPE_RANDOM_STATES = 14;
+    static constexpr double SOFT_SHAPE_LOG_SIGMA = 0.42;
+    static constexpr double SOFT_SHAPE_HOT_EXTREME_BIAS = 0.33;
+    static constexpr double FT_SOFT_EXPAND_MIN_RATE = 0.000;
+    static constexpr double FT_SOFT_EXPAND_MAX_RATE = 0.700;
+    static constexpr double FT_SOFT_EXPAND_BASE_RATE = 0.018;
+    static constexpr double FT_SOFT_MULTI_NET_BONUS = 0.070;
+    static constexpr double FT_SOFT_EDGE_BONUS = 0.030;
+    static constexpr double FT_SOFT_KEEP_CHANNEL_GAP_SCALE = 0.38;
+    static constexpr double FT_SOFT_KEEP_CHANNEL_GAP_CAP = 24.0;
     static constexpr double HPWL_TIE_WEIGHT = 0.012;
     static constexpr double CENTER_TIE_WEIGHT = 1.0e-5;
     static constexpr double ROUTE_GAP_TIE_WEIGHT = 0.080;
@@ -82,6 +99,33 @@ namespace {
     static constexpr int DSU_MAX_VIOLPAIR_INCREASE = 1;
     static constexpr int DSU_MAX_PASSES = 18;
     static constexpr bool FAST_VERBOSE_LOG = true;
+
+
+    // ============================================================================
+    //  B*-tree area-only simulated annealing
+    // ----------------------------------------------------------------------------
+    //  This is the main SA generator.  The Metropolis cost is intentionally only
+    //  outline area (W * H).  Routing pressure / port-window / soft feedthrough
+    //  reserve affect only:
+    //    1) perturb bias: which topology / soft-shape / outline move to try;
+    //    2) packing: B*-tree child spacing and obstacle avoidance use required gap.
+    // ============================================================================
+    static constexpr bool ENABLE_BSTAR_AREA_SA = true;
+    static constexpr int BSTAR_INIT_TRIAL_CAP = 900;
+    static constexpr int BSTAR_SA_INNER_FACTOR = 14;
+    static constexpr int BSTAR_SA_MIN_INNER = 48;
+    static constexpr int BSTAR_SA_MAX_OUTER = 140;
+    static constexpr int BSTAR_SA_MAX_MOVES_CAP = 12000;
+    static constexpr double BSTAR_SA_INIT_ACCEPT_P = 0.90;
+    static constexpr double BSTAR_SA_COOL = 0.875;
+    static constexpr double BSTAR_SA_MIN_TEMP = 1.0e-4;
+    static constexpr double BSTAR_OUTLINE_LOG_SIGMA = 0.055;
+    static constexpr double BSTAR_OUTLINE_SHRINK_BIAS = -0.018;
+    static constexpr double BSTAR_OUTLINE_GROW_SIGMA = 0.035;
+    static constexpr double BSTAR_SOFT_LOCAL_LOG_SIGMA = 0.36;
+    static constexpr double BSTAR_PACK_DEVIATION_WEIGHT = 1.0e-4;
+    static constexpr int BSTAR_ROOT_CAND_LIMIT = 42;
+    static constexpr int BSTAR_CHILD_X_CAND_LIMIT = 24;
 
 
     static double sqr(double x) { return x * x; }
@@ -179,6 +223,116 @@ namespace {
         return s;
     }
 
+    static bool smallOfficialLikeCase(const Design& design) {
+        return design.blockSpecs.size() <= 10;
+    }
+
+    static double softFtExpansionMaxRateForDesign(const Design& design) {
+        if (smallOfficialLikeCase(design)) return 0.020;
+        if (design.blockSpecs.size() >= 45) return 0.520;
+        return FT_SOFT_EXPAND_MAX_RATE;
+    }
+
+    static double maxEndpointDemand(const Design& design) {
+        double best = 1.0;
+        for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) {
+            best = max(best, endpointDemand(design, i));
+        }
+        return best;
+    }
+
+    static double maxPairConnFrom(const Design& design, int id) {
+        double best = 0.0;
+        for (int j = 0; j < static_cast<int>(design.blockSpecs.size()); ++j) {
+            if (j == id) continue;
+            best = max(best, static_cast<double>(totalConnBetween(design, id, j)));
+        }
+        return best;
+    }
+
+    static double softFtExpansionRate(const Design& design, int id) {
+        if (!ENABLE_FT_SOFT_RESERVE) return 0.0;
+        if (id < 0 || id >= static_cast<int>(design.blockSpecs.size())) return 0.0;
+        const BlockSpec& s = design.blockSpecs[id];
+        if (s.type != BlockType::SOFT || s.hasFixedSize) return 0.0;
+
+        const double ep = endpointDemand(design, id);
+        if (ep <= 0.0) return FT_SOFT_EXPAND_MIN_RATE;
+        const double maxEp = maxEndpointDemand(design);
+        const double hot = clampD(ep / max(1.0, maxEp), 0.0, 1.0);
+        const double maxPair = maxPairConnFrom(design, id);
+        const double spread = clampD(1.0 - maxPair / max(1.0, ep), 0.0, 1.0);
+
+        // Two-hop hub proxy: if a soft block connects strongly to multiple blocks,
+        // it is more likely to become a useful feedthrough bridge after routing.
+        double twoHop = 0.0;
+        for (int a = 0; a < static_cast<int>(design.blockSpecs.size()); ++a) {
+            if (a == id) continue;
+            const double ca = totalConnBetween(design, id, a);
+            if (ca <= 0.0) continue;
+            for (int b = a + 1; b < static_cast<int>(design.blockSpecs.size()); ++b) {
+                if (b == id) continue;
+                const double cb = totalConnBetween(design, id, b);
+                if (cb <= 0.0) continue;
+                twoHop += min(ca, cb);
+            }
+        }
+        const double hub = clampD(twoHop / max(1.0, ep * max(1.0, static_cast<double>(design.blockSpecs.size()) - 2.0)), 0.0, 1.0);
+
+        double edgeTouch = 0.0;
+        for (int j = 0; j < static_cast<int>(design.blockSpecs.size()); ++j) {
+            if (j == id) continue;
+            if (design.blockSpecs[j].type == BlockType::EDGE) edgeTouch += totalConnBetween(design, id, j);
+        }
+        edgeTouch = clampD(edgeTouch / max(1.0, ep), 0.0, 1.0);
+
+        const double maxRate = softFtExpansionMaxRateForDesign(design);
+        double rate = FT_SOFT_EXPAND_BASE_RATE;
+        rate += maxRate * (0.56 * sqrt(hot) + 0.24 * spread + 0.20 * sqrt(hub));
+        rate += FT_SOFT_MULTI_NET_BONUS * spread * sqrt(hot);
+        rate += FT_SOFT_EDGE_BONUS * edgeTouch;
+        return clampD(rate, FT_SOFT_EXPAND_MIN_RATE, maxRate);
+    }
+
+    static double blockPackingArea(const Design& design, int id) {
+        if (id < 0 || id >= static_cast<int>(design.blockSpecs.size())) return 1.0;
+        const double base = blockNominalArea(design.blockSpecs[id]);
+        return base * (1.0 + softFtExpansionRate(design, id));
+    }
+
+    static double totalPackingArea(const Design& design) {
+        double a = 0.0;
+        for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) a += blockPackingArea(design, i);
+        return max(1.0, a);
+    }
+
+    static Rect makePackingShape(const Design& design, int id, double ratio) {
+        const BlockSpec& s = design.blockSpecs[id];
+        Rect r;
+        r.x = r.y = 0.0;
+        if (s.hasFixedSize) {
+            r.w = s.fixedW;
+            r.h = s.fixedH;
+            return r;
+        }
+        double amin = max(0.05, s.aspectMin);
+        double amax = max(amin, s.aspectMax);
+        ratio = clampD(ratio > 0.0 ? ratio : aspectMid(s), amin, amax);
+        double area = blockPackingArea(design, id);
+        r.w = sqrt(area * ratio);
+        r.h = area / max(TINY, r.w);
+        return r;
+    }
+
+    static double ftSoftKeepChannelGapBonus(const Design& design, int a, int b, double fullDirect) {
+        if (!ENABLE_FT_SOFT_RESERVE) return 0.0;
+        const double ra = softFtExpansionRate(design, a);
+        const double rb = softFtExpansionRate(design, b);
+        const double rate = max(ra, rb) + 0.35 * min(ra, rb);
+        if (rate <= 0.0) return 0.0;
+        return clampD(fullDirect * FT_SOFT_KEEP_CHANNEL_GAP_SCALE * rate, 0.0, FT_SOFT_KEEP_CHANNEL_GAP_CAP);
+    }
+
     static double requiredForNets(const Design& design, int nets) {
         if (nets <= 0) return PACK_GAP;
         // Raw physical lower bound from the problem rule: 25 nets / um.
@@ -245,6 +399,10 @@ namespace {
 
         const double fullDirect = requiredForNets(design, nets);
         double req = fullDirect * splitAwarePairScale(design, a, b, nets);
+        // FT-reserved soft macros are already enlarged before packing; this small
+        // bonus prevents the reserved area from silently consuming the neighboring
+        // routing channel and causing overflow later.
+        req += ftSoftKeepChannelGapBonus(design, a, b, fullDirect);
 
         // Endpoint pressure from the sourcecode's port-window idea: even a modest
         // pair should not be packed with a numerical zero gap if both endpoints are
@@ -390,6 +548,31 @@ namespace {
             else { v += fabs(rectRight(rc) - W); v += max(0.0, b.first - rc.y); v += max(0.0, rectTop(rc) - b.second); }
             best = min(best, v);
         }
+        for (char side : { 'T', 'B', 'L', 'R' }) {
+            bool used = false;
+            double lo = 0.0;
+            double hi = 0.0;
+            for (const EdgeRule& r : edgeRules(spec)) {
+                if (!r.valid || r.side != side) continue;
+                auto b = zoneBounds(r, W, H);
+                if (!used) {
+                    used = true;
+                    lo = b.first;
+                    hi = b.second;
+                }
+                else {
+                    lo = min(lo, b.first);
+                    hi = max(hi, b.second);
+                }
+            }
+            if (!used) continue;
+            double v = 0.0;
+            if (side == 'T') { v += fabs(rectTop(rc) - H); v += max(0.0, lo - rc.x); v += max(0.0, rectRight(rc) - hi); }
+            else if (side == 'B') { v += fabs(rc.y); v += max(0.0, lo - rc.x); v += max(0.0, rectRight(rc) - hi); }
+            else if (side == 'L') { v += fabs(rc.x); v += max(0.0, lo - rc.y); v += max(0.0, rectTop(rc) - hi); }
+            else { v += fabs(rectRight(rc) - W); v += max(0.0, lo - rc.y); v += max(0.0, rectTop(rc) - hi); }
+            best = min(best, v);
+        }
         return best >= INF * 0.5 ? 0.0 : best;
     }
 
@@ -418,7 +601,7 @@ namespace {
         vector<Rect> shapes(n);
         for (int i = 0; i < n; ++i) {
             double ratio = (i < static_cast<int>(st.ratio.size())) ? st.ratio[i] : aspectMid(design.blockSpecs[i]);
-            shapes[i] = makeShape(design.blockSpecs[i], ratio);
+            shapes[i] = makePackingShape(design, i, ratio);
         }
         return shapes;
     }
@@ -557,7 +740,12 @@ namespace {
                     int cnt = 0;
                     for (const auto& it : items) if (it.rule.zone == z) { total += it.len; ++cnt; }
                     total += PACK_GAP * max(0, cnt - 1);
-                    double pos = clampD(0.5 * (zb.first + zb.second - total), zb.first, zb.second - total);
+                    double pos = 0.5 * (zb.first + zb.second - total);
+                    if (!smallOfficialLikeCase(design)) {
+                        if (z == 0) pos = zb.first;
+                        else if (z == 2) pos = zb.second - total;
+                    }
+                    pos = clampD(pos, zb.first, zb.second - total);
                     for (const auto& it : items) {
                         if (it.rule.zone != z) continue;
                         setEdgeAxis(rects[it.id], it.rule, pos, W, H);
@@ -569,7 +757,13 @@ namespace {
                 double total = 0.0;
                 for (const auto& it : items) total += it.len;
                 total += PACK_GAP * max(0, static_cast<int>(items.size()) - 1);
-                double pos = clampD(0.5 * (span - total), 0.0, max(0.0, span - total));
+                sort(items.begin(), items.end(), [](const EdgePlacedInfo& a, const EdgePlacedInfo& b) {
+                    if (a.rule.zone != b.rule.zone) return a.rule.zone < b.rule.zone;
+                    if (fabs(a.len - b.len) > 1e-6) return a.len < b.len;
+                    if (fabs(a.pref - b.pref) > 1e-6) return a.pref < b.pref;
+                    return a.id < b.id;
+                    });
+                double pos = clampD(0.0, 0.0, max(0.0, span - total));
                 for (const auto& it : items) {
                     setEdgeAxis(rects[it.id], it.rule, pos, W, H);
                     pos += it.len + PACK_GAP;
@@ -1184,10 +1378,68 @@ namespace {
         return uniqueOrders;
     }
 
+    static double edgeSideDemandBias(const Design& design, int id) {
+        // Positive => prefer wider SOFT block (more top/bottom span).
+        // Negative => prefer taller SOFT block (more left/right span).
+        double topBottom = 0.0;
+        double leftRight = 0.0;
+        for (int e = 0; e < static_cast<int>(design.blockSpecs.size()); ++e) {
+            if (e == id || design.blockSpecs[e].type != BlockType::EDGE) continue;
+            const int nets = totalConnBetween(design, id, e);
+            if (nets <= 0) continue;
+            vector<EdgeRule> rules = edgeRules(design.blockSpecs[e]);
+            if (rules.empty()) rules.push_back(parseRule("BL"));
+            for (const EdgeRule& r : rules) {
+                if (r.side == 'T' || r.side == 'B') topBottom += static_cast<double>(nets) / max(1, static_cast<int>(rules.size()));
+                else if (r.side == 'L' || r.side == 'R') leftRight += static_cast<double>(nets) / max(1, static_cast<int>(rules.size()));
+            }
+        }
+        return (topBottom - leftRight) / max(1.0, topBottom + leftRight);
+    }
+
+    static double smartSoftTargetRatio(const Design& design, int id, double globalBias = 1.0) {
+        const BlockSpec& s = design.blockSpecs[id];
+        double amin = max(0.05, s.aspectMin);
+        double amax = max(amin, s.aspectMax);
+        double mid = aspectMid(s);
+        if (s.hasFixedSize || s.type != BlockType::SOFT) return mid;
+
+        const double outlineRatio = clampD(design.maxOutlineW / max(1.0, design.maxOutlineH), amin, amax);
+        const double edgeBias = edgeSideDemandBias(design, id);
+        const double hot = clampD(endpointDemand(design, id) / max(1.0, maxEndpointDemand(design)), 0.0, 1.0);
+        const double ftRate = softFtExpansionRate(design, id);
+
+        // Work in log-ratio space (shape-curve xy=A).  Hot / FT-risk soft blocks
+        // are biased more strongly because their boundary length is valuable for
+        // routing and later feedthrough growth.
+        double logR = log(mid);
+        logR = 0.55 * logR + 0.45 * log(outlineRatio);
+        logR += (0.48 + 0.36 * sqrt(hot)) * edgeBias;
+        if (ftRate > 0.12) {
+            // Reserve-heavy blocks should avoid extreme skinny shapes; central ratios
+            // leave usable slack on both dimensions after expansion.
+            logR = 0.72 * logR + 0.28 * log(mid);
+        }
+        logR += log(max(0.05, globalBias));
+        return clampD(exp(logR), amin, amax);
+    }
+
     static vector<ShapeState> makeShapeStates(const Design& design) {
         int n = static_cast<int>(design.blockSpecs.size());
         vector<ShapeState> states;
-        auto make = [&](int mode) {
+        auto pushUnique = [&](const ShapeState& st) {
+            for (const auto& u : states) {
+                bool same = u.ratio.size() == st.ratio.size();
+                if (same) {
+                    for (int i = 0; i < static_cast<int>(st.ratio.size()); ++i) {
+                        if (fabs(log(max(1e-9, u.ratio[i])) - log(max(1e-9, st.ratio[i]))) > 1e-3) { same = false; break; }
+                    }
+                }
+                if (same) return;
+            }
+            states.push_back(st);
+            };
+        auto make = [&](int mode, double globalBias = 1.0) {
             ShapeState st;
             st.ratio.assign(n, 1.0);
             for (int i = 0; i < n; ++i) {
@@ -1196,44 +1448,90 @@ namespace {
                 double amax = max(amin, s.aspectMax);
                 double r = aspectMid(s);
                 if (!s.hasFixedSize) {
-                    if (mode == 1) r = clampD(1.0, amin, amax);
-                    else if (mode == 2) r = amin;
-                    else if (mode == 3) r = amax;
-                    else if (mode == 4) r = (i % 2 == 0) ? amin : amax;
-                    else if (mode == 5) r = (i % 2 == 0) ? amax : amin;
+                    if (s.type == BlockType::SOFT && ENABLE_SOFT_SHAPE_PERTURB) {
+                        double smart = smartSoftTargetRatio(design, i, globalBias);
+                        if (mode == 0) r = smart;
+                        else if (mode == 1) r = clampD(1.0 * globalBias, amin, amax);
+                        else if (mode == 2) r = amin;
+                        else if (mode == 3) r = amax;
+                        else if (mode == 4) r = clampD(sqrt(amin * smart), amin, amax);
+                        else if (mode == 5) r = clampD(sqrt(amax * smart), amin, amax);
+                        else if (mode == 6) r = (i % 2 == 0) ? amin : amax;
+                        else if (mode == 7) r = (i % 2 == 0) ? amax : amin;
+                        else r = smart;
+                    }
+                    else {
+                        if (mode == 1) r = clampD(1.0, amin, amax);
+                        else if (mode == 2) r = amin;
+                        else if (mode == 3) r = amax;
+                        else if (mode == 4) r = (i % 2 == 0) ? amin : amax;
+                        else if (mode == 5) r = (i % 2 == 0) ? amax : amin;
+                    }
                 }
                 st.ratio[i] = r;
             }
             return st;
             };
-        for (int m = 0; m <= 3; ++m) states.push_back(make(m));
+
+        // Deterministic perturbations first: these are the high-value states that
+        // will be reached even when the global candidate cap stops exploration early.
+        pushUnique(make(0, 1.0));
+        pushUnique(make(0, 0.82));
+        pushUnique(make(0, 1.22));
+        for (int m = 1; m <= 7; ++m) pushUnique(make(m, 1.0));
+
+        // Hot-block targeted states: only the most FT-risk / routing-hot soft blocks
+        // are pushed toward aspect extremes.  This mimics the SA "change soft module
+        // shape" perturbation without exploding the search space.
+        vector<int> softIds;
+        for (int i = 0; i < n; ++i) if (design.blockSpecs[i].type == BlockType::SOFT && !design.blockSpecs[i].hasFixedSize) softIds.push_back(i);
+        sort(softIds.begin(), softIds.end(), [&](int a, int b) {
+            double sa = endpointDemand(design, a) * (1.0 + softFtExpansionRate(design, a));
+            double sb = endpointDemand(design, b) * (1.0 + softFtExpansionRate(design, b));
+            if (fabs(sa - sb) > 1e-6) return sa > sb;
+            return a < b;
+            });
+        const int hotLimit = min(static_cast<int>(softIds.size()), max(2, static_cast<int>(sqrt(max(1, n))) + 2));
+        for (int t = 0; t < hotLimit; ++t) {
+            int id = softIds[t];
+            const BlockSpec& sp = design.blockSpecs[id];
+            double amin = max(0.05, sp.aspectMin);
+            double amax = max(amin, sp.aspectMax);
+            ShapeState low = make(0, 1.0), high = make(0, 1.0);
+            low.ratio[id] = clampD(exp(log(low.ratio[id]) * (1.0 - SOFT_SHAPE_HOT_EXTREME_BIAS) + log(amin) * SOFT_SHAPE_HOT_EXTREME_BIAS), amin, amax);
+            high.ratio[id] = clampD(exp(log(high.ratio[id]) * (1.0 - SOFT_SHAPE_HOT_EXTREME_BIAS) + log(amax) * SOFT_SHAPE_HOT_EXTREME_BIAS), amin, amax);
+            pushUnique(low);
+            pushUnique(high);
+        }
 
         mt19937 rng(FAST_SEED ^ (0x9e3779b9u + static_cast<unsigned>(n)));
-        for (int k = 0; k < FAST_RANDOM_SHAPES; ++k) {
-            ShapeState st;
-            st.ratio.assign(n, 1.0);
+        const int randomStates = ENABLE_SOFT_SHAPE_PERTURB ? min(SOFT_SHAPE_RANDOM_STATES, max(0, SOFT_SHAPE_TARGET_STATES - static_cast<int>(states.size()))) : FAST_RANDOM_SHAPES;
+        for (int k = 0; k < randomStates; ++k) {
+            ShapeState st = make(0, 1.0);
             for (int i = 0; i < n; ++i) {
                 const BlockSpec& sp = design.blockSpecs[i];
                 double amin = max(0.05, sp.aspectMin);
                 double amax = max(amin, sp.aspectMax);
-                double r = aspectMid(sp);
-                if (!sp.hasFixedSize) {
-                    double u = uniform_real_distribution<double>(0.0, 1.0)(rng);
-                    // Sample in log-space, with endpoints occasionally emphasized.
-                    if (k % 3 == 1 && i % 2 == 0) r = amin;
-                    else if (k % 3 == 2 && i % 2 == 1) r = amax;
-                    else r = exp(log(amin) * (1.0 - u) + log(amax) * u);
+                if (!sp.hasFixedSize && sp.type == BlockType::SOFT) {
+                    double target = smartSoftTargetRatio(design, i, 1.0);
+                    double hot = clampD(endpointDemand(design, i) / max(1.0, maxEndpointDemand(design)), 0.0, 1.0);
+                    double sigma = SOFT_SHAPE_LOG_SIGMA * (0.55 + 0.45 * sqrt(hot));
+                    normal_distribution<double> nd(0.0, sigma);
+                    double r = exp(log(target) + nd(rng));
+                    if (k % 5 == 1 && hot > 0.45) r = (edgeSideDemandBias(design, i) >= 0.0) ? amax : amin;
+                    if (k % 7 == 3) r = exp(log(amin) * 0.35 + log(amax) * 0.65);
+                    st.ratio[i] = clampD(r, amin, amax);
                 }
-                st.ratio[i] = r;
             }
-            states.push_back(st);
+            pushUnique(st);
         }
+
         return states;
     }
 
     static vector<double> makeWidthTrials(const Design& design, const ShapeState& st) {
         vector<double> wv;
-        double area = totalNominalArea(design);
+        double area = totalPackingArea(design);
         double minW = minWidthBound(design, st);
         double minH = minHeightBound(design, st);
         double aspect = design.maxOutlineW / max(1.0, design.maxOutlineH);
@@ -1255,7 +1553,7 @@ namespace {
 
     static vector<double> makeHeightTrials(const Design& design, const ShapeState& st, double W) {
         vector<double> hv;
-        const double area = totalNominalArea(design);
+        const double area = totalPackingArea(design);
         const double minH = clampD(minHeightBound(design, st), 1.0, design.maxOutlineH);
         const double base = clampD(area / max(1.0, W), minH, design.maxOutlineH);
 
@@ -1326,6 +1624,744 @@ namespace {
         }
         out = scoreLayout(design, W, H, std::move(finalRects));
         return true;
+    }
+
+
+    // --------------------------------------------------------------------------
+    // B*-tree SA state and route-aware B*-packing.
+    // --------------------------------------------------------------------------
+    struct BStarNode {
+        int block = -1;   // original design.blockSpecs index
+        int parent = -1;
+        int left = -1;    // B*-tree left child: place at parent's right side
+        int right = -1;   // B*-tree right child: place above parent
+    };
+
+    struct BStarState {
+        vector<BStarNode> node;
+        int root = -1;
+        ShapeState shape;
+        double W = 1.0;
+        double H = 1.0;
+        bool strictEdge = true;
+    };
+
+    static vector<int> movableIdsOf(const Design& design) {
+        vector<int> ids;
+        ids.reserve(design.blockSpecs.size());
+        for (int id : degreeOrder(design)) {
+            if (id >= 0 && id < static_cast<int>(design.blockSpecs.size()) && isMovableBlock(design.blockSpecs[id])) {
+                ids.push_back(id);
+            }
+        }
+        return ids;
+    }
+
+    static vector<int> filterMovableOrder(const Design& design, const vector<int>& raw) {
+        const int n = static_cast<int>(design.blockSpecs.size());
+        vector<int> out;
+        vector<char> used(n, 0);
+        for (int id : raw) {
+            if (id < 0 || id >= n || used[id] || !isMovableBlock(design.blockSpecs[id])) continue;
+            out.push_back(id);
+            used[id] = 1;
+        }
+        for (int id : degreeOrder(design)) {
+            if (id >= 0 && id < n && !used[id] && isMovableBlock(design.blockSpecs[id])) {
+                out.push_back(id);
+                used[id] = 1;
+            }
+        }
+        return out;
+    }
+
+    static BStarState makeBStarStateFromOrder(
+        const Design& design,
+        const vector<int>& rawOrder,
+        const ShapeState& st,
+        double W,
+        double H,
+        bool strictEdge
+    ) {
+        vector<int> order = filterMovableOrder(design, rawOrder);
+        BStarState bs;
+        bs.shape = st;
+        bs.W = clampD(W, 1.0, design.maxOutlineW);
+        bs.H = clampD(H, 1.0, design.maxOutlineH);
+        bs.strictEdge = strictEdge;
+        const int m = static_cast<int>(order.size());
+        bs.node.assign(m, BStarNode{});
+        bs.root = (m > 0 ? 0 : -1);
+        for (int i = 0; i < m; ++i) {
+            bs.node[i].block = order[i];
+            bs.node[i].parent = (i == 0) ? -1 : (i - 1) / 2;
+            bs.node[i].left = (2 * i + 1 < m) ? 2 * i + 1 : -1;
+            bs.node[i].right = (2 * i + 2 < m) ? 2 * i + 2 : -1;
+        }
+        return bs;
+    }
+
+    static void bstarPreorderDfs(const vector<BStarNode>& node, int u, vector<int>& out) {
+        if (u < 0 || u >= static_cast<int>(node.size())) return;
+        out.push_back(u);
+        bstarPreorderDfs(node, node[u].left, out);
+        bstarPreorderDfs(node, node[u].right, out);
+    }
+
+    static vector<int> bstarPreorder(const BStarState& bs) {
+        vector<int> out;
+        out.reserve(bs.node.size());
+        bstarPreorderDfs(bs.node, bs.root, out);
+        return out;
+    }
+
+    static bool bstarIsLeaf(const BStarState& bs, int u) {
+        return u >= 0 && u < static_cast<int>(bs.node.size()) && bs.node[u].left < 0 && bs.node[u].right < 0;
+    }
+
+    static void bstarCollectSubtree(const BStarState& bs, int u, vector<int>& out) {
+        if (u < 0 || u >= static_cast<int>(bs.node.size())) return;
+        out.push_back(u);
+        bstarCollectSubtree(bs, bs.node[u].left, out);
+        bstarCollectSubtree(bs, bs.node[u].right, out);
+    }
+
+    static bool bstarIsDescendant(const BStarState& bs, int ancestor, int maybeDesc) {
+        if (ancestor < 0 || maybeDesc < 0) return false;
+        vector<int> sub;
+        bstarCollectSubtree(bs, ancestor, sub);
+        return find(sub.begin(), sub.end(), maybeDesc) != sub.end();
+    }
+
+    static bool bstarTreeLegal(const BStarState& bs) {
+        const int m = static_cast<int>(bs.node.size());
+        if (m == 0) return bs.root < 0;
+        if (bs.root < 0 || bs.root >= m) return false;
+        vector<int> seen;
+        bstarPreorderDfs(bs.node, bs.root, seen);
+        if (static_cast<int>(seen.size()) != m) return false;
+        vector<char> mark(m, 0);
+        for (int u : seen) {
+            if (u < 0 || u >= m || mark[u]) return false;
+            mark[u] = 1;
+            int l = bs.node[u].left, r = bs.node[u].right;
+            if (l >= 0 && (l >= m || bs.node[l].parent != u)) return false;
+            if (r >= 0 && (r >= m || bs.node[r].parent != u)) return false;
+            if (l == r && l >= 0) return false;
+        }
+        if (bs.node[bs.root].parent != -1) return false;
+        return true;
+    }
+
+    static double bstarDeadspace(const Design& design, const LayoutResult& r) {
+        if (r.area <= 1.0) return 0.0;
+        return clampD((r.area - totalPackingArea(design)) / r.area, 0.0, 0.95);
+    }
+
+    static void addLimitedCoord(vector<double>& xs, double x, double lo, double hi) {
+        addCoord(xs, x, lo, hi);
+    }
+
+    static void uniquePrune(vector<double>& v, int limit) {
+        sort(v.begin(), v.end());
+        v.erase(unique(v.begin(), v.end(), [](double a, double b) { return fabs(a - b) < 1e-5; }), v.end());
+        pruneCoords(v, limit);
+    }
+
+    static double routeAwareMinYAtX(
+        const Design& design,
+        int id,
+        double x,
+        double w,
+        double h,
+        double baseY,
+        const vector<Rect>& placed,
+        const vector<int>& placedIds
+    ) {
+        double y = max(0.0, baseY);
+        for (int pass = 0; pass < static_cast<int>(placed.size()) + 8; ++pass) {
+            bool changed = false;
+            for (int k = 0; k < static_cast<int>(placed.size()); ++k) {
+                const Rect& o = placed[k];
+                int oid = (k < static_cast<int>(placedIds.size())) ? placedIds[k] : -1;
+                if (oid < 0) continue;
+                if (ovLen(x, x + w, o.x, rectRight(o)) <= EPS) continue;
+                const double gy = requiredYGap(design, id, oid);
+                // Bottom-left contour semantics: candidate is moved upward until it
+                // clears the obstacle plus route-aware vertical spacing.
+                if (y < rectTop(o) + gy && y + h + gy > o.y) {
+                    y = rectTop(o) + gy;
+                    changed = true;
+                }
+            }
+            if (!changed) break;
+        }
+        return y;
+    }
+
+    static bool chooseRootPlacement(
+        const Design& design,
+        const vector<Rect>& placed,
+        const vector<int>& placedIds,
+        const vector<Rect>& rectsSoFar,
+        const vector<char>& placedMask,
+        int id,
+        const Rect& shape,
+        double W,
+        double H,
+        Rect& out
+    ) {
+        if (shape.w > W + EPS || shape.h > H + EPS) return false;
+        const double maxX = W - shape.w;
+        const double maxY = H - shape.h;
+        vector<double> xs, ys;
+        addLimitedCoord(xs, 0.0, 0.0, maxX);
+        addLimitedCoord(ys, 0.0, 0.0, maxY);
+        addLimitedCoord(xs, maxX, 0.0, maxX);
+        addLimitedCoord(ys, maxY, 0.0, maxY);
+        for (int k = 0; k < static_cast<int>(placed.size()); ++k) {
+            const Rect& o = placed[k];
+            int oid = (k < static_cast<int>(placedIds.size())) ? placedIds[k] : -1;
+            const double gx = (oid >= 0) ? requiredXGap(design, id, oid) : PACK_GAP;
+            const double gy = (oid >= 0) ? requiredYGap(design, id, oid) : PACK_GAP;
+            addLimitedCoord(xs, rectRight(o) + gx, 0.0, maxX);
+            addLimitedCoord(xs, o.x - shape.w - gx, 0.0, maxX);
+            addLimitedCoord(xs, o.x, 0.0, maxX);
+            addLimitedCoord(xs, rectRight(o) - shape.w, 0.0, maxX);
+            addLimitedCoord(ys, rectTop(o) + gy, 0.0, maxY);
+            addLimitedCoord(ys, o.y - shape.h - gy, 0.0, maxY);
+            addLimitedCoord(ys, o.y, 0.0, maxY);
+            addLimitedCoord(ys, rectTop(o) - shape.h, 0.0, maxY);
+        }
+        uniquePrune(xs, BSTAR_ROOT_CAND_LIMIT);
+        uniquePrune(ys, BSTAR_ROOT_CAND_LIMIT);
+
+        bool found = false;
+        PlaceKey bestKey;
+        Rect best = shape;
+        for (double y0 : ys) {
+            for (double x : xs) {
+                double y = routeAwareMinYAtX(design, id, x, shape.w, shape.h, y0, placed, placedIds);
+                if (y > maxY + EPS) continue;
+                Rect cand = shape;
+                cand.x = x;
+                cand.y = y;
+                if (!inside(cand, W, H)) continue;
+                if (anyOverlapWith(cand, placed)) continue;
+                PlaceKey key;
+                key.top = rectTop(cand);
+                key.route = routeGapPenaltyForCandidate(design, placed, placedIds, id, cand);
+                key.right = rectRight(cand);
+                key.y = cand.y;
+                key.wire = partialWire(design, rectsSoFar, placedMask, id, cand);
+                key.center = fabs(rectCx(cand) - 0.5 * W) + fabs(rectCy(cand) - 0.5 * H);
+                key.x = cand.x;
+                if (!found || betterKey(key, bestKey)) {
+                    found = true;
+                    bestKey = key;
+                    best = cand;
+                }
+            }
+        }
+        if (!found) return false;
+        out = best;
+        return true;
+    }
+
+    static bool chooseBStarChildPlacement(
+        const Design& design,
+        const vector<Rect>& placed,
+        const vector<int>& placedIds,
+        const vector<Rect>& rectsSoFar,
+        const vector<char>& placedMask,
+        int id,
+        const Rect& shape,
+        const Rect& parentRect,
+        int parentId,
+        bool isLeftChild,
+        double W,
+        double H,
+        Rect& out
+    ) {
+        if (shape.w > W + EPS || shape.h > H + EPS) return false;
+        const double maxX = W - shape.w;
+        const double maxY = H - shape.h;
+        const double gx = requiredXGap(design, parentId, id);
+        const double gy = requiredYGap(design, parentId, id);
+        const double intendedX = isLeftChild ? rectRight(parentRect) + gx : parentRect.x;
+        const double baseY = isLeftChild ? 0.0 : rectTop(parentRect) + gy;
+
+        vector<double> xs;
+        addLimitedCoord(xs, intendedX, 0.0, maxX);
+        if (!isLeftChild) {
+            addLimitedCoord(xs, rectRight(parentRect) - shape.w, 0.0, maxX);
+            addLimitedCoord(xs, rectCx(parentRect) - 0.5 * shape.w, 0.0, maxX);
+        }
+        else {
+            addLimitedCoord(xs, rectRight(parentRect) + gx, 0.0, maxX);
+            addLimitedCoord(xs, parentRect.x, 0.0, maxX);
+        }
+        for (int k = 0; k < static_cast<int>(placed.size()); ++k) {
+            const Rect& o = placed[k];
+            int oid = (k < static_cast<int>(placedIds.size())) ? placedIds[k] : -1;
+            if (oid < 0) continue;
+            const double gox = requiredXGap(design, id, oid);
+            // Route-aware escape candidates are still packed by the B*-tree relation,
+            // but a few local x alternatives avoid making every failed obstacle a hard reject.
+            addLimitedCoord(xs, rectRight(o) + gox, 0.0, maxX);
+            addLimitedCoord(xs, o.x - shape.w - gox, 0.0, maxX);
+            addLimitedCoord(xs, o.x, 0.0, maxX);
+            addLimitedCoord(xs, rectRight(o) - shape.w, 0.0, maxX);
+        }
+        uniquePrune(xs, BSTAR_CHILD_X_CAND_LIMIT);
+
+        bool found = false;
+        PlaceKey bestKey;
+        Rect best = shape;
+        for (double x : xs) {
+            double y = routeAwareMinYAtX(design, id, x, shape.w, shape.h, baseY, placed, placedIds);
+            if (y > maxY + EPS) continue;
+            Rect cand = shape;
+            cand.x = x;
+            cand.y = y;
+            if (!inside(cand, W, H)) continue;
+            if (anyOverlapWith(cand, placed)) continue;
+            PlaceKey key;
+            key.top = rectTop(cand);
+            key.route = routeGapPenaltyForCandidate(design, placed, placedIds, id, cand);
+            key.right = rectRight(cand);
+            key.y = cand.y;
+            key.wire = partialWire(design, rectsSoFar, placedMask, id, cand);
+            key.center = fabs(x - intendedX) * BSTAR_PACK_DEVIATION_WEIGHT +
+                fabs(rectCx(cand) - 0.5 * W) * CENTER_TIE_WEIGHT;
+            key.x = x;
+            if (!found || betterKey(key, bestKey)) {
+                found = true;
+                bestKey = key;
+                best = cand;
+            }
+        }
+        if (!found) return false;
+        out = best;
+        return true;
+    }
+
+    static bool packBStarState(const Design& design, const BStarState& bs, LayoutResult& out) {
+        if (!bstarTreeLegal(bs)) return false;
+        if (bs.W > design.maxOutlineW + EPS || bs.H > design.maxOutlineH + EPS) return false;
+        if (bs.W < minWidthBound(design, bs.shape) - EPS || bs.H < minHeightBound(design, bs.shape) - EPS) return false;
+
+        vector<Rect> shapes = makeShapes(design, bs.shape);
+        vector<Rect> rects;
+        vector<Rect> edgeObstacles;
+        if (!placeEdgesFast(design, shapes, bs.W, bs.H, rects, edgeObstacles, bs.strictEdge)) return false;
+
+        vector<Rect> placed;
+        vector<int> placedIds;
+        vector<char> placedMask(design.blockSpecs.size(), 0);
+        for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) {
+            if (design.blockSpecs[i].type == BlockType::EDGE) {
+                if (!inside(rects[i], bs.W, bs.H)) return false;
+                placed.push_back(rects[i]);
+                placedIds.push_back(i);
+                placedMask[i] = 1;
+            }
+        }
+
+        vector<int> order = bstarPreorder(bs);
+        for (int u : order) {
+            const int id = bs.node[u].block;
+            if (id < 0 || id >= static_cast<int>(design.blockSpecs.size())) return false;
+            Rect shape = shapes[id];
+            Rect cand;
+            if (u == bs.root) {
+                if (!chooseRootPlacement(design, placed, placedIds, rects, placedMask, id, shape, bs.W, bs.H, cand)) return false;
+            }
+            else {
+                int p = bs.node[u].parent;
+                if (p < 0 || p >= static_cast<int>(bs.node.size())) return false;
+                const int pid = bs.node[p].block;
+                if (pid < 0 || pid >= static_cast<int>(rects.size()) || !placedMask[pid]) return false;
+                bool isLeftChild = (bs.node[p].left == u);
+                if (!chooseBStarChildPlacement(design, placed, placedIds, rects, placedMask,
+                    id, shape, rects[pid], pid, isLeftChild, bs.W, bs.H, cand)) return false;
+            }
+            rects[id] = cand;
+            placed.push_back(cand);
+            placedIds.push_back(id);
+            placedMask[id] = 1;
+        }
+
+        for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) {
+            if (!placedMask[i]) return false;
+        }
+
+        out = scoreLayout(design, bs.W, bs.H, std::move(rects));
+        return out.legal && out.strictEdgeLegal && out.overlap <= EPS && out.outlineViol <= EPS;
+    }
+
+    static bool bstarAreaBetter(const LayoutResult& a, const LayoutResult& b) {
+        if (a.legal != b.legal) return a.legal;
+        if (a.strictEdgeLegal != b.strictEdgeLegal) return a.strictEdgeLegal;
+        if (fabs(a.area - b.area) > max(1.0, 1.0e-6 * min(a.area, b.area))) return a.area < b.area;
+        // Tie-break only after equal area.  This does not enter SA acceptance.
+        if (fabs(a.routePenalty - b.routePenalty) > 1.0) return a.routePenalty < b.routePenalty;
+        return a.hpwl < b.hpwl;
+    }
+
+    static double bstarAreaCost(const LayoutResult& r) {
+        return r.area;
+    }
+
+    static bool makeInitialBStarLegalState(const Design& design, BStarState& bestState, LayoutResult& bestLayout) {
+        vector<vector<int>> orders = makeOrders(design);
+        vector<ShapeState> states = makeShapeStates(design);
+        if (states.empty()) {
+            ShapeState st;
+            st.ratio.assign(design.blockSpecs.size(), 1.0);
+            for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) st.ratio[i] = aspectMid(design.blockSpecs[i]);
+            states.push_back(st);
+        }
+        bool have = false;
+        int tried = 0;
+        for (const ShapeState& st : states) {
+            vector<double> widths = makeWidthTrials(design, st);
+            // Prefer smaller outlines first, but include the full outline as recovery.
+            sort(widths.begin(), widths.end());
+            for (const vector<int>& order : orders) {
+                for (double W : widths) {
+                    vector<double> heights = makeHeightTrials(design, st, W);
+                    sort(heights.begin(), heights.end());
+                    for (double H : heights) {
+                        if (++tried > BSTAR_INIT_TRIAL_CAP && have) return true;
+                        BStarState bs = makeBStarStateFromOrder(design, order, st, W, H, true);
+                        LayoutResult cur;
+                        if (!packBStarState(design, bs, cur)) continue;
+                        if (!have || bstarAreaBetter(cur, bestLayout)) {
+                            have = true;
+                            bestState = std::move(bs);
+                            bestLayout = std::move(cur);
+                        }
+                    }
+                }
+            }
+        }
+        if (!have) {
+            ShapeState st = states.front();
+            vector<int> order = degreeOrder(design);
+            BStarState bs = makeBStarStateFromOrder(design, order, st, design.maxOutlineW, design.maxOutlineH, false);
+            LayoutResult cur;
+            if (packBStarState(design, bs, cur)) {
+                bestState = std::move(bs);
+                bestLayout = std::move(cur);
+                have = true;
+            }
+        }
+        return have;
+    }
+
+    static int pickHotMovableNode(const Design& design, const BStarState& bs, mt19937& rng) {
+        vector<double> weights(bs.node.size(), 0.0);
+        double sum = 0.0;
+        for (int u = 0; u < static_cast<int>(bs.node.size()); ++u) {
+            const int id = bs.node[u].block;
+            double w = 1.0 + sqrt(max(0.0, endpointDemand(design, id)));
+            w *= 1.0 + 2.0 * softFtExpansionRate(design, id);
+            weights[u] = w;
+            sum += w;
+        }
+        if (sum <= 0.0) return uniform_int_distribution<int>(0, max(0, static_cast<int>(bs.node.size()) - 1))(rng);
+        double r = uniform_real_distribution<double>(0.0, sum)(rng);
+        for (int u = 0; u < static_cast<int>(weights.size()); ++u) {
+            r -= weights[u];
+            if (r <= 0.0) return u;
+        }
+        return static_cast<int>(weights.size()) - 1;
+    }
+
+    static void bstarSwapBlocks(BStarState& bs, int a, int b) {
+        if (a == b || a < 0 || b < 0 || a >= static_cast<int>(bs.node.size()) || b >= static_cast<int>(bs.node.size())) return;
+        swap(bs.node[a].block, bs.node[b].block);
+    }
+
+    static bool bstarMoveLeaf(BStarState& bs, mt19937& rng) {
+        const int m = static_cast<int>(bs.node.size());
+        if (m <= 1) return false;
+        vector<int> leaves;
+        for (int u = 0; u < m; ++u) {
+            if (u != bs.root && bstarIsLeaf(bs, u)) leaves.push_back(u);
+        }
+        if (leaves.empty()) return false;
+        int u = leaves[uniform_int_distribution<int>(0, static_cast<int>(leaves.size()) - 1)(rng)];
+        int pOld = bs.node[u].parent;
+        if (pOld < 0) return false;
+        if (bs.node[pOld].left == u) bs.node[pOld].left = -1;
+        else if (bs.node[pOld].right == u) bs.node[pOld].right = -1;
+        bs.node[u].parent = -1;
+
+        int target = -1;
+        for (int t = 0; t < 32; ++t) {
+            int cand = uniform_int_distribution<int>(0, m - 1)(rng);
+            if (cand == u) continue;
+            target = cand;
+            break;
+        }
+        if (target < 0) {
+            // restore
+            bs.node[u].parent = pOld;
+            if (bs.node[pOld].left < 0) bs.node[pOld].left = u;
+            else bs.node[pOld].right = u;
+            return false;
+        }
+        bool leftSide = uniform_int_distribution<int>(0, 1)(rng) == 0;
+        int oldChild = leftSide ? bs.node[target].left : bs.node[target].right;
+        if (leftSide) bs.node[target].left = u;
+        else bs.node[target].right = u;
+        bs.node[u].parent = target;
+        if (oldChild >= 0) {
+            if (uniform_int_distribution<int>(0, 1)(rng) == 0) bs.node[u].left = oldChild;
+            else bs.node[u].right = oldChild;
+            bs.node[oldChild].parent = u;
+        }
+        return bstarTreeLegal(bs);
+    }
+
+    static void bstarFlipChildren(BStarState& bs, int u) {
+        if (u < 0 || u >= static_cast<int>(bs.node.size())) return;
+        swap(bs.node[u].left, bs.node[u].right);
+    }
+
+    static bool bstarResizeSoft(const Design& design, BStarState& bs, mt19937& rng) {
+        vector<int> cand;
+        for (int u = 0; u < static_cast<int>(bs.node.size()); ++u) {
+            int id = bs.node[u].block;
+            if (id >= 0 && id < static_cast<int>(design.blockSpecs.size())) {
+                const BlockSpec& sp = design.blockSpecs[id];
+                if (sp.type == BlockType::SOFT && !sp.hasFixedSize) cand.push_back(id);
+            }
+        }
+        if (cand.empty()) return false;
+        int id;
+        if (uniform_real_distribution<double>(0.0, 1.0)(rng) < 0.70) {
+            int best = cand.front();
+            double bestScore = -1.0;
+            for (int c : cand) {
+                double sc = endpointDemand(design, c) * (1.0 + softFtExpansionRate(design, c));
+                sc *= 0.85 + 0.30 * uniform_real_distribution<double>(0.0, 1.0)(rng);
+                if (sc > bestScore) { bestScore = sc; best = c; }
+            }
+            id = best;
+        }
+        else {
+            id = cand[uniform_int_distribution<int>(0, static_cast<int>(cand.size()) - 1)(rng)];
+        }
+        const BlockSpec& sp = design.blockSpecs[id];
+        const double amin = max(0.05, sp.aspectMin);
+        const double amax = max(amin, sp.aspectMax);
+        double cur = (id < static_cast<int>(bs.shape.ratio.size())) ? bs.shape.ratio[id] : smartSoftTargetRatio(design, id, 1.0);
+        const double hot = clampD(endpointDemand(design, id) / max(1.0, maxEndpointDemand(design)), 0.0, 1.0);
+        normal_distribution<double> nd(0.0, BSTAR_SOFT_LOCAL_LOG_SIGMA * (0.65 + 0.35 * sqrt(hot)));
+        double r = exp(log(max(1e-9, cur)) + nd(rng));
+        if (uniform_real_distribution<double>(0.0, 1.0)(rng) < 0.18 + 0.20 * hot) {
+            r = (edgeSideDemandBias(design, id) >= 0.0) ? amax : amin;
+        }
+        bs.shape.ratio[id] = clampD(r, amin, amax);
+        return true;
+    }
+
+    static void bstarResizeOutline(const Design& design, BStarState& bs, const LayoutResult& curLayout, mt19937& rng) {
+        const double dead = bstarDeadspace(design, curLayout);
+        const double shrinkBias = BSTAR_OUTLINE_SHRINK_BIAS - 0.020 * clampD(dead / 0.25, 0.0, 1.0);
+        normal_distribution<double> shrinkND(shrinkBias, BSTAR_OUTLINE_LOG_SIGMA);
+        normal_distribution<double> growND(0.020, BSTAR_OUTLINE_GROW_SIGMA);
+        const bool grow = uniform_real_distribution<double>(0.0, 1.0)(rng) < 0.22;
+        double fx = exp(grow ? growND(rng) : shrinkND(rng));
+        double fy = exp(grow ? growND(rng) : shrinkND(rng));
+        // Sometimes change aspect instead of pure area to escape bad B*-tree shapes.
+        if (uniform_real_distribution<double>(0.0, 1.0)(rng) < 0.45) {
+            double a = exp(normal_distribution<double>(0.0, 0.055)(rng));
+            fx *= a;
+            fy /= a;
+        }
+        bs.W = clampD(bs.W * fx, minWidthBound(design, bs.shape), design.maxOutlineW);
+        bs.H = clampD(bs.H * fy, minHeightBound(design, bs.shape), design.maxOutlineH);
+    }
+
+    static void bstarPerturb(const Design& design, BStarState& bs, const LayoutResult& curLayout, mt19937& rng) {
+        const int m = static_cast<int>(bs.node.size());
+        if (m <= 0) return;
+        const double routeBad = clampD(curLayout.routePenalty / max(1.0, totalPackingArea(design)), 0.0, 3.0);
+        const double dead = bstarDeadspace(design, curLayout);
+        double r = uniform_real_distribution<double>(0.0, 1.0)(rng);
+
+        // Routing/congestion does not enter cost; it only biases what kind of
+        // neighbor we sample.  Bad route proxy => more topology/soft moves.  High
+        // deadspace => more outline shrinking.
+        double pOutline = clampD(0.22 + 0.45 * dead, 0.18, 0.58);
+        double pShape = clampD(0.14 + 0.10 * routeBad, 0.12, 0.28);
+        double pMove = clampD(0.22 + 0.10 * routeBad, 0.18, 0.35);
+        double pSwap = 0.24;
+        double pFlip = 1.0 - (pOutline + pShape + pMove + pSwap);
+        if (pFlip < 0.08) { pFlip = 0.08; pOutline = max(0.10, pOutline - 0.05); }
+
+        if (r < pOutline) {
+            bstarResizeOutline(design, bs, curLayout, rng);
+        }
+        else if (r < pOutline + pShape) {
+            (void)bstarResizeSoft(design, bs, rng);
+        }
+        else if (r < pOutline + pShape + pMove) {
+            BStarState old = bs;
+            if (!bstarMoveLeaf(bs, rng)) bs = std::move(old);
+        }
+        else if (r < pOutline + pShape + pMove + pSwap) {
+            int a = pickHotMovableNode(design, bs, rng);
+            int b = uniform_int_distribution<int>(0, m - 1)(rng);
+            if (a == b) b = (b + 1) % m;
+            bstarSwapBlocks(bs, a, b);
+        }
+        else {
+            int u = pickHotMovableNode(design, bs, rng);
+            bstarFlipChildren(bs, u);
+        }
+    }
+
+    static double estimateBStarInitialTemp(const Design& design, const BStarState& init, const LayoutResult& initLayout, mt19937& rng) {
+        double base = bstarAreaCost(initLayout);
+        double sumUp = 0.0;
+        int cntUp = 0;
+        const int samples = max(30, min(240, BSTAR_SA_INNER_FACTOR * max(1, static_cast<int>(init.node.size()))));
+        for (int i = 0; i < samples; ++i) {
+            BStarState trial = init;
+            bstarPerturb(design, trial, initLayout, rng);
+            LayoutResult cur;
+            if (!packBStarState(design, trial, cur)) continue;
+            double d = bstarAreaCost(cur) - base;
+            if (d > 1.0) { sumUp += d; ++cntUp; }
+        }
+        double avg = (cntUp > 0) ? (sumUp / cntUp) : max(1.0, 0.015 * base);
+        return max(1.0, avg / max(1e-9, log(1.0 / BSTAR_SA_INIT_ACCEPT_P)));
+    }
+
+    static LayoutResult runBStarAreaSA(const Design& design, int& triedOut, int& packedOut, int& legalOut) {
+        triedOut = packedOut = legalOut = 0;
+        LayoutResult empty;
+        BStarState curState;
+        LayoutResult curLayout;
+        if (!makeInitialBStarLegalState(design, curState, curLayout)) {
+            if (FAST_VERBOSE_LOG) cerr << "[BStarSA] init failed, fallback required\n";
+            return empty;
+        }
+        ++packedOut;
+        ++legalOut;
+
+        BStarState bestState = curState;
+        LayoutResult bestLayout = curLayout;
+        mt19937 rng(FAST_SEED ^ 0xB57A5A11u ^ static_cast<unsigned>(design.blockSpecs.size() * 131u));
+        double T = estimateBStarInitialTemp(design, curState, curLayout, rng);
+        const int m = static_cast<int>(curState.node.size());
+        const int inner = max(BSTAR_SA_MIN_INNER, BSTAR_SA_INNER_FACTOR * max(1, m));
+        const bool smallCase = smallOfficialLikeCase(design);
+        int defaultMoveCap = min(BSTAR_SA_MAX_MOVES_CAP, max(1200, inner * max(18, min(80, m + 12))));
+        if (!smallCase && design.blockSpecs.size() >= 45) {
+            defaultMoveCap = min(defaultMoveCap, 4800);
+        }
+        const int moveCap = smallCase ? max(defaultMoveCap, 90000) : defaultMoveCap;
+        int accepted = 0, uphill = 0, rejected = 0, bestUpdates = 0, outer = 0;
+        double curCost = bstarAreaCost(curLayout);
+        const double startArea = curLayout.area;
+
+        const int outerLimit = smallCase ? max(BSTAR_SA_MAX_OUTER, 1200) : BSTAR_SA_MAX_OUTER;
+        while (outer++ < outerLimit && triedOut < moveCap && T > BSTAR_SA_MIN_TEMP) {
+            int roundAccepted = 0;
+            int roundRejected = 0;
+            int roundPacked = 0;
+            for (int mt = 0; mt < inner && triedOut < moveCap; ++mt) {
+                ++triedOut;
+                BStarState trial = curState;
+                bstarPerturb(design, trial, curLayout, rng);
+                LayoutResult cand;
+                if (!packBStarState(design, trial, cand)) {
+                    ++roundRejected;
+                    ++rejected;
+                    continue;
+                }
+                ++packedOut;
+                ++roundPacked;
+                if (cand.legal && cand.strictEdgeLegal) ++legalOut;
+                double candCost = bstarAreaCost(cand);
+                double d = candCost - curCost;
+                bool accept = false;
+                if (d <= 0.0) accept = true;
+                else {
+                    double prob = exp(-d / max(1e-12, T));
+                    accept = uniform_real_distribution<double>(0.0, 1.0)(rng) < prob;
+                }
+                if (accept) {
+                    curState = std::move(trial);
+                    curLayout = std::move(cand);
+                    curCost = candCost;
+                    ++accepted;
+                    ++roundAccepted;
+                    if (d > 0.0) ++uphill;
+                    if (curLayout.legal && curLayout.strictEdgeLegal && bstarAreaBetter(curLayout, bestLayout)) {
+                        bestLayout = curLayout;
+                        bestState = curState;
+                        ++bestUpdates;
+                    }
+                }
+                else {
+                    ++rejected;
+                    ++roundRejected;
+                }
+            }
+            const double rejectRate = static_cast<double>(roundRejected) / max(1, roundRejected + roundAccepted);
+            if (FAST_VERBOSE_LOG && (outer <= 6 || outer % 8 == 0 || bestUpdates > 0)) {
+                cerr << fixed << setprecision(3)
+                    << "[BStarSA/Round] outer=" << outer
+                    << " T=" << T
+                    << " packedDelta=" << roundPacked
+                    << " acceptDelta=" << roundAccepted
+                    << " rejectRate=" << rejectRate
+                    << " curArea=" << curLayout.area
+                    << " bestArea=" << bestLayout.area
+                    << " bestW/H=" << bestLayout.W << "x" << bestLayout.H
+                    << " bestRouteGap=" << bestLayout.routePenalty
+                    << " bestViolPairs=" << bestLayout.routeViolPairs << "/" << bestLayout.routeConnectedPairs
+                    << "\n";
+                bestUpdates = 0;
+            }
+            if (roundPacked == 0 && T < 0.02 * startArea) break;
+            if (!smallCase && rejectRate > 0.985 && outer > 12) break;
+            T *= BSTAR_SA_COOL;
+            if (smallCase && T <= BSTAR_SA_MIN_TEMP && triedOut < moveCap) {
+                T = max(1.0, 0.0005 * startArea);
+            }
+        }
+
+        if (FAST_VERBOSE_LOG) {
+            cerr << fixed << setprecision(3)
+                << "[BStarSA/Selected] startArea=" << startArea
+                << " bestArea=" << bestLayout.area
+                << " W/H=" << bestLayout.W << "x" << bestLayout.H
+                << " hpwl=" << bestLayout.hpwl
+                << " routeGap=" << bestLayout.routePenalty
+                << " gapPart=" << bestLayout.routeGapPenaltyPart
+                << " portPart=" << bestLayout.routePortPenaltyPart
+                << " maxGapMiss=" << bestLayout.routeMaxGapMiss
+                << " maxPortMiss=" << bestLayout.routeMaxPortMiss
+                << " violPairs=" << bestLayout.routeViolPairs << "/" << bestLayout.routeConnectedPairs
+                << " tried=" << triedOut
+                << " packed=" << packedOut
+                << " legal=" << legalOut
+                << " accepted=" << accepted
+                << " uphill=" << uphill
+                << " rejected=" << rejected
+                << " cost=outlineAreaOnly"
+                << "\n";
+        }
+        (void)bestState;
+        return bestLayout;
     }
 
     static LayoutResult fallbackShelf(const Design& design) {
@@ -1488,7 +2524,6 @@ namespace {
         const LayoutResult& anchor,
         double minAllowedArea
     ) {
-        (void)design;
         if (!layoutPlacementLegal(cand)) return false;
         if (cand.strictEdgeLegal != anchor.strictEdgeLegal && anchor.strictEdgeLegal) return false;
         if (cand.area + 1.0 < minAllowedArea) return false;
@@ -1534,7 +2569,7 @@ namespace {
     static LayoutResult dsuPostCompaction(const Design& design, const LayoutResult& start) {
         if (!ENABLE_DSU_POST_COMPACTION || !layoutPlacementLegal(start)) return start;
 
-        const double blockArea = totalNominalArea(design);
+        const double blockArea = totalPackingArea(design);
         const double deadspace = clampD((start.area - blockArea) / max(1.0, start.area), 0.0, 0.95);
         double cap = 0.0;
         if (deadspace > DSU_DEADSPACE_START) cap = 0.50 * (deadspace - DSU_DEADSPACE_START);
@@ -1597,7 +2632,7 @@ namespace {
             BlockInst b;
             b.spec = design.blockSpecs[i];
             if (i < static_cast<int>(best.rects.size())) b.rect = best.rects[i];
-            else b.rect = makeShape(design.blockSpecs[i], aspectMid(design.blockSpecs[i]));
+            else b.rect = makePackingShape(design, i, aspectMid(design.blockSpecs[i]));
             b.rect.x = clampD(b.rect.x, 0.0, max(0.0, design.outlineW - b.rect.w));
             b.rect.y = clampD(b.rect.y, 0.0, max(0.0, design.outlineH - b.rect.h));
             b.ftUsed = 0.0;
@@ -1635,7 +2670,6 @@ void Floorplanner::run(Design& design) {
         FAST_MAX_TOTAL_LAYOUT_CANDIDATES,
         max(targetCandidates, 2 * targetCandidates + 200)
     );
-
     int nEdge = 0, nHard = 0, nSoft = 0, nMovable = 0;
     for (const auto& spec : design.blockSpecs) {
         if (spec.type == BlockType::EDGE) ++nEdge;
@@ -1686,7 +2720,8 @@ void Floorplanner::run(Design& design) {
             << " n2Target=" << targetCandidates
             << " maxCap=" << maxCandidates
             << " maxOutline=" << design.maxOutlineW << "x" << design.maxOutlineH
-            << " blockArea=" << totalNominalArea(design)
+            << " nominalArea=" << totalNominalArea(design)
+            << " packingArea=" << totalPackingArea(design)
             << "\n";
         cerr << fixed << setprecision(3)
             << "[FastSourcePack/GapPolicy] density=" << ROUTE_DENSITY
@@ -1697,7 +2732,26 @@ void Floorplanner::run(Design& design) {
             << " endpointGuardCap=" << ENDPOINT_GUARD_CAP_FAST
             << " dsu=" << (ENABLE_DSU_POST_COMPACTION ? "ON" : "OFF")
             << " dsuMaxShrink=" << DSU_MAX_AREA_SHRINK
+            << " ftSoftReserve=" << (ENABLE_FT_SOFT_RESERVE ? "ON" : "OFF")
+            << " softShapePerturb=" << (ENABLE_SOFT_SHAPE_PERTURB ? "ON" : "OFF")
             << "\n";
+        if (ENABLE_FT_SOFT_RESERVE) {
+            int ftCnt = 0;
+            double ftSum = 0.0, ftMax = 0.0;
+            for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) {
+                if (design.blockSpecs[i].type != BlockType::SOFT) continue;
+                double rr = softFtExpansionRate(design, i);
+                if (rr > 1e-9) { ++ftCnt; ftSum += rr; ftMax = max(ftMax, rr); }
+            }
+            cerr << fixed << setprecision(3)
+                << "[FastSourcePack/FTReserve] softCount=" << ftCnt
+                << " avgRate=" << (ftCnt ? ftSum / ftCnt : 0.0)
+                << " maxRate=" << ftMax
+                << " nominalArea=" << totalNominalArea(design)
+                << " packingArea=" << totalPackingArea(design)
+                << " addedArea=" << (totalPackingArea(design) - totalNominalArea(design))
+                << "\n";
+        }
     }
 
     auto tryCandidate = [&](const ShapeState& st, const vector<int>& order, double W, double H, bool strictEdge) {
@@ -1723,105 +2777,19 @@ void Floorplanner::run(Design& design) {
         }
         };
 
-    struct CandidatePlan {
-        int shapeIdx = 0;
-        int orderIdx = 0;
-        double W = 0.0;
-        double H = 0.0;
-        double area = 0.0;
-        unsigned hash = 0;
-    };
-
-    int lastCandidatePool = 0;
-    int lastCandidateGroups = 0;
-    int lastRankDepth = 0;
-
     auto runPass = [&](bool strictEdge, int stopAfterTried) {
-        // Balanced N^2 scheduler.
-        // Old nested order was shape -> order -> W -> H, so the first 900 trials
-        // mostly covered only the first few orders.  That made orders=38 look good
-        // in the log but effective diversity was low.  This scheduler groups by
-        // (shape, order), sorts each group's W/H candidates by area, then tries
-        // rank-0 for every group, rank-1 for every group, etc.  Therefore the same
-        // N^2 runtime budget covers many more topology/order perturbations.
-        vector<vector<CandidatePlan>> groups;
-        groups.resize(max(1, static_cast<int>(shapes.size() * orders.size())));
-
-        const double minSearchArea = totalNominalArea(design) * 1.06;
-        int pool = 0;
-        for (int si = 0; si < static_cast<int>(shapes.size()); ++si) {
-            const ShapeState& st = shapes[si];
+        for (const ShapeState& st : shapes) {
             vector<double> widths = makeWidthTrials(design, st);
-            for (int oi = 0; oi < static_cast<int>(orders.size()); ++oi) {
-                int gidx = si * static_cast<int>(orders.size()) + oi;
+            for (const vector<int>& order : orders) {
                 for (double W : widths) {
                     vector<double> heights = makeHeightTrials(design, st, W);
                     for (double H : heights) {
-                        if (W > design.maxOutlineW + EPS || H > design.maxOutlineH + EPS) continue;
-                        double area = W * H;
-                        if (area + EPS < minSearchArea) continue;
-                        CandidatePlan cp;
-                        cp.shapeIdx = si;
-                        cp.orderIdx = oi;
-                        cp.W = W;
-                        cp.H = H;
-                        cp.area = area;
-                        // Deterministic tie-breaker: interleave W/H choices so
-                        // same-area candidates do not all come from one width band.
-                        unsigned x = static_cast<unsigned>(si * 73856093u) ^
-                            static_cast<unsigned>(oi * 19349663u) ^
-                            static_cast<unsigned>(llround(W * 17.0)) ^
-                            static_cast<unsigned>(llround(H * 31.0));
-                        x ^= x << 13; x ^= x >> 17; x ^= x << 5;
-                        cp.hash = x;
-                        groups[gidx].push_back(cp);
-                        ++pool;
+                        if (tried >= stopAfterTried && have && best.legal) return;
+                        if (tried >= maxCandidates && have) return;
+                        tryCandidate(st, order, W, H, strictEdge);
                     }
                 }
             }
-        }
-
-        vector<int> groupOrder;
-        groupOrder.reserve(groups.size());
-        for (int g = 0; g < static_cast<int>(groups.size()); ++g) {
-            auto& vec = groups[g];
-            if (vec.empty()) continue;
-            sort(vec.begin(), vec.end(), [](const CandidatePlan& a, const CandidatePlan& b) {
-                if (fabs(a.area - b.area) > 1.0) return a.area < b.area;
-                return a.hash < b.hash;
-                });
-            groupOrder.push_back(g);
-        }
-
-        // Deterministically shuffle group order to avoid always favoring shape 0
-        // or the first deterministic orders when the pass stops at n^2.
-        mt19937 schedRng(FAST_SEED ^ (strictEdge ? 0x13572468u : 0x24681357u) ^ static_cast<unsigned>(nBlocks * 101u));
-        shuffle(groupOrder.begin(), groupOrder.end(), schedRng);
-
-        lastCandidatePool = pool;
-        lastCandidateGroups = static_cast<int>(groupOrder.size());
-        lastRankDepth = 0;
-
-        int maxRank = 0;
-        for (int g : groupOrder) maxRank = max(maxRank, static_cast<int>(groups[g].size()));
-        for (int rank = 0; rank < maxRank; ++rank) {
-            bool anyAtRank = false;
-            for (int g : groupOrder) {
-                if (rank >= static_cast<int>(groups[g].size())) continue;
-                anyAtRank = true;
-                const CandidatePlan& cp = groups[g][rank];
-                if (tried >= stopAfterTried && have && best.legal) {
-                    lastRankDepth = max(lastRankDepth, rank + 1);
-                    return;
-                }
-                if (tried >= maxCandidates && have) {
-                    lastRankDepth = max(lastRankDepth, rank + 1);
-                    return;
-                }
-                tryCandidate(shapes[cp.shapeIdx], orders[cp.orderIdx], cp.W, cp.H, strictEdge);
-            }
-            if (!anyAtRank) break;
-            lastRankDepth = rank + 1;
         }
         };
 
@@ -1833,9 +2801,6 @@ void Floorplanner::run(Design& design) {
             << " triedDelta=" << (tried - triedBefore)
             << " packedDelta=" << (packed - packedBefore)
             << " legalDelta=" << (legalNow - legalBefore)
-            << " pool=" << lastCandidatePool
-            << " groups=" << lastCandidateGroups
-            << " rankDepth=" << lastRankDepth
             << " totalTried=" << tried
             << " totalPacked=" << packed
             << " strictPacked=" << strictPacked
@@ -1860,25 +2825,58 @@ void Floorplanner::run(Design& design) {
         cerr << "\n";
         };
 
-    // Main pass: exactly the desired behavior ¡X at least n^2 high-level layout
-    // candidates when a legal solution is available early, with a hard cap to
-    // avoid runtime explosion.  Each candidate is one explicit W/H coordinate pack;
-    // no repeated binary search in the hot loop.
-    int passTried0 = tried, passPacked0 = packed, passLegal0 = strictLegal + looseLegal;
-    runPass(true, targetCandidates);
-    printPassSummary("strict-edge", passTried0, passPacked0, passLegal0);
+    // Main generator: B*-tree SA.  The SA acceptance cost is outline area only.
+    // The old explicit W/H candidate sweep is now only a recovery fallback if the
+    // B*-tree annealer cannot produce a legal strict-edge placement.
+    bool usedBStarSA = false;
+    if (ENABLE_BSTAR_AREA_SA) {
+        int saTried = 0, saPacked = 0, saLegal = 0;
+        LayoutResult saBest = runBStarAreaSA(design, saTried, saPacked, saLegal);
+        tried += saTried;
+        packed += saPacked;
+        strictTried += saTried;
+        strictPacked += saPacked;
+        strictLegal += saLegal;
+        strictEdgeOK += saLegal;
+        if (saBest.legal) {
+            best = std::move(saBest);
+            have = true;
+            usedBStarSA = true;
+            ++bestUpdates;
+        }
+        if (FAST_VERBOSE_LOG) {
+            cerr << fixed << setprecision(3)
+                << "[MainFlow] BStarSA=" << (usedBStarSA ? "USED" : "FAILED")
+                << " saTried=" << saTried
+                << " saPacked=" << saPacked
+                << " saLegal=" << saLegal;
+            if (have) {
+                cerr << " bestArea=" << best.area
+                    << " bestW/H=" << best.W << "x" << best.H
+                    << " routeGap=" << best.routePenalty;
+            }
+            cerr << "\n";
+        }
+    }
+
+    if (!have || !best.legal) {
+        int passTried0 = tried, passPacked0 = packed, passLegal0 = strictLegal + looseLegal;
+        runPass(true, targetCandidates);
+        printPassSummary("strict-edge-recovery", passTried0, passPacked0, passLegal0);
+    }
 
     // If strict EDGE zones prevented legal packing, use permissive EDGE packing
     // only for additional recovery candidates, still under the global cap.
     if (!have || !best.legal) {
-        passTried0 = tried; passPacked0 = packed; passLegal0 = strictLegal + looseLegal;
+        int passTried0 = tried, passPacked0 = packed, passLegal0 = strictLegal + looseLegal;
         runPass(false, maxCandidates);
         printPassSummary("permissive-edge-recovery", passTried0, passPacked0, passLegal0);
     }
 
-    // Optional local height refinement around the selected layout only.  This keeps
-    // the n^2 exploration cheap while recovering some area from the best candidate.
-    if (have && best.legal) {
+    // HeightRefine belongs to the old explicit-W/H recovery path.  When B*-tree SA
+    // succeeds, we do not overwrite it with a greedy order-based refinement because
+    // that would no longer be a B*-tree annealed solution.
+    if (!usedBStarSA && have && best.legal) {
         LayoutResult beforeRefine = best;
         LayoutResult refined = best;
         double lo = minHeightBound(design, shapes.front());
@@ -1887,9 +2885,6 @@ void Floorplanner::run(Design& design) {
         for (int it = 0; it < FAST_HEIGHT_BISECT; ++it) {
             double mid = 0.5 * (lo + hi);
             LayoutResult cur;
-            // Reuse the first robust order/state as a conservative local shrink is
-            // unsafe because we no longer know which state produced best.  Therefore
-            // refine only by accepting if explicit packing succeeds and improves.
             bool accepted = false;
             for (const ShapeState& st : shapes) {
                 if (accepted) break;

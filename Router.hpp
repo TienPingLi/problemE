@@ -5,6 +5,7 @@
 
 class Router {
 public:
+    void setFTOverflowCostEnabled(bool enabled);
     void run(Design& design);
 
 private:
@@ -33,4 +34,8 @@ private:
     const Rect* findRectByName(const Design& design, const std::string& name) const;
     double calcRouteWireLength(const Design& design, const RoutePath& path) const;
     void updateUsage(Design& design, const RoutePath& path) const;
+
+    mutable bool routeGraphCacheValid = false;
+    mutable std::vector<Node> routeGraphNodes;
+    mutable std::vector<std::vector<AdjEdge>> routeGraphAdj;
 };
