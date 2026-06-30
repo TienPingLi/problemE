@@ -78,6 +78,7 @@ namespace {
     static constexpr int FAST_COORD_LIMIT_SMALL = 54;
     static constexpr int FAST_COORD_LIMIT_MID = 36;
     static constexpr int FAST_COORD_LIMIT_LARGE = 24;
+    static int g_edgePlacementMode = 0;
 
     // Phase-1 packing deliberately uses a looser required-gap rule so area search
     // does not get trapped by over-reserved channels.  A bounded DSU-style post pass
@@ -126,6 +127,9 @@ namespace {
     static constexpr double BSTAR_PACK_DEVIATION_WEIGHT = 1.0e-4;
     static constexpr int BSTAR_ROOT_CAND_LIMIT = 42;
     static constexpr int BSTAR_CHILD_X_CAND_LIMIT = 24;
+    static constexpr bool ENABLE_DENSITY_AWARE_PACK = false;
+    static constexpr double PACK_TOP_PRESSURE_RATIO = 0.0;
+    static constexpr double PACK_RIGHT_PRESSURE_RATIO = 0.0;
 
 
     static double sqr(double x) { return x * x; }
@@ -146,6 +150,18 @@ namespace {
 
     static double ovLen(double a1, double a2, double b1, double b2) {
         return max(0.0, min(a2, b2) - max(a1, b1));
+    }
+
+    static int inwardPortForEdgeSide(char side) {
+        if (side == 'L') return 3;
+        if (side == 'R') return 1;
+        if (side == 'B') return 2;
+        return 4; // top edge faces inward through the block bottom edge.
+    }
+
+    static bool allowsPortEdge(const BlockSpec& spec, int port) {
+        if (spec.portEdges.empty()) return true;
+        return find(spec.portEdges.begin(), spec.portEdges.end(), port) != spec.portEdges.end();
     }
 
     static double ovArea(const Rect& a, const Rect& b) {
@@ -650,6 +666,42 @@ namespace {
         v.swap(out);
     }
 
+    static void addQuadrantArea(const Rect& r, double W, double H, double q[4]) {
+        const double mx = 0.5 * W;
+        const double my = 0.5 * H;
+        for (int ix = 0; ix < 2; ++ix) {
+            double x1 = (ix == 0) ? 0.0 : mx;
+            double x2 = (ix == 0) ? mx : W;
+            double ox = max(0.0, min(rectRight(r), x2) - max(r.x, x1));
+            if (ox <= EPS) continue;
+            for (int iy = 0; iy < 2; ++iy) {
+                double y1 = (iy == 0) ? 0.0 : my;
+                double y2 = (iy == 0) ? my : H;
+                double oy = max(0.0, min(rectTop(r), y2) - max(r.y, y1));
+                if (oy <= EPS) continue;
+                q[iy * 2 + ix] += ox * oy;
+            }
+        }
+    }
+
+    static double quadrantBalancePenalty(
+        const vector<Rect>& placed,
+        const Rect& cand,
+        double W,
+        double H
+    ) {
+        if (!ENABLE_DENSITY_AWARE_PACK) return 0.0;
+        double q[4] = { 0.0, 0.0, 0.0, 0.0 };
+        for (const Rect& r : placed) addQuadrantArea(r, W, H, q);
+        addQuadrantArea(cand, W, H, q);
+        double total = q[0] + q[1] + q[2] + q[3];
+        double mean = 0.25 * total;
+        double norm = max(1.0, 0.25 * W * H);
+        double p = 0.0;
+        for (double a : q) p += sqr((a - mean) / norm);
+        return p;
+    }
+
 
     struct EdgePlacedInfo {
         int id = -1;
@@ -673,6 +725,12 @@ namespace {
 
         vector<EdgePlacedInfo> sideItems[4];
         auto sideIndex = [](char s) { return s == 'T' ? 0 : (s == 'B' ? 1 : (s == 'L' ? 2 : 3)); };
+        const bool smartEdgeChoice = false;
+        const bool smartAxisSpread = (g_edgePlacementMode == 0 && n >= 20);
+        const bool loadBalancedEdgeChoice = (g_edgePlacementMode == 1);
+        const bool centeredEdgeZones = (g_edgePlacementMode == 2);
+        double sideLoad[4] = { 0.0, 0.0, 0.0, 0.0 };
+        double zoneLoad[12] = { 0.0 };
 
         vector<int> edgeIds;
         for (int i = 0; i < n; ++i) if (design.blockSpecs[i].type == BlockType::EDGE) edgeIds.push_back(i);
@@ -688,7 +746,16 @@ namespace {
             vector<EdgeRule> rules = edgeRules(design.blockSpecs[id]);
             EdgeRule best = rules.empty() ? parseRule("BL") : rules.front();
             double bestScore = INF;
+            bool hasPortFacingRule = false;
             for (const EdgeRule& r : rules) {
+                if (!r.valid) continue;
+                if (allowsPortEdge(design.blockSpecs[id], inwardPortForEdgeSide(r.side))) {
+                    hasPortFacingRule = true;
+                    break;
+                }
+            }
+            for (int ri = 0; ri < static_cast<int>(rules.size()); ++ri) {
+                const EdgeRule& r = rules[ri];
                 if (!r.valid) continue;
                 double span = sideSpan(r.side, W, H);
                 double len = sideLen(sh, r.side);
@@ -696,7 +763,33 @@ namespace {
                 double zoneCap = max(0.0, zb.second - zb.first);
                 double zoneOverflow = max(0.0, len - zoneCap);
                 double sideOverflow = max(0.0, len - span);
+                int si = sideIndex(r.side);
+                int bucket = si * 3 + r.zone;
+                double projectedSide = sideLoad[si] + len + PACK_GAP;
+                double projectedZone = zoneLoad[bucket] + len + PACK_GAP;
+                double packedSideOverflow = max(0.0, projectedSide - span);
+                double packedZoneOverflow = max(0.0, projectedZone - zoneCap);
+                double sideUtil = projectedSide / max(1.0, span);
+                double zoneUtil = projectedZone / max(1.0, zoneCap);
                 double score = 1.0e9 * sqr(sideOverflow) + 1.0e6 * sqr(zoneOverflow) + 1.0e-3 * r.zone;
+                if (smartEdgeChoice) {
+                    if (hasPortFacingRule && !allowsPortEdge(design.blockSpecs[id], inwardPortForEdgeSide(r.side))) {
+                        score += 2.0e-4;
+                    }
+                    score +=
+                        5.0e-3 * sqr(packedSideOverflow) +
+                        5.0e-4 * sqr(packedZoneOverflow) +
+                        1.0e-4 * sqr(zoneUtil) +
+                        1.0e-5 * sqr(sideUtil) +
+                        1.0e-2 * static_cast<double>(ri);
+                }
+                if (loadBalancedEdgeChoice) {
+                    score +=
+                        1.0e8 * sqr(packedSideOverflow) +
+                        1.0e5 * sqr(packedZoneOverflow) +
+                        5.0e3 * sqr(zoneUtil) +
+                        5.0e2 * sqr(sideUtil);
+                }
                 if (score < bestScore) { bestScore = score; best = r; }
             }
             EdgePlacedInfo it;
@@ -704,7 +797,11 @@ namespace {
             it.rule = best;
             it.len = sideLen(sh, best.side);
             it.pref = zoneCenter(best, W, H) - 0.5 * it.len;
-            sideItems[sideIndex(best.side)].push_back(it);
+            int si = sideIndex(best.side);
+            int bucket = si * 3 + best.zone;
+            sideLoad[si] += it.len + PACK_GAP;
+            zoneLoad[bucket] += it.len + PACK_GAP;
+            sideItems[si].push_back(it);
         }
 
         for (int si = 0; si < 4; ++si) {
@@ -741,9 +838,11 @@ namespace {
                     for (const auto& it : items) if (it.rule.zone == z) { total += it.len; ++cnt; }
                     total += PACK_GAP * max(0, cnt - 1);
                     double pos = 0.5 * (zb.first + zb.second - total);
-                    if (!smallOfficialLikeCase(design)) {
-                        if (z == 0) pos = zb.first;
-                        else if (z == 2) pos = zb.second - total;
+                    if (!centeredEdgeZones && !smallOfficialLikeCase(design)) {
+                        const double slack = max(0.0, (zb.second - zb.first) - total);
+                        const double inset = smartAxisSpread ? min(96.0, 0.14 * slack) : 0.0;
+                        if (z == 0) pos = zb.first + inset;
+                        else if (z == 2) pos = zb.second - total - inset;
                     }
                     pos = clampD(pos, zb.first, zb.second - total);
                     for (const auto& it : items) {
@@ -763,7 +862,10 @@ namespace {
                     if (fabs(a.pref - b.pref) > 1e-6) return a.pref < b.pref;
                     return a.id < b.id;
                     });
-                double pos = clampD(0.0, 0.0, max(0.0, span - total));
+                double freeSpan = max(0.0, span - total);
+                double pos = centeredEdgeZones
+                    ? clampD(0.5 * freeSpan, 0.0, freeSpan)
+                    : clampD(smartAxisSpread ? min(96.0, 0.08 * freeSpan) : 0.0, 0.0, freeSpan);
                 for (const auto& it : items) {
                     setEdgeAxis(rects[it.id], it.rule, pos, W, H);
                     pos += it.len + PACK_GAP;
@@ -830,7 +932,10 @@ namespace {
 
     struct PlaceKey {
         double top = INF;
+        double topPressure = INF;
         double route = INF;
+        double balance = INF;
+        double rightPressure = INF;
         double right = INF;
         double y = INF;
         double wire = INF;
@@ -839,14 +944,23 @@ namespace {
     };
 
     static bool betterKey(const PlaceKey& a, const PlaceKey& b) {
-        if (fabs(a.top - b.top) > 1e-6) return a.top < b.top;
+        if (fabs(a.topPressure - b.topPressure) > 1e-6) return a.topPressure < b.topPressure;
         // Same-height candidates prefer satisfying direct channel / port-window needs.
         if (fabs(a.route - b.route) > 1e-6) return a.route < b.route;
+        if (fabs(a.balance - b.balance) > 1e-8) return a.balance < b.balance;
+        if (fabs(a.rightPressure - b.rightPressure) > 1e-6) return a.rightPressure < b.rightPressure;
         if (fabs(a.right - b.right) > 1e-6) return a.right < b.right;
+        if (fabs(a.top - b.top) > 1e-6) return a.top < b.top;
         if (fabs(a.y - b.y) > 1e-6) return a.y < b.y;
         if (fabs(a.wire - b.wire) > 1e-6) return a.wire < b.wire;
         if (fabs(a.center - b.center) > 1e-6) return a.center < b.center;
         return a.x < b.x;
+    }
+
+    static void fillPlacementPressure(PlaceKey& key, const vector<Rect>& placed, const Rect& cand, double W, double H) {
+        key.topPressure = max(0.0, key.top - PACK_TOP_PRESSURE_RATIO * H);
+        key.rightPressure = max(0.0, key.right - PACK_RIGHT_PRESSURE_RATIO * W);
+        key.balance = quadrantBalancePenalty(placed, cand, W, H);
     }
 
     static double routeGapPenaltyForCandidate(
@@ -1069,6 +1183,7 @@ namespace {
                     key.wire = partialWire(design, rects, placedMask, id, cand);
                     key.center = fabs(rectCx(cand) - 0.5 * W) + fabs(rectCy(cand) - 0.5 * H);
                     key.x = x;
+                    fillPlacementPressure(key, placed, cand, W, H);
                     if (!found || betterKey(key, bestKey)) {
                         found = true;
                         bestKey = key;
@@ -1856,6 +1971,7 @@ namespace {
                 key.wire = partialWire(design, rectsSoFar, placedMask, id, cand);
                 key.center = fabs(rectCx(cand) - 0.5 * W) + fabs(rectCy(cand) - 0.5 * H);
                 key.x = cand.x;
+                fillPlacementPressure(key, placed, cand, W, H);
                 if (!found || betterKey(key, bestKey)) {
                     found = true;
                     bestKey = key;
@@ -1915,30 +2031,37 @@ namespace {
         }
         uniquePrune(xs, BSTAR_CHILD_X_CAND_LIMIT);
 
+        vector<double> ySeeds;
+        addLimitedCoord(ySeeds, baseY, 0.0, maxY);
+        uniquePrune(ySeeds, 3);
+
         bool found = false;
         PlaceKey bestKey;
         Rect best = shape;
         for (double x : xs) {
-            double y = routeAwareMinYAtX(design, id, x, shape.w, shape.h, baseY, placed, placedIds);
-            if (y > maxY + EPS) continue;
-            Rect cand = shape;
-            cand.x = x;
-            cand.y = y;
-            if (!inside(cand, W, H)) continue;
-            if (anyOverlapWith(cand, placed)) continue;
-            PlaceKey key;
-            key.top = rectTop(cand);
-            key.route = routeGapPenaltyForCandidate(design, placed, placedIds, id, cand);
-            key.right = rectRight(cand);
-            key.y = cand.y;
-            key.wire = partialWire(design, rectsSoFar, placedMask, id, cand);
-            key.center = fabs(x - intendedX) * BSTAR_PACK_DEVIATION_WEIGHT +
-                fabs(rectCx(cand) - 0.5 * W) * CENTER_TIE_WEIGHT;
-            key.x = x;
-            if (!found || betterKey(key, bestKey)) {
-                found = true;
-                bestKey = key;
-                best = cand;
+            for (double ySeed : ySeeds) {
+                double y = routeAwareMinYAtX(design, id, x, shape.w, shape.h, ySeed, placed, placedIds);
+                if (y > maxY + EPS) continue;
+                Rect cand = shape;
+                cand.x = x;
+                cand.y = y;
+                if (!inside(cand, W, H)) continue;
+                if (anyOverlapWith(cand, placed)) continue;
+                PlaceKey key;
+                key.top = rectTop(cand);
+                key.route = routeGapPenaltyForCandidate(design, placed, placedIds, id, cand);
+                key.right = rectRight(cand);
+                key.y = cand.y;
+                key.wire = partialWire(design, rectsSoFar, placedMask, id, cand);
+                key.center = fabs(x - intendedX) * BSTAR_PACK_DEVIATION_WEIGHT +
+                    fabs(rectCx(cand) - 0.5 * W) * CENTER_TIE_WEIGHT;
+                key.x = x;
+                fillPlacementPressure(key, placed, cand, W, H);
+                if (!found || betterKey(key, bestKey)) {
+                    found = true;
+                    bestKey = key;
+                    best = cand;
+                }
             }
         }
         if (!found) return false;
@@ -2266,7 +2389,7 @@ namespace {
         if (!smallCase && design.blockSpecs.size() >= 45) {
             defaultMoveCap = min(defaultMoveCap, 4800);
         }
-        const int moveCap = smallCase ? max(defaultMoveCap, 90000) : defaultMoveCap;
+        const int moveCap = smallCase ? max(defaultMoveCap, 36000) : defaultMoveCap;
         int accepted = 0, uphill = 0, rejected = 0, bestUpdates = 0, outer = 0;
         double curCost = bstarAreaCost(curLayout);
         const double startArea = curLayout.area;
@@ -2981,6 +3104,10 @@ void Floorplanner::run(Design& design) {
 // --------------------------------------------------------------------------
 // Compatibility methods for the existing Floorplanner.hpp interface.
 // --------------------------------------------------------------------------
+
+void Floorplanner::setEdgePlacementMode(int mode) {
+    g_edgePlacementMode = max(0, min(2, mode));
+}
 
 Rect Floorplanner::makeInitialShape(const BlockSpec& spec) const {
     return makeShape(spec, aspectMid(spec));

@@ -4,6 +4,7 @@
 
 class Floorplanner {
 public:
+    void setEdgePlacementMode(int mode);
     void run(Design& design);
 
 private:

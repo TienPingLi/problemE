@@ -6,6 +6,7 @@
 class Router {
 public:
     void setFTOverflowCostEnabled(bool enabled);
+    void setSoftFTCostRelaxed(bool enabled);
     void run(Design& design);
 
 private:

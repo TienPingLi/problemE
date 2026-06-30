@@ -88,7 +88,7 @@ namespace {
     //   maxUtil 是哪一個 channel 的哪一個方向分量。
     // ============================================================================
 
-    static constexpr bool ROUTER_DIAG_ENABLE = true;
+    static constexpr bool ROUTER_DIAG_ENABLE = false;
     static constexpr bool ROUTER_DIAG_PRINT_DECISIONS = false;
     static constexpr bool ROUTER_DIAG_PRINT_PATHS = false;
     static constexpr int  ROUTER_DIAG_TOP_CHANNELS = 12;
@@ -126,8 +126,12 @@ namespace {
     static constexpr int SPLIT_CHUNK_SIZE_4 = 20;
 
     // Soft feedthrough cost.  FT is a fallback, not default routing.
-    static constexpr double SOFT_FT_FIXED_PENALTY = 50000.0;
-    static constexpr double SOFT_FT_PER_NET_PENALTY = 10.0;
+    static constexpr double SOFT_FT_FIXED_PENALTY_BASE = 50000.0;
+    static constexpr double SOFT_FT_PER_NET_PENALTY_BASE = 10.0;
+    static constexpr double SOFT_FT_FIXED_PENALTY_RELAXED = 2000.0;
+    static constexpr double SOFT_FT_PER_NET_PENALTY_RELAXED = 0.5;
+    static double g_softFtFixedPenalty = SOFT_FT_FIXED_PENALTY_BASE;
+    static double g_softFtPerNetPenalty = SOFT_FT_PER_NET_PENALTY_BASE;
     static constexpr double FT_INCREMENTAL_AREA_WEIGHT = 10.0;
     static constexpr double FT_OVERFLOW_EXTRA_WEIGHT_BASE = 0.0;
     static constexpr double FT_OVERFLOW_EXTRA_WEIGHT_REPAIR = 1.0e3;
@@ -156,6 +160,19 @@ namespace {
     static constexpr int RIPUP_MAX_GROUPS_LARGE = 40;
     static constexpr double RIPUP_MIN_GROUP_SCORE = 1.0;
 
+    // Negotiated congestion.  Overflow is not the only bad state: a legal channel
+    // at 90%+ utilization is fragile and tends to create later detours.  These
+    // terms make reroute passes avoid both actual overflow and near-full corridors.
+    static constexpr double NEGOTIATED_UTIL_START = 0.82;
+    static constexpr double NEGOTIATED_LEGAL_RIPUP_MIN_UTIL = 0.90;
+    static constexpr double NEGOTIATED_HISTORY_DECAY = 0.65;
+    static constexpr double NEGOTIATED_HISTORY_GAIN = 1.75;
+    static constexpr double NEGOTIATED_HISTORY_WEIGHT = 0.65;
+    static constexpr double NEGOTIATED_RISK_IMPROVE_RATIO = 0.92;
+    static constexpr double NEGOTIATED_MAX_UTIL_IMPROVE = 0.02;
+    static constexpr double NEGOTIATED_WL_RELAX = 1.006;
+    static constexpr double NEGOTIATED_WL_ABS_RELAX = 200000.0;
+
     static constexpr double CHANNEL_CAPACITY_EPS = 1e-7;
     static constexpr double TOUCH_EPS = 1e-3;
     static constexpr double TOUCH_OVERLAP_EPS = 1e-7;
@@ -178,6 +195,7 @@ namespace {
     static bool g_congestionRerouteMode = false;
     static double g_congestionBiasWeight = 0.0;
     static vector<array<double, 2>> g_hotChannelBias;
+    static vector<array<double, 2>> g_negotiatedChannelHistory;
     static vector<double> g_hotSoftBias;
 
     string modeName(RouteMode mode) {
@@ -305,6 +323,12 @@ namespace {
         return d;
     }
 
+    double negotiatedUtilRisk(double util) {
+        if (!std::isfinite(util)) return 1000.0;
+        const double x = max(0.0, util - NEGOTIATED_UTIL_START);
+        return x * x;
+    }
+
     // ----------------------------------------------------------------------------
     // FT helpers
     // ----------------------------------------------------------------------------
@@ -347,8 +371,8 @@ namespace {
     double softFTPenaltyLocal(const BlockInst& b, int netCount) {
         const double incArea = incrementalFTAreaLocal(b, netCount);
         const double overflowAfter = estimatedFTOverflowAfterLocal(b, netCount);
-        return SOFT_FT_FIXED_PENALTY
-            + SOFT_FT_PER_NET_PENALTY * static_cast<double>(netCount)
+        return g_softFtFixedPenalty
+            + g_softFtPerNetPenalty * static_cast<double>(netCount)
             + FT_INCREMENTAL_AREA_WEIGHT * incArea
             + g_ftOverflowExtraWeight * overflowAfter;
     }
@@ -377,6 +401,37 @@ namespace {
 
         return usage;
     }
+
+    struct DirectionalUseCache {
+        const Design* design = nullptr;
+        const RoutePath* routeData = nullptr;
+        size_t routeCount = 0;
+        size_t channelCount = 0;
+        vector<DirUse> usage;
+    };
+
+    static DirectionalUseCache g_directionalUseCache;
+
+    void clearDirectionalUseCache() {
+        g_directionalUseCache = DirectionalUseCache{};
+    }
+
+    const vector<DirUse>& cachedDirectionalChannelUseFromRoutes(const Design& design) {
+        const RoutePath* data = design.routes.empty() ? nullptr : design.routes.data();
+        if (g_directionalUseCache.design == &design &&
+            g_directionalUseCache.routeData == data &&
+            g_directionalUseCache.routeCount == design.routes.size() &&
+            g_directionalUseCache.channelCount == design.channels.size()) {
+            return g_directionalUseCache.usage;
+        }
+        g_directionalUseCache.design = &design;
+        g_directionalUseCache.routeData = data;
+        g_directionalUseCache.routeCount = design.routes.size();
+        g_directionalUseCache.channelCount = design.channels.size();
+        g_directionalUseCache.usage = computeDirectionalChannelUseFromRoutes(design);
+        return g_directionalUseCache.usage;
+    }
+
     struct PathDirUse {
         map<int, DirUse> byChannel;
     };
@@ -520,6 +575,7 @@ namespace {
         const double cLR = capLR(ch);
         const double cTB = capTB(ch);
 
+
         auto evalComponent = [&](DirComponent comp, double used, double cap, double delta) {
             if (delta <= EPS) return;
 
@@ -584,6 +640,10 @@ namespace {
             if (g_congestionRerouteMode && chIndex >= 0 && chIndex < static_cast<int>(g_hotChannelBias.size())) {
                 const double hot = comp == DirComponent::LR ? g_hotChannelBias[chIndex][0] : g_hotChannelBias[chIndex][1];
                 if (hot > EPS) p += g_congestionBiasWeight * hot * delta;
+            }
+            if (g_congestionRerouteMode && chIndex >= 0 && chIndex < static_cast<int>(g_negotiatedChannelHistory.size())) {
+                const double hist = comp == DirComponent::LR ? g_negotiatedChannelHistory[chIndex][0] : g_negotiatedChannelHistory[chIndex][1];
+                if (hist > EPS) p += g_congestionBiasWeight * NEGOTIATED_HISTORY_WEIGHT * hist * delta;
             }
             if (g_allowChannelOverflow) {
                 const double beforeOv = max(0.0, used - cap);
@@ -668,7 +728,7 @@ namespace {
         if (!m.open && routeHasIllegalIntermediateBlock(design, path)) m.open = true;
         if (m.open) return m;
 
-        const vector<DirUse> current = computeDirectionalChannelUseFromRoutes(design);
+        const vector<DirUse>& current = cachedDirectionalChannelUseFromRoutes(design);
         const PathDirUse pd = computeDirectionalUseForPath(design, path);
 
         for (const auto& kv : pd.byChannel) {
@@ -741,8 +801,63 @@ namespace {
         double wireLength = 0.0;
     };
 
+    struct CongestionRiskScore {
+        double maxUtil = 0.0;
+        double riskSum = 0.0;
+    };
+
     RouterScore scoreRouterSolution(const Design& design) {
         return RouterScore{ openRouteCountNow(design), totalChannelOverflowNow(design), totalFTOverflowNow(design), totalRouteWireLengthNow(design) };
+    }
+
+    CongestionRiskScore scoreCongestionRisk(const Design& design) {
+        CongestionRiskScore s;
+        vector<DirUse> usage = computeDirectionalChannelUseFromRoutes(design);
+        for (int i = 0; i < static_cast<int>(design.channels.size()); ++i) {
+            const Channel& ch = design.channels[i];
+            const double cLR = max(1.0, capLR(ch));
+            const double cTB = max(1.0, capTB(ch));
+            const double utilLR = usage[i].lr / cLR;
+            const double utilTB = usage[i].tb / cTB;
+            s.maxUtil = max(s.maxUtil, max(utilLR, utilTB));
+            s.riskSum += negotiatedUtilRisk(utilLR) * cLR;
+            s.riskSum += negotiatedUtilRisk(utilTB) * cTB;
+        }
+        return s;
+    }
+
+    bool legalCongestionRiskImproved(const RouterScore& baseScore, const CongestionRiskScore& baseRisk,
+        const RouterScore& trialScore, const CongestionRiskScore& trialRisk) {
+        if (trialScore.open != 0 || trialScore.channelOverflow > EPS || trialScore.ftOverflow > EPS) return false;
+        const bool riskBetter = trialRisk.riskSum + 1e-6 < baseRisk.riskSum * NEGOTIATED_RISK_IMPROVE_RATIO;
+        const bool maxUtilBetter = trialRisk.maxUtil + 1e-6 < baseRisk.maxUtil - NEGOTIATED_MAX_UTIL_IMPROVE;
+        if (!riskBetter && !maxUtilBetter) return false;
+        const double wlLimit = baseScore.wireLength * NEGOTIATED_WL_RELAX + NEGOTIATED_WL_ABS_RELAX;
+        return trialScore.wireLength <= wlLimit;
+    }
+
+    void updateNegotiatedChannelHistory(const Design& design, bool includeLegalRisk) {
+        vector<DirUse> usage = computeDirectionalChannelUseFromRoutes(design);
+        if (g_negotiatedChannelHistory.size() != design.channels.size()) {
+            g_negotiatedChannelHistory.assign(design.channels.size(), { 0.0, 0.0 });
+        }
+        for (int i = 0; i < static_cast<int>(design.channels.size()); ++i) {
+            const Channel& ch = design.channels[i];
+            const double cLR = max(1.0, capLR(ch));
+            const double cTB = max(1.0, capTB(ch));
+            const double utilLR = usage[i].lr / cLR;
+            const double utilTB = usage[i].tb / cTB;
+            double pressureLR = max(0.0, usage[i].lr - cLR) / cLR;
+            double pressureTB = max(0.0, usage[i].tb - cTB) / cTB;
+            if (includeLegalRisk) {
+                pressureLR += negotiatedUtilRisk(utilLR);
+                pressureTB += negotiatedUtilRisk(utilTB);
+            }
+            g_negotiatedChannelHistory[i][0] = NEGOTIATED_HISTORY_DECAY * g_negotiatedChannelHistory[i][0]
+                + NEGOTIATED_HISTORY_GAIN * pressureLR;
+            g_negotiatedChannelHistory[i][1] = NEGOTIATED_HISTORY_DECAY * g_negotiatedChannelHistory[i][1]
+                + NEGOTIATED_HISTORY_GAIN * pressureTB;
+        }
     }
 
     bool betterRouterScore(const RouterScore& a, const RouterScore& b) {
@@ -771,15 +886,27 @@ namespace {
         double ftScore = 0.0;
     };
 
-    vector<array<double, 2>> buildHotChannelBias(const Design& design) {
+    vector<array<double, 2>> buildHotChannelBias(const Design& design, bool includeLegalRisk) {
         vector<array<double, 2>> bias(design.channels.size());
         vector<DirUse> usage = computeDirectionalChannelUseFromRoutes(design);
         for (int i = 0; i < static_cast<int>(design.channels.size()); ++i) {
             const Channel& ch = design.channels[i];
             const double cLR = max(1.0, capLR(ch));
             const double cTB = max(1.0, capTB(ch));
-            bias[i][0] = max(0.0, usage[i].lr - cLR) / cLR;
-            bias[i][1] = max(0.0, usage[i].tb - cTB) / cTB;
+            const double utilLR = usage[i].lr / cLR;
+            const double utilTB = usage[i].tb / cTB;
+            const double overflowLR = max(0.0, usage[i].lr - cLR) / cLR;
+            const double overflowTB = max(0.0, usage[i].tb - cTB) / cTB;
+            bias[i][0] = overflowLR;
+            bias[i][1] = overflowTB;
+            if (includeLegalRisk) {
+                bias[i][0] = max(bias[i][0], negotiatedUtilRisk(utilLR));
+                bias[i][1] = max(bias[i][1], negotiatedUtilRisk(utilTB));
+            }
+            if (i < static_cast<int>(g_negotiatedChannelHistory.size())) {
+                bias[i][0] = max(bias[i][0], g_negotiatedChannelHistory[i][0]);
+                bias[i][1] = max(bias[i][1], g_negotiatedChannelHistory[i][1]);
+            }
         }
         return bias;
     }
@@ -795,8 +922,8 @@ namespace {
         return bias;
     }
 
-    vector<RipupGroup> selectRipupGroups(const Design& design, int maxGroups) {
-        vector<array<double, 2>> hotCh = buildHotChannelBias(design);
+    vector<RipupGroup> selectRipupGroups(const Design& design, int maxGroups, bool includeLegalRisk) {
+        vector<array<double, 2>> hotCh = buildHotChannelBias(design, includeLegalRisk);
         vector<double> hotSoft = buildHotSoftBias(design);
         map<RipupKey, RipupGroup> groups;
 
@@ -1004,13 +1131,19 @@ namespace {
 //      Step5: channel-only whole + allow overflow。
 // 6. 最後印出 directional channel report 與 FT report。
 //
-// 注意：這版仍然是 baseline，不含 rip-up/reroute，也沒有多 routing order rerun。
-// 因此它仍可能因前面的 greedy commit 導致後面 connection 被迫 deferred。
+// 注意：這版已含有限度的 congestion rip-up/reroute repair，但主體仍是
+// greedy routing order；它仍可能因前面的 greedy commit 導致後面 connection
+// 被迫 deferred。
 // -----------------------------------------------------------------------------
 void Router::setFTOverflowCostEnabled(bool enabled) {
     g_ftOverflowExtraWeight = enabled ? FT_OVERFLOW_EXTRA_WEIGHT_REPAIR : FT_OVERFLOW_EXTRA_WEIGHT_BASE;
 }
+void Router::setSoftFTCostRelaxed(bool enabled) {
+    g_softFtFixedPenalty = enabled ? SOFT_FT_FIXED_PENALTY_RELAXED : SOFT_FT_FIXED_PENALTY_BASE;
+    g_softFtPerNetPenalty = enabled ? SOFT_FT_PER_NET_PENALTY_RELAXED : SOFT_FT_PER_NET_PENALTY_BASE;
+}
 void Router::run(Design& design) {
+    clearDirectionalUseCache();
     design.routes.clear();
     g_channelIndexByName.clear();
     g_channelIndexByName.reserve(design.channels.size() * 2 + 1);
@@ -1312,7 +1445,6 @@ void Router::run(Design& design) {
         RoutePath ftReserve = routeWithPolicy(d, conn, RouteMode::FT_ENABLED, false, CAP_SCALE_CH_WHOLE_RESERVED, false, true);
         RouteMetrics ftReserveM = analyzeRoute(d, ftReserve);
         printDecision("STEP1A_FT_FORCED_RESERVE", d, conn, ftReserve);
-
         if (!chWholeM.open && chWholeM.channelOverflowIncrement <= EPS) {
             if (shouldUseStrictFTCandidate(chWholeM, ftReserveM)) { applyPath(d, ftReserve); return true; }
             applyPath(d, chWhole); return true;
@@ -1329,6 +1461,7 @@ void Router::run(Design& design) {
 
         if (!chWholeFullM.open && chWholeFullM.channelOverflowIncrement <= EPS) {
             if (shouldUseStrictFTCandidate(chWholeFullM, ftFullM)) { applyPath(d, ftFull); return true; }
+
             applyPath(d, chWholeFull); return true;
         }
         if (shouldUseStrictFTCandidate(chWholeFullM, ftFullM)) { applyPath(d, ftFull); return true; }
@@ -1462,11 +1595,16 @@ void Router::run(Design& design) {
         if (!ENABLE_CONGESTION_RIPUP) return false;
         recomputeRouterUsageFields(design);
         const RouterScore baseScore = scoreRouterSolution(design);
-        if (baseScore.open == 0 && baseScore.channelOverflow <= EPS && baseScore.ftOverflow <= EPS) return false;
+        const CongestionRiskScore baseRisk = scoreCongestionRisk(design);
+        const bool legalRiskMode = baseScore.open == 0 && baseScore.channelOverflow <= EPS && baseScore.ftOverflow <= EPS;
+        if (legalRiskMode && baseRisk.maxUtil < NEGOTIATED_LEGAL_RIPUP_MIN_UTIL) return false;
+        if (legalRiskMode) updateNegotiatedChannelHistory(design, true);
+        else g_negotiatedChannelHistory.assign(design.channels.size(), { 0.0, 0.0 });
 
         const int n = static_cast<int>(design.blocks.size());
-        const int maxGroups = n >= 45 ? RIPUP_MAX_GROUPS_LARGE : RIPUP_MAX_GROUPS_MID;
-        vector<RipupGroup> groups = selectRipupGroups(design, maxGroups);
+        const int maxGroups = legalRiskMode ? max(8, (n >= 45 ? RIPUP_MAX_GROUPS_LARGE : RIPUP_MAX_GROUPS_MID) / 2)
+            : (n >= 45 ? RIPUP_MAX_GROUPS_LARGE : RIPUP_MAX_GROUPS_MID);
+        vector<RipupGroup> groups = selectRipupGroups(design, maxGroups, legalRiskMode);
         if (groups.empty()) return false;
 
         set<RipupKey> selected;
@@ -1495,7 +1633,7 @@ void Router::run(Design& design) {
         trial.routes = std::move(kept);
         recomputeRouterUsageFields(trial);
 
-        g_hotChannelBias = buildHotChannelBias(design);
+        g_hotChannelBias = buildHotChannelBias(design, legalRiskMode);
         g_hotSoftBias = buildHotSoftBias(design);
         g_congestionRerouteMode = true;
         g_congestionBiasWeight = n >= 45 ? 8.0e6 : 4.0e6;
@@ -1523,7 +1661,10 @@ void Router::run(Design& design) {
 
         recomputeRouterUsageFields(trial);
         const RouterScore trialScore = scoreRouterSolution(trial);
-        if (!ripupRouteFailed && betterRouterScore(trialScore, baseScore)) {
+        const CongestionRiskScore trialRisk = scoreCongestionRisk(trial);
+        const bool acceptRipup = !ripupRouteFailed && (betterRouterScore(trialScore, baseScore)
+            || (legalRiskMode && legalCongestionRiskImproved(baseScore, baseRisk, trialScore, trialRisk)));
+        if (acceptRipup) {
             if (ROUTER_DIAG_ENABLE) {
                 cerr << fixed << setprecision(3)
                     << "[RouterRefined][RIPUP_ACCEPT] groups=" << groups.size()
@@ -1612,9 +1753,11 @@ void Router::run(Design& design) {
                 << " finalWL=" << totalRouteWireLengthNow(design) << "\n";
         }
         };
+    g_negotiatedChannelHistory.assign(design.channels.size(), { 0.0, 0.0 });
     for (int ripupPass = 0; ripupPass < 3; ++ripupPass) {
         if (!tryCongestionRipup()) break;
     }
+    g_negotiatedChannelHistory.clear();
     repairConnectionCoverage();
     printFinalDiagnosis(design);
 }
@@ -1764,7 +1907,7 @@ RoutePath Router::routeOneConnection(const Design& design, const Connection& con
     }
     const vector<Node>& nodes = *nodesPtr;
     const vector<vector<AdjEdge>>& g = *graphPtr;
-    vector<DirUse> currentUse = computeDirectionalChannelUseFromRoutes(design);
+    const vector<DirUse>& currentUse = cachedDirectionalChannelUseFromRoutes(design);
 
     const int srcNode = conn.src;
     const int dstNode = conn.dst;
@@ -1777,6 +1920,14 @@ RoutePath Router::routeOneConnection(const Design& design, const Connection& con
     auto sNode = [&](int state) { return (state / SOFT_STATE_COUNT) / EDGE_STATE_COUNT; };
     auto sEdge = [&](int state) { return (state / SOFT_STATE_COUNT) % EDGE_STATE_COUNT; };
 
+    const double dstCx = rectCx(nodes[dstNode].rect);
+    const double dstCy = rectCy(nodes[dstNode].rect);
+    auto astarHeuristic = [&](int node) -> double {
+        if (node == dstNode) return 0.0;
+        return ROUTER_WIRE_WEIGHT * static_cast<double>(conn.netCount)
+            * manhattan(rectCx(nodes[node].rect), rectCy(nodes[node].rect), dstCx, dstCy);
+        };
+
     vector<double> dist(S, numeric_limits<double>::infinity());
     vector<int> parent(S, -1);
     vector<int> transEdgeOut(S, 0); // edge of parent node used to leave parent
@@ -1787,15 +1938,16 @@ RoutePath Router::routeOneConnection(const Design& design, const Connection& con
 
     const int start = sid(srcNode, 0, 0);
     dist[start] = 0.0;
-    pq.push({ 0.0, start });
+    pq.push({ astarHeuristic(srcNode), start });
 
     int bestDst = -1;
     while (!pq.empty()) {
-        auto [d, st] = pq.top(); pq.pop();
-        if (d != dist[st]) continue;
+        auto [queuedCost, st] = pq.top(); pq.pop();
         const int u = sNode(st);
         const int uIn = sEdge(st);
         const int uSoftSeen = sSoft(st);
+        const double d = dist[st];
+        if (queuedCost > d + astarHeuristic(u) + 1e-9) continue;
         if (u == dstNode && (!g_requireSoftFT || uSoftSeen != 0)) { bestDst = st; break; }
 
         for (const auto& e : g[u]) {
@@ -1843,7 +1995,7 @@ RoutePath Router::routeOneConnection(const Design& design, const Connection& con
                 parent[next] = st;
                 transEdgeOut[next] = e.edgeFrom;
                 transEdgeIn[next] = e.edgeTo;
-                pq.push({ nd, next });
+                pq.push({ nd + astarHeuristic(v), next });
             }
         }
     }
