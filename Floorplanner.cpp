@@ -1,4 +1,5 @@
 #include "Floorplanner.hpp"
+#include "ChannelBuilder.hpp"
 #include "Utility.hpp"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <queue>
 #include <string>
 #include <vector>
+#include <functional>
 
 using namespace std;
 
@@ -48,13 +50,13 @@ namespace {
     static constexpr double SOFT_SHAPE_LOG_SIGMA = 0.42;
     static constexpr double SOFT_SHAPE_HOT_EXTREME_BIAS = 0.33;
     static constexpr double FT_SOFT_EXPAND_MIN_RATE = 0.000;
-    static constexpr double FT_SOFT_EXPAND_MAX_RATE = 0.700;
-    static constexpr double FT_SOFT_EXPAND_BASE_RATE = 0.018;
-    static constexpr double FT_SOFT_MULTI_NET_BONUS = 0.070;
-    static constexpr double FT_SOFT_EDGE_BONUS = 0.030;
-    static constexpr double FT_SOFT_KEEP_CHANNEL_GAP_SCALE = 0.38;
-    static constexpr double FT_SOFT_KEEP_CHANNEL_GAP_CAP = 24.0;
-    static constexpr double HPWL_TIE_WEIGHT = 0.012;
+    static constexpr double FT_SOFT_EXPAND_MAX_RATE = 0.220;
+    static constexpr double FT_SOFT_EXPAND_BASE_RATE = 0.010;
+    static constexpr double FT_SOFT_MULTI_NET_BONUS = 0.030;
+    static constexpr double FT_SOFT_EDGE_BONUS = 0.012;
+    static constexpr double FT_SOFT_KEEP_CHANNEL_GAP_SCALE = 0.10;
+    static constexpr double FT_SOFT_KEEP_CHANNEL_GAP_CAP = 6.0;
+    static constexpr double HPWL_TIE_WEIGHT = 0.060;
     static constexpr double CENTER_TIE_WEIGHT = 1.0e-5;
     static constexpr double ROUTE_GAP_TIE_WEIGHT = 0.080;
     static constexpr double ROUTE_DENSITY = 25.0;
@@ -67,6 +69,9 @@ namespace {
     // It does NOT add any new SA/annealing cost term or extra inner-loop estimator.
     static constexpr double DIRECT_CHANNEL_SAFETY_FAST = 1.0;
     static constexpr double MIN_DIRECT_GUARD_NETS_FAST = 25.0;
+    static constexpr double CHANNEL_THICKNESS_MIN_FAST = 1.0;
+    static constexpr double CHANNEL_THICKNESS_MAX_FAST = 6.0;
+    static constexpr double CHANNEL_THICKNESS_NET_SCALE_FAST = 0.018;
     static constexpr double SLIVER_SNAP_ABS_FAST = 2.0;
     static constexpr double SLIVER_SNAP_RATIO_FAST = 0.08;
     static constexpr double SPLIT_AWARE_MIN_SCALE_FAST = 0.24;
@@ -75,6 +80,9 @@ namespace {
     static constexpr double ENDPOINT_GUARD_CAP_FAST = 18.0;
     static constexpr double PACK_GAP = 1.0e-3;
     static constexpr int FAST_MAX_TOTAL_LAYOUT_CANDIDATES = 6000;
+    static constexpr bool ENABLE_EXPLICIT_TOPOLOGY_SUPPLEMENT = true;
+    static constexpr int EXPLICIT_TOPOLOGY_SUPPLEMENT_TRIALS = 1200;
+    static constexpr int EXPLICIT_TOPOLOGY_SUPPLEMENT_KEEP = 10;
     static constexpr int FAST_COORD_LIMIT_SMALL = 54;
     static constexpr int FAST_COORD_LIMIT_MID = 36;
     static constexpr int FAST_COORD_LIMIT_LARGE = 24;
@@ -127,6 +135,26 @@ namespace {
     static constexpr double BSTAR_PACK_DEVIATION_WEIGHT = 1.0e-4;
     static constexpr int BSTAR_ROOT_CAND_LIMIT = 42;
     static constexpr int BSTAR_CHILD_X_CAND_LIMIT = 24;
+    static constexpr int BSTAR_ARCHIVE_LIMIT = 24;
+    static constexpr int BSTAR_ARCHIVE_SAMPLE_PERIOD = 31;
+    static constexpr double BSTAR_ARCHIVE_AREA_WINDOW = 0.14;
+    static constexpr double STRIP_PROXY_FREE_UTIL = 0.72;
+    static constexpr double STRIP_PROXY_TARGET_UTIL = 0.94;
+    static constexpr double STRIP_PROXY_OVERFLOW_WEIGHT = 18000.0;
+    static constexpr double STRIP_PROXY_RISK_WEIGHT = 1400.0;
+    static constexpr double STRIP_PROXY_PEAK_WEIGHT = 70000.0;
+    static constexpr double BSTAR_HPWL_COST_WEIGHT = 0.045;
+    static constexpr double BSTAR_ROUTE_COST_WEIGHT = 0.020;
+    static constexpr bool ENABLE_HPWL_FORCE_ARCHIVE_REFINEMENT = true;
+    static constexpr int FORCE_REFINE_SEED_LIMIT = 8;
+    static constexpr int FORCE_REFINE_KEEP_LIMIT = 4;
+    static constexpr int FORCE_REFINE_ITERS = 18;
+    static constexpr double FORCE_REFINE_START_STEP = 0.045;
+    static constexpr double FORCE_REFINE_END_STEP = 0.018;
+    static constexpr double FORCE_ATTR_WEIGHT = 1.00;
+    static constexpr double FORCE_REPULSE_WEIGHT = 0.85;
+    static constexpr double FORCE_CHANNEL_WEIGHT = 0.90;
+    static constexpr double FORCE_HOT_PAIR_FRAC = 0.20;
     static constexpr bool ENABLE_DENSITY_AWARE_PACK = false;
     static constexpr double PACK_TOP_PRESSURE_RATIO = 0.0;
     static constexpr double PACK_RIGHT_PRESSURE_RATIO = 0.0;
@@ -245,7 +273,7 @@ namespace {
 
     static double softFtExpansionMaxRateForDesign(const Design& design) {
         if (smallOfficialLikeCase(design)) return 0.020;
-        if (design.blockSpecs.size() >= 45) return 0.520;
+        if (design.blockSpecs.size() >= 45) return 0.180;
         return FT_SOFT_EXPAND_MAX_RATE;
     }
 
@@ -310,10 +338,34 @@ namespace {
         return clampD(rate, FT_SOFT_EXPAND_MIN_RATE, maxRate);
     }
 
+    static double softFtSideReserve(const Design& design, int id) {
+        if (!ENABLE_FT_SOFT_RESERVE) return 0.0;
+        if (id < 0 || id >= static_cast<int>(design.blockSpecs.size())) return 0.0;
+        const BlockSpec& s = design.blockSpecs[id];
+        if (s.type != BlockType::SOFT || s.hasFixedSize) return 0.0;
+
+        const double base = blockNominalArea(s);
+        const double eta = softFtExpansionRate(design, id);
+        if (eta <= 0.0) return 0.0;
+
+        // The official FT growth is side-length based, not a raw area multiplier.
+        // Use endpoint demand as a conservative FT proxy, then reserve a bounded
+        // per-side halo.  Actual FT resizing still happens after real routing.
+        const double delta = (endpointDemand(design, id) / ROUTE_DENSITY) * eta * 0.5;
+        const double cap = max(3.0, 0.045 * sqrt(base));
+        return clampD(delta, 0.0, cap);
+    }
+
     static double blockPackingArea(const Design& design, int id) {
         if (id < 0 || id >= static_cast<int>(design.blockSpecs.size())) return 1.0;
-        const double base = blockNominalArea(design.blockSpecs[id]);
-        return base * (1.0 + softFtExpansionRate(design, id));
+        const BlockSpec& s = design.blockSpecs[id];
+        const double base = blockNominalArea(s);
+        if (s.hasFixedSize) return base;
+        const double ratio = aspectMid(s);
+        const double w = sqrt(base * ratio);
+        const double h = base / max(TINY, w);
+        const double d = softFtSideReserve(design, id);
+        return (w + d) * (h + d);
     }
 
     static double totalPackingArea(const Design& design) {
@@ -334,9 +386,12 @@ namespace {
         double amin = max(0.05, s.aspectMin);
         double amax = max(amin, s.aspectMax);
         ratio = clampD(ratio > 0.0 ? ratio : aspectMid(s), amin, amax);
-        double area = blockPackingArea(design, id);
+        double area = blockNominalArea(s);
         r.w = sqrt(area * ratio);
         r.h = area / max(TINY, r.w);
+        const double d = softFtSideReserve(design, id);
+        r.w += d;
+        r.h += d;
         return r;
     }
 
@@ -408,36 +463,39 @@ namespace {
         return clampD(scale, 0.20, 0.86);
     }
 
+    static double estimatedDirectFlowNets(const Design& design, int a, int b, int nets) {
+        if (nets <= 0) return 0.0;
+        const double ea = endpointDemand(design, a);
+        const double eb = endpointDemand(design, b);
+        const double pairShare = clampD(static_cast<double>(nets) / max(1.0, min(ea, eb)), 0.0, 1.0);
+
+        // Only a fraction of a pair's nets should be forced through the immediate
+        // interface.  The rest may split through other channels or soft feedthrough.
+        double direct = 0.45 + 0.55 * sqrt(pairShare);
+        direct *= sqrt(blockRoutingRigidity(design, a) * blockRoutingRigidity(design, b));
+
+        const bool aSoft = design.blockSpecs[a].type == BlockType::SOFT;
+        const bool bSoft = design.blockSpecs[b].type == BlockType::SOFT;
+        if (aSoft && bSoft) direct *= 0.92;
+        else if (aSoft || bSoft) direct *= 0.96;
+
+        return static_cast<double>(nets) * clampD(direct, 0.42, 1.00);
+    }
+
     static double requiredPairGap(const Design& design, int a, int b, bool xGap) {
-        (void)xGap; // currently symmetric; kept as a hook for future directional tuning.
+        (void)xGap; // LR/TB capacity is carried by perpendicular overlap below.
         const int nets = totalConnBetween(design, a, b);
         if (nets <= 0) return PACK_GAP;
 
-        const double fullDirect = requiredForNets(design, nets);
-        double req = fullDirect * splitAwarePairScale(design, a, b, nets);
-        // FT-reserved soft macros are already enlarged before packing; this small
-        // bonus prevents the reserved area from silently consuming the neighboring
-        // routing channel and causing overflow later.
-        req += ftSoftKeepChannelGapBonus(design, a, b, fullDirect);
+        const double flow = estimatedDirectFlowNets(design, a, b, nets);
+        double req = CHANNEL_THICKNESS_MIN_FAST + CHANNEL_THICKNESS_NET_SCALE_FAST * sqrt(max(0.0, flow));
+        req *= clampD(sqrt(blockRoutingRigidity(design, a) * blockRoutingRigidity(design, b)), 0.85, 1.20);
 
-        // Endpoint pressure from the sourcecode's port-window idea: even a modest
-        // pair should not be packed with a numerical zero gap if both endpoints are
-        // high-demand blocks.  Keep this bounded so it does not become a hidden cost.
-        const double ep = min(endpointDemand(design, a), endpointDemand(design, b));
-        const double endpointGuard = min(ENDPOINT_GUARD_CAP_FAST, ENDPOINT_GUARD_SCALE_FAST * ep / ROUTE_DENSITY);
-        req = max(req, endpointGuard);
-
-        // Avoid creating 0.x / 1.x um channel strips for connected blocks.  The cap
-        // prevents one huge bundle from forcing every candidate to waste outline area.
-        req = max(req, min(7.0, sliverSnapThresholdFast(design) * 0.70));
-
-        const double ea = endpointDemand(design, a);
-        const double eb = endpointDemand(design, b);
-        const double share = clampD(static_cast<double>(nets) / max(1.0, min(ea, eb)), 0.0, 1.0);
-        double capFrac = 0.032 + 0.043 * sqrt(share);
-        capFrac *= sqrt(blockRoutingRigidity(design, a) * blockRoutingRigidity(design, b));
-        const double cap = max(20.0, min(ROUTE_GAP_MAX_ABS, capFrac * min(design.maxOutlineW, design.maxOutlineH)));
-        return clampD(req, PACK_GAP, cap);
+        // Keep a small numerical channel thickness, but do not let direct-net count
+        // become a second capacity reservation on top of requiredPortOverlap().
+        req += ftSoftKeepChannelGapBonus(design, a, b, requiredForNets(design, nets));
+        req = max(req, min(CHANNEL_THICKNESS_MAX_FAST, sliverSnapThresholdFast(design) * 0.30));
+        return clampD(req, PACK_GAP, CHANNEL_THICKNESS_MAX_FAST);
     }
 
     static double requiredXGap(const Design& design, int a, int b) {
@@ -451,7 +509,7 @@ namespace {
     static double requiredPortOverlap(const Design& design, int a, int b) {
         int nets = totalConnBetween(design, a, b);
         if (nets <= 0) return 0.0;
-        return static_cast<double>(nets) / ROUTE_DENSITY * PORT_WINDOW_SAFETY_FAST;
+        return estimatedDirectFlowNets(design, a, b, nets) / ROUTE_DENSITY * PORT_WINDOW_SAFETY_FAST;
     }
 
 
@@ -731,6 +789,7 @@ namespace {
         const bool centeredEdgeZones = (g_edgePlacementMode == 2);
         double sideLoad[4] = { 0.0, 0.0, 0.0, 0.0 };
         double zoneLoad[12] = { 0.0 };
+        vector<EdgeRule> selectedRule(n);
 
         vector<int> edgeIds;
         for (int i = 0; i < n; ++i) if (design.blockSpecs[i].type == BlockType::EDGE) edgeIds.push_back(i);
@@ -774,7 +833,7 @@ namespace {
                 double score = 1.0e9 * sqr(sideOverflow) + 1.0e6 * sqr(zoneOverflow) + 1.0e-3 * r.zone;
                 if (smartEdgeChoice) {
                     if (hasPortFacingRule && !allowsPortEdge(design.blockSpecs[id], inwardPortForEdgeSide(r.side))) {
-                        score += 2.0e-4;
+                        score += 1.0e5;
                     }
                     score +=
                         5.0e-3 * sqr(packedSideOverflow) +
@@ -795,6 +854,7 @@ namespace {
             EdgePlacedInfo it;
             it.id = id;
             it.rule = best;
+            selectedRule[id] = best;
             it.len = sideLen(sh, best.side);
             it.pref = zoneCenter(best, W, H) - 0.5 * it.len;
             int si = sideIndex(best.side);
@@ -882,12 +942,8 @@ namespace {
                     if (ovArea(rects[a], rects[b]) <= EPS) continue;
                     // Move the smaller edge block along its side away from the conflict.
                     int id = (rects[a].w * rects[a].h <= rects[b].w * rects[b].h) ? a : b;
-                    EdgeRule r = edgeRules(design.blockSpecs[id]).empty() ? parseRule("BL") : edgeRules(design.blockSpecs[id]).front();
-                    // Use currently selected side by detecting boundary.
-                    if (fabs(rects[id].y) <= 1e-5) r.side = 'B';
-                    else if (fabs(rectTop(rects[id]) - H) <= 1e-5) r.side = 'T';
-                    else if (fabs(rects[id].x) <= 1e-5) r.side = 'L';
-                    else r.side = 'R';
+                    EdgeRule r = selectedRule[id].valid ? selectedRule[id] :
+                        (edgeRules(design.blockSpecs[id]).empty() ? parseRule("BL") : edgeRules(design.blockSpecs[id]).front());
                     double span = sideSpan(r.side, W, H);
                     double len = sideLen(rects[id], r.side);
                     double cur = (r.side == 'T' || r.side == 'B') ? rects[id].x : rects[id].y;
@@ -1228,6 +1284,10 @@ namespace {
         int routeViolPairs = 0;
         int routeXInterfaces = 0;
         int routeYInterfaces = 0;
+        double stripOverflowProxy = 0.0;
+        double stripRiskProxy = 0.0;
+        double stripPeakUtilProxy = 0.0;
+        int stripHotComponents = 0;
         vector<Rect> rects;
     };
 
@@ -1276,6 +1336,1088 @@ namespace {
             }
         }
         return a.score < b.score;
+    }
+
+    static double intervalDistanceToPoint(double lo, double hi, double p) {
+        if (p < lo) return lo - p;
+        if (p > hi) return p - hi;
+        return 0.0;
+    }
+
+    static Design makeTempDesignWithLayout(const Design& design, const LayoutResult& layout) {
+        Design tmp = design;
+        tmp.outlineW = clampD(layout.W, 1.0, design.maxOutlineW);
+        tmp.outlineH = clampD(layout.H, 1.0, design.maxOutlineH);
+        tmp.blocks.clear();
+        tmp.blocks.reserve(design.blockSpecs.size());
+        tmp.blockNameToIndex.clear();
+        for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) {
+            BlockInst b;
+            b.spec = design.blockSpecs[i];
+            if (i < static_cast<int>(layout.rects.size())) b.rect = layout.rects[i];
+            tmp.blockNameToIndex[b.spec.name] = i;
+            tmp.blocks.push_back(b);
+        }
+        tmp.channels.clear();
+        tmp.routes.clear();
+        ChannelBuilder builder;
+        builder.build(tmp);
+        return tmp;
+    }
+
+    static void annotateStripProxy(const Design& design, LayoutResult& layout) {
+        layout.stripOverflowProxy = 0.0;
+        layout.stripRiskProxy = 0.0;
+        layout.stripPeakUtilProxy = 0.0;
+        layout.stripHotComponents = 0;
+        if (!layout.legal || layout.rects.empty()) return;
+
+        Design tmp = makeTempDesignWithLayout(design, layout);
+        const int chN = static_cast<int>(tmp.channels.size());
+        if (chN <= 0) return;
+
+        vector<double> lrUse(chN, 0.0), tbUse(chN, 0.0);
+        auto addDemand = [&](int src, int dst, int nets) {
+            if (nets <= 0 || src < 0 || dst < 0 ||
+                src >= static_cast<int>(layout.rects.size()) ||
+                dst >= static_cast<int>(layout.rects.size())) return;
+
+            const Rect& a = layout.rects[src];
+            const Rect& b = layout.rects[dst];
+            const double ax = rectCx(a), ay = rectCy(a);
+            const double bx = rectCx(b), by = rectCy(b);
+            const double minX = min(ax, bx), maxX = max(ax, bx);
+            const double minY = min(ay, by), maxY = max(ay, by);
+            const double spanX = max(1.0, maxX - minX);
+            const double spanY = max(1.0, maxY - minY);
+            const double midX = 0.5 * (ax + bx);
+            const double midY = 0.5 * (ay + by);
+            const double bandX = max(12.0, 0.08 * layout.W + 0.18 * spanX);
+            const double bandY = max(12.0, 0.08 * layout.H + 0.18 * spanY);
+
+            const double demand = 12.0 * max(estimatedDirectFlowNets(design, src, dst, nets), 0.72 * static_cast<double>(nets));
+            if (demand <= EPS) return;
+            int bestH = -1, bestV = -1;
+            double bestHW = 0.0, bestVW = 0.0;
+            for (int ci = 0; ci < chN; ++ci) {
+                const Channel& ch = tmp.channels[ci];
+                const double chR = rectRight(ch.rect);
+                const double chT = rectTop(ch.rect);
+                const double ox = overlapLen(ch.rect.x, chR, minX, maxX) / spanX;
+                const double oy = overlapLen(ch.rect.y, chT, minY, maxY) / spanY;
+                const double dy = intervalDistanceToPoint(ch.rect.y, chT, midY);
+                const double dx = intervalDistanceToPoint(ch.rect.x, chR, midX);
+                const double hWeight = (0.15 + 0.85 * clampD(ox, 0.0, 1.0)) * exp(-dy / bandY);
+                const double vWeight = (0.15 + 0.85 * clampD(oy, 0.0, 1.0)) * exp(-dx / bandX);
+                if (hWeight > 1.0e-4) lrUse[ci] += demand * hWeight;
+                if (vWeight > 1.0e-4) tbUse[ci] += demand * vWeight;
+                if (hWeight > bestHW) { bestHW = hWeight; bestH = ci; }
+                if (vWeight > bestVW) { bestVW = vWeight; bestV = ci; }
+            }
+            if (bestH >= 0 && bestHW > 1.0e-4) lrUse[bestH] += 0.65 * demand;
+            if (bestV >= 0 && bestVW > 1.0e-4) tbUse[bestV] += 0.65 * demand;
+            };
+
+        if (!design.connections.empty()) {
+            for (const auto& c : design.connections) addDemand(c.src, c.dst, max(0, c.netCount));
+        }
+        else {
+            const int n = static_cast<int>(design.blockSpecs.size());
+            for (int i = 0; i < n; ++i) {
+                for (int j = i + 1; j < n; ++j) addDemand(i, j, totalConnBetween(design, i, j));
+            }
+        }
+
+        for (int ci = 0; ci < chN; ++ci) {
+            const Channel& ch = tmp.channels[ci];
+            const double capLR = max(1.0, ch.rect.h * ROUTE_DENSITY);
+            const double capTB = max(1.0, ch.rect.w * ROUTE_DENSITY);
+            const double utilLR = lrUse[ci] / capLR;
+            const double utilTB = tbUse[ci] / capTB;
+            layout.stripPeakUtilProxy = max(layout.stripPeakUtilProxy, max(utilLR, utilTB));
+
+            auto addComponent = [&](double util, double cap) {
+                const double over = max(0.0, util - STRIP_PROXY_TARGET_UTIL);
+                const double risk = max(0.0, util - STRIP_PROXY_FREE_UTIL);
+                layout.stripOverflowProxy += over * over * cap;
+                layout.stripRiskProxy += risk * risk * cap;
+                if (util > STRIP_PROXY_TARGET_UTIL) ++layout.stripHotComponents;
+                };
+            addComponent(utilLR, capLR);
+            addComponent(utilTB, capTB);
+        }
+    }
+
+    static double archiveProxyScore(const LayoutResult& r) {
+        const double peak = max(0.0, r.stripPeakUtilProxy - STRIP_PROXY_TARGET_UTIL);
+        return r.area
+            + HPWL_TIE_WEIGHT * r.hpwl
+            + ROUTE_GAP_TIE_WEIGHT * r.routePenalty
+            + STRIP_PROXY_OVERFLOW_WEIGHT * r.stripOverflowProxy
+            + STRIP_PROXY_RISK_WEIGHT * r.stripRiskProxy
+            + STRIP_PROXY_PEAK_WEIGHT * peak * peak * max(1.0, r.area);
+    }
+
+    static bool betterArchiveLayout(const LayoutResult& a, const LayoutResult& b) {
+        if (a.legal != b.legal) return a.legal;
+        if (a.strictEdgeLegal != b.strictEdgeLegal) return a.strictEdgeLegal;
+        if (!std::isfinite(b.area) || b.area >= INF * 0.5) return true;
+        const double minArea = min(a.area, b.area);
+        const double areaTol = max(1.0, BSTAR_ARCHIVE_AREA_WINDOW * minArea);
+        if (fabs(a.area - b.area) > areaTol) return a.area < b.area;
+        const double as = archiveProxyScore(a);
+        const double bs = archiveProxyScore(b);
+        if (fabs(as - bs) > max(1.0, 1.0e-6 * min(as, bs))) return as < bs;
+        return a.area < b.area;
+    }
+
+    static void addToBStarArchive(const Design& design, vector<LayoutResult>& archive, const LayoutResult& cand) {
+        if (!cand.legal || !cand.strictEdgeLegal) return;
+        LayoutResult item = cand;
+        annotateStripProxy(design, item);
+        for (const auto& old : archive) {
+            const double areaTol = max(1.0, 0.0005 * min(old.area, item.area));
+            if (fabs(old.area - item.area) <= areaTol &&
+                fabs(old.W - item.W) <= 1.0 &&
+                fabs(old.H - item.H) <= 1.0 &&
+                fabs(old.stripPeakUtilProxy - item.stripPeakUtilProxy) <= 0.01) {
+                return;
+            }
+        }
+        archive.push_back(std::move(item));
+        sort(archive.begin(), archive.end(), betterArchiveLayout);
+        if (static_cast<int>(archive.size()) > BSTAR_ARCHIVE_LIMIT) archive.resize(BSTAR_ARCHIVE_LIMIT);
+    }
+
+    static vector<int> legalPortEdgesForForce(const BlockSpec& spec) {
+        if (!spec.portEdges.empty()) return spec.portEdges;
+        return { 1, 2, 3, 4 };
+    }
+
+    static pair<double, double> forceEdgeAnchor(const Rect& r, int edge, double t) {
+        t = clampD(t, 0.0, 1.0);
+        if (edge == 1) return { r.x, r.y + t * r.h };
+        if (edge == 3) return { rectRight(r), r.y + t * r.h };
+        if (edge == 2) return { r.x + t * r.w, rectTop(r) };
+        return { r.x + t * r.w, r.y };
+    }
+
+    static double bestPortAwareDelta(
+        const Design& design,
+        const vector<Rect>& rects,
+        int a,
+        int b,
+        double& dx,
+        double& dy
+    ) {
+        dx = rectCx(rects[b]) - rectCx(rects[a]);
+        dy = rectCy(rects[b]) - rectCy(rects[a]);
+        if (a < 0 || b < 0 || a >= static_cast<int>(rects.size()) || b >= static_cast<int>(rects.size())) {
+            return fabs(dx) + fabs(dy);
+        }
+        const vector<int> ea = legalPortEdgesForForce(design.blockSpecs[a]);
+        const vector<int> eb = legalPortEdgesForForce(design.blockSpecs[b]);
+        const double ts[3] = { 0.25, 0.50, 0.75 };
+        double best = INF;
+        for (int pa : ea) {
+            if (pa < 1 || pa > 4) continue;
+            for (int pb : eb) {
+                if (pb < 1 || pb > 4) continue;
+                for (double ta : ts) {
+                    const auto aa = forceEdgeAnchor(rects[a], pa, ta);
+                    for (double tb : ts) {
+                        const auto bb = forceEdgeAnchor(rects[b], pb, tb);
+                        const double ddx = bb.first - aa.first;
+                        const double ddy = bb.second - aa.second;
+                        const double d = fabs(ddx) + fabs(ddy);
+                        if (d < best) {
+                            best = d;
+                            dx = ddx;
+                            dy = ddy;
+                        }
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    static double portAwareHpwl(const Design& design, const vector<Rect>& rects) {
+        double s = 0.0;
+        auto addPair = [&](int a, int b, int nets) {
+            if (nets <= 0 || a < 0 || b < 0 ||
+                a >= static_cast<int>(rects.size()) ||
+                b >= static_cast<int>(rects.size())) return;
+            double dx = 0.0, dy = 0.0;
+            s += static_cast<double>(nets) * bestPortAwareDelta(design, rects, a, b, dx, dy);
+            };
+
+        if (!design.connections.empty()) {
+            for (const auto& c : design.connections) addPair(c.src, c.dst, max(0, c.netCount));
+        }
+        else {
+            const int n = min(static_cast<int>(rects.size()), static_cast<int>(design.connMatrix.size()));
+            for (int i = 0; i < n; ++i) {
+                for (int j = i + 1; j < n; ++j) addPair(i, j, totalConnBetween(design, i, j));
+            }
+        }
+        return s;
+    }
+
+    struct ProxyDirUse {
+        double lr = 0.0;
+        double tb = 0.0;
+    };
+
+    struct RouteProxy {
+        double guidePointWL = 0.0;
+        double maxDirectionalUtil = 0.0;
+        double channelRisk = 0.0;
+        double ftRisk = 0.0;
+        int disconnectedPairs = 0;
+        int routedPairs = 0;
+    };
+
+    struct ProxyNode {
+        string name;
+        Rect rect;
+        bool isBlock = false;
+        int index = -1;
+    };
+
+    struct ProxyAdj {
+        int to = -1;
+        int edgeFrom = 0;
+        int edgeTo = 0;
+        double baseCost = 0.0;
+    };
+
+    struct ProxyPath {
+        bool open = true;
+        double guideWL = 0.0;
+        vector<int> states;
+        vector<int> transOut;
+        vector<pair<double, double>> contacts;
+    };
+
+    static bool validProxyEdge(int e) {
+        return e >= 1 && e <= 4;
+    }
+
+    static bool proxyAllowsPortEdge(const BlockSpec& spec, int edge) {
+        if (!validProxyEdge(edge)) return false;
+        if (spec.portEdges.empty()) return true;
+        return find(spec.portEdges.begin(), spec.portEdges.end(), edge) != spec.portEdges.end();
+    }
+
+    static bool proxyOppositeLR(int a, int b) {
+        return (a == 1 && b == 3) || (a == 3 && b == 1);
+    }
+
+    static bool proxyOppositeTB(int a, int b) {
+        return (a == 2 && b == 4) || (a == 4 && b == 2);
+    }
+
+    static bool proxyTurn(int a, int b) {
+        return validProxyEdge(a) && validProxyEdge(b) && a != b &&
+            !proxyOppositeLR(a, b) && !proxyOppositeTB(a, b);
+    }
+
+    static ProxyDirUse proxyDeltaForTraversal(int inEdge, int outEdge, double nets) {
+        ProxyDirUse d;
+        if (!validProxyEdge(inEdge) || !validProxyEdge(outEdge) || inEdge == outEdge) return d;
+        if (proxyOppositeLR(inEdge, outEdge)) d.lr += nets;
+        else if (proxyOppositeTB(inEdge, outEdge)) d.tb += nets;
+        else if (proxyTurn(inEdge, outEdge)) {
+            d.lr += nets;
+            d.tb += nets;
+        }
+        return d;
+    }
+
+    static bool proxyTouchWithEdges(const Rect& a, const Rect& b, int& edgeA, int& edgeB) {
+        static constexpr double TOUCH_EPS_LOCAL = 1.0e-3;
+        static constexpr double TOUCH_OVERLAP_EPS_LOCAL = 1.0e-7;
+        if (fabs(rectRight(a) - b.x) <= TOUCH_EPS_LOCAL &&
+            overlapLen(a.y, rectTop(a), b.y, rectTop(b)) > TOUCH_OVERLAP_EPS_LOCAL) {
+            edgeA = 3; edgeB = 1; return true;
+        }
+        if (fabs(a.x - rectRight(b)) <= TOUCH_EPS_LOCAL &&
+            overlapLen(a.y, rectTop(a), b.y, rectTop(b)) > TOUCH_OVERLAP_EPS_LOCAL) {
+            edgeA = 1; edgeB = 3; return true;
+        }
+        if (fabs(rectTop(a) - b.y) <= TOUCH_EPS_LOCAL &&
+            overlapLen(a.x, rectRight(a), b.x, rectRight(b)) > TOUCH_OVERLAP_EPS_LOCAL) {
+            edgeA = 2; edgeB = 4; return true;
+        }
+        if (fabs(a.y - rectTop(b)) <= TOUCH_EPS_LOCAL &&
+            overlapLen(a.x, rectRight(a), b.x, rectRight(b)) > TOUCH_OVERLAP_EPS_LOCAL) {
+            edgeA = 4; edgeB = 2; return true;
+        }
+        return false;
+    }
+
+    static bool proxyContactPoint(const Rect& a, int ea, const Rect& b, int eb, pair<double, double>& p) {
+        if (!validProxyEdge(ea) || !validProxyEdge(eb)) return false;
+        if (ea == 3 && eb == 1 && fabs(rectRight(a) - b.x) <= 1.0e-3) {
+            const double lo = max(a.y, b.y);
+            const double hi = min(rectTop(a), rectTop(b));
+            if (hi <= lo + 1.0e-7) return false;
+            p = { 0.5 * (rectRight(a) + b.x), 0.5 * (lo + hi) };
+            return true;
+        }
+        if (ea == 1 && eb == 3 && fabs(a.x - rectRight(b)) <= 1.0e-3) {
+            const double lo = max(a.y, b.y);
+            const double hi = min(rectTop(a), rectTop(b));
+            if (hi <= lo + 1.0e-7) return false;
+            p = { 0.5 * (a.x + rectRight(b)), 0.5 * (lo + hi) };
+            return true;
+        }
+        if (ea == 2 && eb == 4 && fabs(rectTop(a) - b.y) <= 1.0e-3) {
+            const double lo = max(a.x, b.x);
+            const double hi = min(rectRight(a), rectRight(b));
+            if (hi <= lo + 1.0e-7) return false;
+            p = { 0.5 * (lo + hi), 0.5 * (rectTop(a) + b.y) };
+            return true;
+        }
+        if (ea == 4 && eb == 2 && fabs(a.y - rectTop(b)) <= 1.0e-3) {
+            const double lo = max(a.x, b.x);
+            const double hi = min(rectRight(a), rectRight(b));
+            if (hi <= lo + 1.0e-7) return false;
+            p = { 0.5 * (lo + hi), 0.5 * (a.y + rectTop(b)) };
+            return true;
+        }
+        return false;
+    }
+
+    static pair<double, double> proxyContactOrEdgePoint(const ProxyNode& a, int ea, const ProxyNode& b, int eb) {
+        pair<double, double> gp;
+        if (proxyContactPoint(a.rect, ea, b.rect, eb, gp)) return gp;
+        auto pa = edgeCenterPoint(a.rect, ea);
+        auto pb = edgeCenterPoint(b.rect, eb);
+        return { 0.5 * (pa.first + pb.first), 0.5 * (pa.second + pb.second) };
+    }
+
+    static bool proxyNodeAllowedIntermediate(const Design& tmp, const ProxyNode& node) {
+        if (!node.isBlock) return true;
+        if (node.index < 0 || node.index >= static_cast<int>(tmp.blocks.size())) return false;
+        return tmp.blocks[node.index].spec.type == BlockType::SOFT;
+    }
+
+    static double proxyCapLR(const Channel& ch) {
+        return max(1.0, ch.rect.h * ROUTE_DENSITY);
+    }
+
+    static double proxyCapTB(const Channel& ch) {
+        return max(1.0, ch.rect.w * ROUTE_DENSITY);
+    }
+
+    static double proxyFTRequiredArea(const BlockInst& b, double ftNets) {
+        const double baseArea = max(1.0, b.spec.area);
+        double aspect = b.rect.h > EPS ? b.rect.w / b.rect.h : 1.0;
+        if (b.spec.aspectMin > EPS) aspect = max(aspect, b.spec.aspectMin);
+        if (b.spec.aspectMax > EPS) aspect = min(aspect, b.spec.aspectMax);
+        if (!std::isfinite(aspect) || aspect <= EPS) aspect = 1.0;
+
+        const double coreW = sqrt(baseArea * aspect);
+        const double coreH = baseArea / max(1.0, coreW);
+        double d = 0.0;
+        if (b.spec.type == BlockType::SOFT && ftNets > EPS) {
+            double rate = b.spec.ftRate[3];
+            if (ftNets <= 3000.0) rate = b.spec.ftRate[0];
+            else if (ftNets <= 6000.0) rate = b.spec.ftRate[1];
+            else if (ftNets <= 9000.0) rate = b.spec.ftRate[2];
+            d = ceil((ftNets / ROUTE_DENSITY) * rate) / 2.0;
+        }
+        return max(baseArea, (coreW + d) * (coreH + d));
+    }
+
+    static double proxyIncrementalFTCost(const BlockInst& b, double oldFt, double addFt) {
+        if (b.spec.type != BlockType::SOFT || addFt <= EPS) return INF;
+        const double curArea = max(1.0, b.rect.w * b.rect.h);
+        const double oldReq = proxyFTRequiredArea(b, oldFt);
+        const double newReq = proxyFTRequiredArea(b, oldFt + addFt);
+        const double incArea = max(0.0, newReq - oldReq);
+        const double oldOv = max(0.0, oldReq - curArea);
+        const double newOv = max(0.0, newReq - curArea);
+        return 8.0 * incArea + 220.0 * max(0.0, newOv - oldOv) + 0.35 * addFt;
+    }
+
+    static vector<ProxyNode> buildProxyNodes(const Design& tmp) {
+        vector<ProxyNode> nodes;
+        nodes.reserve(tmp.blocks.size() + tmp.channels.size());
+        for (int i = 0; i < static_cast<int>(tmp.blocks.size()); ++i) {
+            nodes.push_back({ tmp.blocks[i].spec.name, tmp.blocks[i].rect, true, i });
+        }
+        for (int i = 0; i < static_cast<int>(tmp.channels.size()); ++i) {
+            nodes.push_back({ tmp.channels[i].name, tmp.channels[i].rect, false, i });
+        }
+        return nodes;
+    }
+
+    static vector<vector<ProxyAdj>> buildProxyGraph(const vector<ProxyNode>& nodes) {
+        const int n = static_cast<int>(nodes.size());
+        vector<vector<ProxyAdj>> g(n);
+        for (int i = 0; i < n; ++i) {
+            for (int j = i + 1; j < n; ++j) {
+                int ei = 0, ej = 0;
+                if (!proxyTouchWithEdges(nodes[i].rect, nodes[j].rect, ei, ej)) continue;
+                const double base = manhattan(rectCx(nodes[i].rect), rectCy(nodes[i].rect),
+                    rectCx(nodes[j].rect), rectCy(nodes[j].rect));
+                g[i].push_back({ j, ei, ej, base });
+                g[j].push_back({ i, ej, ei, base });
+            }
+        }
+        return g;
+    }
+
+    static double proxyChannelComponentCost(double used, double cap, double delta) {
+        if (delta <= EPS) return 0.0;
+        cap = max(1.0, cap);
+        const double before = used / cap;
+        const double after = (used + delta) / cap;
+        const double softRisk = max(0.0, after - 0.72);
+        const double hardRisk = max(0.0, after - 0.96);
+        const double overflow = max(0.0, used + delta - cap);
+        return 0.18 * delta + 900.0 * delta * softRisk * softRisk +
+            9000.0 * delta * hardRisk * hardRisk + 3500.0 * overflow * overflow / cap;
+    }
+
+    static ProxyPath routeProxyConnection(
+        const Design& tmp,
+        const vector<ProxyNode>& nodes,
+        const vector<vector<ProxyAdj>>& g,
+        const Connection& conn,
+        const vector<ProxyDirUse>& channelUse,
+        const vector<double>& softFT
+    ) {
+        ProxyPath result;
+        if (conn.src < 0 || conn.dst < 0 ||
+            conn.src >= static_cast<int>(tmp.blocks.size()) ||
+            conn.dst >= static_cast<int>(tmp.blocks.size()) ||
+            conn.src >= static_cast<int>(nodes.size()) ||
+            conn.dst >= static_cast<int>(nodes.size()) ||
+            conn.netCount <= 0) {
+            return result;
+        }
+
+        const int nodeCount = static_cast<int>(nodes.size());
+        const int edgeStates = 5;
+        const int stateCount = nodeCount * edgeStates;
+        auto sid = [&](int node, int inEdge) { return node * edgeStates + inEdge; };
+        auto sNode = [&](int st) { return st / edgeStates; };
+        auto sEdge = [&](int st) { return st % edgeStates; };
+
+        vector<double> dist(stateCount, INF);
+        vector<int> parent(stateCount, -1);
+        vector<int> transOut(stateCount, 0);
+        vector<int> transIn(stateCount, 0);
+
+        using QItem = pair<double, int>;
+        priority_queue<QItem, vector<QItem>, greater<QItem>> pq;
+        const int start = sid(conn.src, 0);
+        dist[start] = 0.0;
+        pq.push({ 0.0, start });
+
+        int bestDst = -1;
+        while (!pq.empty()) {
+            const auto item = pq.top();
+            pq.pop();
+            const double queued = item.first;
+            const int st = item.second;
+            if (queued > dist[st] + 1.0e-9) continue;
+
+            const int u = sNode(st);
+            const int uIn = sEdge(st);
+            if (u == conn.dst) {
+                bestDst = st;
+                break;
+            }
+
+            for (const ProxyAdj& e : g[u]) {
+                const int v = e.to;
+                const bool vEndpoint = (v == conn.src || v == conn.dst);
+                if (!vEndpoint && !proxyNodeAllowedIntermediate(tmp, nodes[v])) continue;
+                if (u == conn.src && !proxyAllowsPortEdge(tmp.blocks[conn.src].spec, e.edgeFrom)) continue;
+                if (v == conn.dst && !proxyAllowsPortEdge(tmp.blocks[conn.dst].spec, e.edgeTo)) continue;
+
+                double resourceCost = 0.0;
+                double internalWire = 0.0;
+                if (u != conn.src && u != conn.dst) {
+                    if (!validProxyEdge(uIn) || uIn == e.edgeFrom) continue;
+                    const auto p = edgeCenterPoint(nodes[u].rect, uIn);
+                    const auto q = edgeCenterPoint(nodes[u].rect, e.edgeFrom);
+                    internalWire = manhattan(p.first, p.second, q.first, q.second);
+
+                    if (!nodes[u].isBlock) {
+                        const int ci = nodes[u].index;
+                        if (ci < 0 || ci >= static_cast<int>(tmp.channels.size()) ||
+                            ci >= static_cast<int>(channelUse.size())) continue;
+                        const Channel& ch = tmp.channels[ci];
+                        const ProxyDirUse d = proxyDeltaForTraversal(uIn, e.edgeFrom, static_cast<double>(conn.netCount));
+                        resourceCost += proxyChannelComponentCost(channelUse[ci].lr, proxyCapLR(ch), d.lr);
+                        resourceCost += proxyChannelComponentCost(channelUse[ci].tb, proxyCapTB(ch), d.tb);
+                    }
+                    else {
+                        const int bi = nodes[u].index;
+                        if (bi < 0 || bi >= static_cast<int>(tmp.blocks.size()) ||
+                            bi >= static_cast<int>(softFT.size()) ||
+                            tmp.blocks[bi].spec.type != BlockType::SOFT) continue;
+                        resourceCost += proxyIncrementalFTCost(tmp.blocks[bi], softFT[bi], static_cast<double>(conn.netCount));
+                        if (!std::isfinite(resourceCost)) continue;
+                    }
+                }
+
+                const double contactCost = 0.012 * e.baseCost * static_cast<double>(conn.netCount);
+                const double wireCost = 0.20 * internalWire * static_cast<double>(conn.netCount) + contactCost;
+                const int next = sid(v, e.edgeTo);
+                const double nd = dist[st] + wireCost + resourceCost;
+                if (nd + 1.0e-9 < dist[next]) {
+                    dist[next] = nd;
+                    parent[next] = st;
+                    transOut[next] = e.edgeFrom;
+                    transIn[next] = e.edgeTo;
+                    pq.push({ nd, next });
+                }
+            }
+        }
+
+        if (bestDst < 0) return result;
+        vector<int> states;
+        for (int st = bestDst; st >= 0; st = parent[st]) states.push_back(st);
+        reverse(states.begin(), states.end());
+
+        vector<pair<double, double>> contacts;
+        for (int k = 1; k < static_cast<int>(states.size()); ++k) {
+            const int prev = states[k - 1];
+            const int cur = states[k];
+            const int u = sNode(prev);
+            const int v = sNode(cur);
+            contacts.push_back(proxyContactOrEdgePoint(nodes[u], transOut[cur], nodes[v], transIn[cur]));
+        }
+
+        double wlOne = 0.0;
+        for (int k = 0; k + 1 < static_cast<int>(contacts.size()); ++k) {
+            wlOne += manhattan(contacts[k].first, contacts[k].second, contacts[k + 1].first, contacts[k + 1].second);
+        }
+
+        result.open = false;
+        result.guideWL = wlOne * static_cast<double>(conn.netCount);
+        result.states = std::move(states);
+        result.transOut = std::move(transOut);
+        result.contacts = std::move(contacts);
+        return result;
+    }
+
+    static void commitProxyPathUse(
+        const Design& tmp,
+        const vector<ProxyNode>& nodes,
+        const Connection& conn,
+        const ProxyPath& path,
+        vector<ProxyDirUse>& channelUse,
+        vector<double>& softFT
+    ) {
+        if (path.open || path.states.size() < 3) return;
+        const int edgeStates = 5;
+        auto sNode = [&](int st) { return st / edgeStates; };
+        auto sEdge = [&](int st) { return st % edgeStates; };
+        const double nets = static_cast<double>(conn.netCount);
+        for (int k = 1; k + 1 < static_cast<int>(path.states.size()); ++k) {
+            const int cur = path.states[k];
+            const int next = path.states[k + 1];
+            const int u = sNode(cur);
+            if (u < 0 || u >= static_cast<int>(nodes.size())) continue;
+            if (u == conn.src || u == conn.dst) continue;
+            if (!nodes[u].isBlock) {
+                const int ci = nodes[u].index;
+                if (ci < 0 || ci >= static_cast<int>(channelUse.size())) continue;
+                const ProxyDirUse d = proxyDeltaForTraversal(sEdge(cur), path.transOut[next], nets);
+                channelUse[ci].lr += d.lr;
+                channelUse[ci].tb += d.tb;
+            }
+            else {
+                const int bi = nodes[u].index;
+                if (bi >= 0 && bi < static_cast<int>(softFT.size()) &&
+                    bi < static_cast<int>(tmp.blocks.size()) &&
+                    tmp.blocks[bi].spec.type == BlockType::SOFT) {
+                    softFT[bi] += nets;
+                }
+            }
+        }
+    }
+
+    static vector<Connection> collectProxyConnections(const Design& design) {
+        vector<Connection> conns;
+        if (!design.connections.empty()) {
+            for (const Connection& c : design.connections) {
+                if (c.netCount > 0) conns.push_back(c);
+            }
+        }
+        else {
+            const int n = static_cast<int>(design.connMatrix.size());
+            for (int i = 0; i < n; ++i) {
+                for (int j = i + 1; j < static_cast<int>(design.connMatrix[i].size()); ++j) {
+                    const int nets = totalConnBetween(design, i, j);
+                    if (nets > 0) conns.push_back({ i, j, nets });
+                }
+            }
+        }
+        sort(conns.begin(), conns.end(), [](const Connection& a, const Connection& b) {
+            if (a.netCount != b.netCount) return a.netCount > b.netCount;
+            if (a.src != b.src) return a.src < b.src;
+            return a.dst < b.dst;
+            });
+        return conns;
+    }
+
+    static RouteProxy estimateRouteProxy(const Design& design, const LayoutResult& layout) {
+        RouteProxy proxy;
+        if (!layout.legal || !layout.strictEdgeLegal || layout.rects.empty()) {
+            proxy.disconnectedPairs = 1000000;
+            proxy.channelRisk = INF * 0.25;
+            proxy.ftRisk = INF * 0.25;
+            proxy.guidePointWL = INF * 0.25;
+            return proxy;
+        }
+
+        Design tmp = makeTempDesignWithLayout(design, layout);
+        vector<ProxyNode> nodes = buildProxyNodes(tmp);
+        vector<vector<ProxyAdj>> graph = buildProxyGraph(nodes);
+        vector<ProxyDirUse> channelUse(tmp.channels.size());
+        vector<double> softFT(tmp.blocks.size(), 0.0);
+        vector<Connection> conns = collectProxyConnections(design);
+
+        for (const Connection& conn : conns) {
+            ProxyPath p = routeProxyConnection(tmp, nodes, graph, conn, channelUse, softFT);
+            if (p.open) {
+                ++proxy.disconnectedPairs;
+                double dx = 0.0, dy = 0.0;
+                proxy.guidePointWL += 4.0 * static_cast<double>(max(0, conn.netCount)) *
+                    max(1.0, bestPortAwareDelta(design, layout.rects, conn.src, conn.dst, dx, dy));
+                proxy.channelRisk += 5.0e8 + 5000.0 * static_cast<double>(max(0, conn.netCount));
+                continue;
+            }
+            ++proxy.routedPairs;
+            proxy.guidePointWL += p.guideWL;
+            commitProxyPathUse(tmp, nodes, conn, p, channelUse, softFT);
+        }
+
+        for (int ci = 0; ci < static_cast<int>(tmp.channels.size()) && ci < static_cast<int>(channelUse.size()); ++ci) {
+            const Channel& ch = tmp.channels[ci];
+            const double capLR = proxyCapLR(ch);
+            const double capTB = proxyCapTB(ch);
+            const double utilLR = channelUse[ci].lr / capLR;
+            const double utilTB = channelUse[ci].tb / capTB;
+            proxy.maxDirectionalUtil = max(proxy.maxDirectionalUtil, max(utilLR, utilTB));
+            auto addRisk = [&](double util, double cap) {
+                const double soft = max(0.0, util - 0.72);
+                const double target = max(0.0, util - 0.94);
+                const double hard = max(0.0, util - 1.00);
+                proxy.channelRisk += soft * soft * cap +
+                    12.0 * target * target * cap +
+                    90.0 * hard * hard * cap;
+                };
+            addRisk(utilLR, capLR);
+            addRisk(utilTB, capTB);
+        }
+
+        for (int bi = 0; bi < static_cast<int>(tmp.blocks.size()) && bi < static_cast<int>(softFT.size()); ++bi) {
+            const BlockInst& b = tmp.blocks[bi];
+            if (b.spec.type != BlockType::SOFT || softFT[bi] <= EPS) continue;
+            const double curArea = max(1.0, b.rect.w * b.rect.h);
+            const double reqArea = proxyFTRequiredArea(b, softFT[bi]);
+            const double overflow = max(0.0, reqArea - curArea);
+            proxy.ftRisk += overflow + 0.015 * softFT[bi] * max(0.0, reqArea / curArea - 1.0);
+        }
+        return proxy;
+    }
+
+    struct ForcePair {
+        int a = -1;
+        int b = -1;
+        int nets = 0;
+        bool hot = false;
+    };
+
+    static vector<ForcePair> collectForcePairs(const Design& design) {
+        const int n = static_cast<int>(design.blockSpecs.size());
+        vector<vector<int>> w(n, vector<int>(n, 0));
+        if (!design.connections.empty()) {
+            for (const auto& c : design.connections) {
+                if (c.src < 0 || c.dst < 0 || c.src >= n || c.dst >= n || c.src == c.dst) continue;
+                int a = min(c.src, c.dst);
+                int b = max(c.src, c.dst);
+                w[a][b] += max(0, c.netCount);
+            }
+        }
+        else {
+            for (int i = 0; i < n; ++i) {
+                for (int j = i + 1; j < n; ++j) w[i][j] = totalConnBetween(design, i, j);
+            }
+        }
+
+        vector<ForcePair> pairs;
+        for (int i = 0; i < n; ++i) {
+            for (int j = i + 1; j < n; ++j) {
+                if (w[i][j] > 0) pairs.push_back({ i, j, w[i][j], false });
+            }
+        }
+        sort(pairs.begin(), pairs.end(), [](const ForcePair& a, const ForcePair& b) {
+            if (a.nets != b.nets) return a.nets > b.nets;
+            if (a.a != b.a) return a.a < b.a;
+            return a.b < b.b;
+            });
+        const int hotCount = max(1, static_cast<int>(ceil(FORCE_HOT_PAIR_FRAC * static_cast<double>(pairs.size()))));
+        for (int i = 0; i < static_cast<int>(pairs.size()) && i < hotCount; ++i) pairs[i].hot = true;
+        return pairs;
+    }
+
+    static bool forceMovableSoft(const Design& design, int id) {
+        return id >= 0 && id < static_cast<int>(design.blockSpecs.size()) &&
+            design.blockSpecs[id].type == BlockType::SOFT;
+    }
+
+    struct SepConstraint {
+        int lo = -1;
+        int hi = -1;
+        bool xAxis = true;
+        double gap = PACK_GAP;
+    };
+
+    static vector<SepConstraint> buildSoftProjectionConstraints(const Design& design, const vector<Rect>& ref) {
+        vector<SepConstraint> out;
+        const int n = static_cast<int>(ref.size());
+        for (int i = 0; i < n; ++i) {
+            for (int j = i + 1; j < n; ++j) {
+                if (!forceMovableSoft(design, i) && !forceMovableSoft(design, j)) continue;
+
+                const Rect& a = ref[i];
+                const Rect& b = ref[j];
+                const bool iLeft = rectRight(a) <= b.x + EPS;
+                const bool jLeft = rectRight(b) <= a.x + EPS;
+                const bool iBelow = rectTop(a) <= b.y + EPS;
+                const bool jBelow = rectTop(b) <= a.y + EPS;
+                if (!iLeft && !jLeft && !iBelow && !jBelow) continue;
+
+                const int nets = totalConnBetween(design, i, j);
+                const double xGap = iLeft ? max(0.0, b.x - rectRight(a)) :
+                    (jLeft ? max(0.0, a.x - rectRight(b)) : INF);
+                const double yGap = iBelow ? max(0.0, b.y - rectTop(a)) :
+                    (jBelow ? max(0.0, a.y - rectTop(b)) : INF);
+                const bool useX = (iLeft || jLeft) && (!(iBelow || jBelow) || xGap <= yGap);
+
+                SepConstraint c;
+                c.xAxis = useX;
+                if (useX) {
+                    c.lo = iLeft ? i : j;
+                    c.hi = iLeft ? j : i;
+                    c.gap = nets > 0 ? requiredXGap(design, i, j) : PACK_GAP;
+                }
+                else {
+                    c.lo = iBelow ? i : j;
+                    c.hi = iBelow ? j : i;
+                    c.gap = nets > 0 ? requiredYGap(design, i, j) : PACK_GAP;
+                }
+                out.push_back(c);
+            }
+        }
+        return out;
+    }
+
+    static void clampSoftInsideOutline(const Design& design, vector<Rect>& r, double W, double H) {
+        for (int i = 0; i < static_cast<int>(r.size()); ++i) {
+            if (!forceMovableSoft(design, i)) continue;
+            r[i].x = clampD(r[i].x, 0.0, max(0.0, W - r[i].w));
+            r[i].y = clampD(r[i].y, 0.0, max(0.0, H - r[i].h));
+        }
+    }
+
+    static bool projectSoftByHcgVcg(
+        const Design& design,
+        const vector<Rect>& ref,
+        vector<Rect>& r,
+        double W,
+        double H
+    ) {
+        const vector<SepConstraint> constraints = buildSoftProjectionConstraints(design, ref);
+        if (constraints.empty()) return true;
+
+        clampSoftInsideOutline(design, r, W, H);
+        for (int iter = 0; iter < 96; ++iter) {
+            bool changed = false;
+            const bool xPassFirst = (iter % 2 == 0);
+            for (int pass = 0; pass < 2; ++pass) {
+                const bool xPass = (pass == 0) ? xPassFirst : !xPassFirst;
+                for (const SepConstraint& c : constraints) {
+                    if (c.xAxis != xPass) continue;
+                    if (c.lo < 0 || c.hi < 0 || c.lo >= static_cast<int>(r.size()) || c.hi >= static_cast<int>(r.size())) continue;
+                    const bool loMov = forceMovableSoft(design, c.lo);
+                    const bool hiMov = forceMovableSoft(design, c.hi);
+                    if (!loMov && !hiMov) continue;
+
+                    if (xPass) {
+                        const double need = rectRight(r[c.lo]) + c.gap;
+                        const double viol = need - r[c.hi].x;
+                        if (viol <= 1.0e-5) continue;
+                        if (loMov && hiMov) {
+                            r[c.lo].x -= 0.5 * viol;
+                            r[c.hi].x += 0.5 * viol;
+                        }
+                        else if (hiMov) r[c.hi].x += viol;
+                        else r[c.lo].x -= viol;
+                    }
+                    else {
+                        const double need = rectTop(r[c.lo]) + c.gap;
+                        const double viol = need - r[c.hi].y;
+                        if (viol <= 1.0e-5) continue;
+                        if (loMov && hiMov) {
+                            r[c.lo].y -= 0.5 * viol;
+                            r[c.hi].y += 0.5 * viol;
+                        }
+                        else if (hiMov) r[c.hi].y += viol;
+                        else r[c.lo].y -= viol;
+                    }
+                    changed = true;
+                    clampSoftInsideOutline(design, r, W, H);
+                }
+            }
+            if (!changed) break;
+        }
+
+        LayoutResult projected = scoreLayout(design, W, H, r);
+        return projected.legal && projected.strictEdgeLegal && projected.overlap <= EPS && projected.outlineViol <= EPS;
+    }
+
+    static bool refineLayoutWithHpwlForce(const Design& design, const LayoutResult& base, LayoutResult& out) {
+        if (!ENABLE_HPWL_FORCE_ARCHIVE_REFINEMENT ||
+            !base.legal || !base.strictEdgeLegal ||
+            base.overlap > EPS || base.outlineViol > EPS) return false;
+
+        vector<Rect> cur = base.rects;
+        const vector<Rect> ref = base.rects;
+        const vector<ForcePair> pairs = collectForcePairs(design);
+        if (pairs.empty()) return false;
+
+        vector<char> movable(cur.size(), 0);
+        int movableCount = 0;
+        for (int i = 0; i < static_cast<int>(cur.size()); ++i) {
+            movable[i] = forceMovableSoft(design, i) ? 1 : 0;
+            if (movable[i]) ++movableCount;
+        }
+        if (movableCount == 0) return false;
+
+        const double W = base.W;
+        const double H = base.H;
+        for (int iter = 0; iter < FORCE_REFINE_ITERS; ++iter) {
+            vector<double> fx(cur.size(), 0.0), fy(cur.size(), 0.0), fw(cur.size(), 0.0);
+
+            for (const ForcePair& p : pairs) {
+                double dx = 0.0, dy = 0.0;
+                const double dist = max(1.0, bestPortAwareDelta(design, cur, p.a, p.b, dx, dy));
+                const double ux = dx / dist;
+                const double uy = dy / dist;
+                const double w = FORCE_ATTR_WEIGHT * static_cast<double>(p.nets);
+                if (movable[p.a]) {
+                    fx[p.a] += w * ux;
+                    fy[p.a] += w * uy;
+                    fw[p.a] += w;
+                }
+                if (movable[p.b]) {
+                    fx[p.b] -= w * ux;
+                    fy[p.b] -= w * uy;
+                    fw[p.b] += w;
+                }
+
+                if (!p.hot) continue;
+                const Rect& a = cur[p.a];
+                const Rect& b = cur[p.b];
+                const double cxD = rectCx(b) - rectCx(a);
+                const double cyD = rectCy(b) - rectCy(a);
+                const bool horizontal = fabs(cxD) >= fabs(cyD);
+                if (horizontal) {
+                    const double reqGap = requiredXGap(design, p.a, p.b);
+                    const bool aLeft = rectCx(a) <= rectCx(b);
+                    const double gap = aLeft ? (b.x - rectRight(a)) : (a.x - rectRight(b));
+                    const double miss = max(0.0, reqGap - gap);
+                    if (miss > EPS) {
+                        const double dir = aLeft ? 1.0 : -1.0;
+                        const double push = FORCE_CHANNEL_WEIGHT * static_cast<double>(p.nets) * miss / max(1.0, reqGap);
+                        if (movable[p.a]) { fx[p.a] -= dir * push; fw[p.a] += push; }
+                        if (movable[p.b]) { fx[p.b] += dir * push; fw[p.b] += push; }
+                    }
+                    const double reqOv = requiredPortOverlap(design, p.a, p.b);
+                    const double yOv = ovLen(a.y, rectTop(a), b.y, rectTop(b));
+                    if (reqOv > EPS && yOv < reqOv) {
+                        const double dirY = (rectCy(b) >= rectCy(a)) ? 1.0 : -1.0;
+                        const double pull = FORCE_CHANNEL_WEIGHT * static_cast<double>(p.nets) * (reqOv - yOv) / reqOv;
+                        if (movable[p.a]) { fy[p.a] += dirY * pull; fw[p.a] += pull; }
+                        if (movable[p.b]) { fy[p.b] -= dirY * pull; fw[p.b] += pull; }
+                    }
+                }
+                else {
+                    const double reqGap = requiredYGap(design, p.a, p.b);
+                    const bool aBelow = rectCy(a) <= rectCy(b);
+                    const double gap = aBelow ? (b.y - rectTop(a)) : (a.y - rectTop(b));
+                    const double miss = max(0.0, reqGap - gap);
+                    if (miss > EPS) {
+                        const double dir = aBelow ? 1.0 : -1.0;
+                        const double push = FORCE_CHANNEL_WEIGHT * static_cast<double>(p.nets) * miss / max(1.0, reqGap);
+                        if (movable[p.a]) { fy[p.a] -= dir * push; fw[p.a] += push; }
+                        if (movable[p.b]) { fy[p.b] += dir * push; fw[p.b] += push; }
+                    }
+                    const double reqOv = requiredPortOverlap(design, p.a, p.b);
+                    const double xOv = ovLen(a.x, rectRight(a), b.x, rectRight(b));
+                    if (reqOv > EPS && xOv < reqOv) {
+                        const double dirX = (rectCx(b) >= rectCx(a)) ? 1.0 : -1.0;
+                        const double pull = FORCE_CHANNEL_WEIGHT * static_cast<double>(p.nets) * (reqOv - xOv) / reqOv;
+                        if (movable[p.a]) { fx[p.a] += dirX * pull; fw[p.a] += pull; }
+                        if (movable[p.b]) { fx[p.b] -= dirX * pull; fw[p.b] += pull; }
+                    }
+                }
+            }
+
+            const double nearGuard = max(4.0, 0.004 * min(W, H));
+            for (int i = 0; i < static_cast<int>(cur.size()); ++i) {
+                if (!movable[i]) continue;
+                for (int j = 0; j < static_cast<int>(cur.size()); ++j) {
+                    if (i == j) continue;
+                    const double xOv = ovLen(cur[i].x, rectRight(cur[i]), cur[j].x, rectRight(cur[j]));
+                    const double yOv = ovLen(cur[i].y, rectTop(cur[i]), cur[j].y, rectTop(cur[j]));
+                    const bool overlaps = xOv > EPS && yOv > EPS;
+                    const double xGap = max(0.0, max(cur[j].x - rectRight(cur[i]), cur[i].x - rectRight(cur[j])));
+                    const double yGap = max(0.0, max(cur[j].y - rectTop(cur[i]), cur[i].y - rectTop(cur[j])));
+                    const bool nearX = yOv > EPS && xGap < nearGuard;
+                    const bool nearY = xOv > EPS && yGap < nearGuard;
+                    if (!overlaps && !nearX && !nearY) continue;
+                    double dx = rectCx(cur[i]) - rectCx(cur[j]);
+                    double dy = rectCy(cur[i]) - rectCy(cur[j]);
+                    double len = hypot(dx, dy);
+                    if (len < 1.0e-6) {
+                        dx = (i < j) ? -1.0 : 1.0;
+                        dy = ((i + j) & 1) ? -0.5 : 0.5;
+                        len = hypot(dx, dy);
+                    }
+                    const double strength = FORCE_REPULSE_WEIGHT * (overlaps ? 2.0 : 0.65) *
+                        max(1.0, endpointDemand(design, i)) / max(1.0, maxEndpointDemand(design));
+                    fx[i] += strength * dx / len;
+                    fy[i] += strength * dy / len;
+                    fw[i] += strength;
+                }
+            }
+
+            const double t = static_cast<double>(iter) / max(1, FORCE_REFINE_ITERS - 1);
+            const double stepFrac = FORCE_REFINE_START_STEP * (1.0 - t) + FORCE_REFINE_END_STEP * t;
+            for (int i = 0; i < static_cast<int>(cur.size()); ++i) {
+                if (!movable[i] || fw[i] <= EPS) continue;
+                const double maxStep = max(1.0, stepFrac * min(cur[i].w, cur[i].h));
+                const double mx = clampD(fx[i] / fw[i] * maxStep, -maxStep, maxStep);
+                const double my = clampD(fy[i] / fw[i] * maxStep, -maxStep, maxStep);
+                cur[i].x += mx;
+                cur[i].y += my;
+            }
+            clampSoftInsideOutline(design, cur, W, H);
+            if (!projectSoftByHcgVcg(design, ref, cur, W, H)) return false;
+        }
+
+        LayoutResult refined = scoreLayout(design, W, H, std::move(cur));
+        if (!refined.legal || !refined.strictEdgeLegal) return false;
+        annotateStripProxy(design, refined);
+        out = std::move(refined);
+        return true;
+    }
+
+    static vector<LayoutResult> makeHpwlForceRefinedArchive(const Design& design, const vector<LayoutResult>& archive) {
+        vector<pair<double, LayoutResult>> ranked;
+        const int limit = min(FORCE_REFINE_SEED_LIMIT, static_cast<int>(archive.size()));
+        for (int i = 0; i < limit; ++i) {
+            const LayoutResult& base = archive[i];
+            LayoutResult refined;
+            if (!refineLayoutWithHpwlForce(design, base, refined)) continue;
+
+            const double basePA = max(1.0, portAwareHpwl(design, base.rects));
+            const double newPA = max(1.0, portAwareHpwl(design, refined.rects));
+            const RouteProxy baseProxy = estimateRouteProxy(design, base);
+            const RouteProxy refinedProxy = estimateRouteProxy(design, refined);
+
+            const bool areaOk = refined.area <= base.area * 1.060 + 1.0;
+            const bool noOpenRegression = refinedProxy.disconnectedPairs <= baseProxy.disconnectedPairs;
+            const double baseRisk = max(1.0, baseProxy.channelRisk + 0.35 * baseProxy.ftRisk);
+            const double refinedRisk = max(1.0, refinedProxy.channelRisk + 0.35 * refinedProxy.ftRisk);
+            const bool channelRiskOk =
+                refinedProxy.maxDirectionalUtil <= max(baseProxy.maxDirectionalUtil * 1.16 + 0.05, baseProxy.maxDirectionalUtil + 0.22) &&
+                refinedProxy.channelRisk <= max(baseProxy.channelRisk * 1.22 + 2500.0, baseProxy.channelRisk + 250000.0);
+            const bool ftRiskOk =
+                refinedProxy.ftRisk <= max(baseProxy.ftRisk * 1.30 + 500.0, baseProxy.ftRisk + 100000.0);
+            const bool stripSafe =
+                refined.stripPeakUtilProxy <= max(base.stripPeakUtilProxy * 1.08 + 0.05, base.stripPeakUtilProxy + 6000.0) &&
+                refined.stripOverflowProxy <= max(base.stripOverflowProxy * 1.08 + 5000.0, base.stripOverflowProxy + 12000000.0);
+            const bool wlBetter =
+                refinedProxy.guidePointWL <= baseProxy.guidePointWL * 0.995;
+            const bool riskBetter =
+                refinedRisk <= baseRisk * 0.90;
+            const bool areaBetter =
+                refined.area <= base.area * 0.995 &&
+                refinedProxy.guidePointWL <= baseProxy.guidePointWL * 1.020 &&
+                refinedRisk <= baseRisk * 1.08;
+            const bool accept = areaOk && noOpenRegression && channelRiskOk && ftRiskOk && stripSafe &&
+                (wlBetter || riskBetter || areaBetter);
+            string rejectReason = "accepted";
+            if (!accept) {
+                if (!areaOk) rejectReason = "areaWorse";
+                else if (!noOpenRegression) rejectReason = "openRegression";
+                else if (!stripSafe) rejectReason = "stripRiskWorse";
+                else if (!channelRiskOk) rejectReason = "channelRiskWorse";
+                else if (!ftRiskOk) rejectReason = "ftRiskWorse";
+                else rejectReason = "noParetoGain";
+            }
+
+            cerr << fixed << setprecision(3)
+                << "[HPWLForce] seed=" << i
+                << " pa=" << basePA << "->" << newPA
+                << " proxyWL=" << baseProxy.guidePointWL << "->" << refinedProxy.guidePointWL
+                << " maxUtil=" << baseProxy.maxDirectionalUtil << "->" << refinedProxy.maxDirectionalUtil
+                << " chRisk=" << baseProxy.channelRisk << "->" << refinedProxy.channelRisk
+                << " ftRisk=" << baseProxy.ftRisk << "->" << refinedProxy.ftRisk
+                << " openProxy=" << baseProxy.disconnectedPairs << "->" << refinedProxy.disconnectedPairs
+                << " area=" << base.area << "->" << refined.area
+                << " stripPeak=" << base.stripPeakUtilProxy << "->" << refined.stripPeakUtilProxy
+                << " stripOv=" << base.stripOverflowProxy << "->" << refined.stripOverflowProxy
+                << " accept=" << (accept ? "Y" : "N")
+                << " rejectReason=" << rejectReason
+                << "\n";
+
+            if (!accept) continue;
+            const double proxyWLRatio = refinedProxy.guidePointWL / max(1.0, baseProxy.guidePointWL);
+            const double areaRatio = refined.area / max(1.0, base.area);
+            const double riskRatio = refinedRisk / baseRisk;
+            const double paRatio = newPA / basePA;
+            const double openPenalty = 1000.0 * static_cast<double>(refinedProxy.disconnectedPairs);
+            const double score = openPenalty +
+                0.64 * proxyWLRatio +
+                0.18 * riskRatio +
+                0.12 * areaRatio +
+                0.06 * paRatio;
+            ranked.push_back({ score, std::move(refined) });
+        }
+
+        sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) {
+            if (fabs(a.first - b.first) > 1.0e-9) return a.first < b.first;
+            return a.second.area < b.second.area;
+            });
+        vector<LayoutResult> out;
+        for (auto& item : ranked) {
+            if (static_cast<int>(out.size()) >= FORCE_REFINE_KEEP_LIMIT) break;
+            bool dup = false;
+            for (const auto& old : out) {
+                if (fabs(old.area - item.second.area) <= max(1.0, 0.0005 * min(old.area, item.second.area)) &&
+                    fabs(old.hpwl - item.second.hpwl) <= max(1.0, 0.0005 * min(old.hpwl, item.second.hpwl))) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) out.push_back(std::move(item.second));
+        }
+        return out;
     }
 
     static double minWidthBound(const Design& design, const ShapeState& st) {
@@ -2123,17 +3265,21 @@ namespace {
         return out.legal && out.strictEdgeLegal && out.overlap <= EPS && out.outlineViol <= EPS;
     }
 
+    static double bstarAreaCost(const LayoutResult& r) {
+        return r.area
+            + BSTAR_HPWL_COST_WEIGHT * r.hpwl
+            + BSTAR_ROUTE_COST_WEIGHT * r.routePenalty;
+    }
+
     static bool bstarAreaBetter(const LayoutResult& a, const LayoutResult& b) {
         if (a.legal != b.legal) return a.legal;
         if (a.strictEdgeLegal != b.strictEdgeLegal) return a.strictEdgeLegal;
-        if (fabs(a.area - b.area) > max(1.0, 1.0e-6 * min(a.area, b.area))) return a.area < b.area;
-        // Tie-break only after equal area.  This does not enter SA acceptance.
+        const double ac = bstarAreaCost(a);
+        const double bc = bstarAreaCost(b);
+        if (fabs(ac - bc) > max(1.0, 1.0e-6 * min(ac, bc))) return ac < bc;
         if (fabs(a.routePenalty - b.routePenalty) > 1.0) return a.routePenalty < b.routePenalty;
+        if (fabs(a.area - b.area) > max(1.0, 1.0e-6 * min(a.area, b.area))) return a.area < b.area;
         return a.hpwl < b.hpwl;
-    }
-
-    static double bstarAreaCost(const LayoutResult& r) {
-        return r.area;
     }
 
     static bool makeInitialBStarLegalState(const Design& design, BStarState& bestState, LayoutResult& bestLayout) {
@@ -2366,7 +3512,7 @@ namespace {
         return max(1.0, avg / max(1e-9, log(1.0 / BSTAR_SA_INIT_ACCEPT_P)));
     }
 
-    static LayoutResult runBStarAreaSA(const Design& design, int& triedOut, int& packedOut, int& legalOut) {
+    static LayoutResult runBStarAreaSA(const Design& design, int& triedOut, int& packedOut, int& legalOut, vector<LayoutResult>* archiveOut = nullptr) {
         triedOut = packedOut = legalOut = 0;
         LayoutResult empty;
         BStarState curState;
@@ -2380,6 +3526,8 @@ namespace {
 
         BStarState bestState = curState;
         LayoutResult bestLayout = curLayout;
+        vector<LayoutResult> archive;
+        addToBStarArchive(design, archive, curLayout);
         mt19937 rng(FAST_SEED ^ 0xB57A5A11u ^ static_cast<unsigned>(design.blockSpecs.size() * 131u));
         double T = estimateBStarInitialTemp(design, curState, curLayout, rng);
         const int m = static_cast<int>(curState.node.size());
@@ -2412,6 +3560,10 @@ namespace {
                 ++packedOut;
                 ++roundPacked;
                 if (cand.legal && cand.strictEdgeLegal) ++legalOut;
+                if (cand.legal && cand.strictEdgeLegal &&
+                    (static_cast<int>(archive.size()) < BSTAR_ARCHIVE_LIMIT || (triedOut % BSTAR_ARCHIVE_SAMPLE_PERIOD) == 0)) {
+                    addToBStarArchive(design, archive, cand);
+                }
                 double candCost = bstarAreaCost(cand);
                 double d = candCost - curCost;
                 bool accept = false;
@@ -2430,6 +3582,7 @@ namespace {
                     if (curLayout.legal && curLayout.strictEdgeLegal && bstarAreaBetter(curLayout, bestLayout)) {
                         bestLayout = curLayout;
                         bestState = curState;
+                        addToBStarArchive(design, archive, curLayout);
                         ++bestUpdates;
                     }
                 }
@@ -2462,6 +3615,11 @@ namespace {
             }
         }
 
+        if (!archive.empty()) {
+            bestLayout = archive.front();
+        }
+        if (archiveOut) *archiveOut = archive;
+
         if (FAST_VERBOSE_LOG) {
             cerr << fixed << setprecision(3)
                 << "[BStarSA/Selected] startArea=" << startArea
@@ -2480,11 +3638,659 @@ namespace {
                 << " accepted=" << accepted
                 << " uphill=" << uphill
                 << " rejected=" << rejected
+                << " archive=" << archive.size()
+                << " stripPeak=" << bestLayout.stripPeakUtilProxy
+                << " stripOvProxy=" << bestLayout.stripOverflowProxy
+                << " stripHot=" << bestLayout.stripHotComponents
                 << " cost=outlineAreaOnly"
                 << "\n";
         }
         (void)bestState;
         return bestLayout;
+    }
+
+    static double compactColumnOrderScore(const Design& design, int id, const Rect& sh, int mode) {
+        const double area = max(1.0, sh.w * sh.h);
+        const double demand = endpointDemand(design, id);
+        if (mode == 0) return sh.h;
+        if (mode == 1) return -sh.h;
+        if (mode == 2) return area;
+        if (mode == 3) return -area;
+        if (mode == 4) return demand;
+        if (mode == 5) return -demand;
+        return static_cast<double>(id);
+    }
+
+    static bool compactColumnPlaceOne(
+        const Design& design,
+        const vector<Rect>& shapes,
+        int id,
+        const vector<double>& xCands,
+        double W,
+        double H,
+        vector<Rect>& rects,
+        vector<Rect>& placed,
+        vector<int>& placedIds
+    ) {
+        if (id < 0 || id >= static_cast<int>(shapes.size())) return false;
+        const Rect& sh = shapes[id];
+        if (sh.w > W + EPS || sh.h > H + EPS) return false;
+
+        bool found = false;
+        Rect best = sh;
+        PlaceKey bestKey;
+        vector<double> expandedX = xCands;
+        for (int pi = 0; pi < static_cast<int>(placed.size()); ++pi) {
+            const Rect& o = placed[pi];
+            int oid = (pi < static_cast<int>(placedIds.size())) ? placedIds[pi] : -1;
+            const double gx = (oid >= 0) ? requiredXGap(design, oid, id) : PACK_GAP;
+            addCoord(expandedX, rectRight(o) + gx, 0.0, max(0.0, W - sh.w));
+            addCoord(expandedX, o.x - sh.w - gx, 0.0, max(0.0, W - sh.w));
+            addCoord(expandedX, o.x, 0.0, max(0.0, W - sh.w));
+            addCoord(expandedX, rectRight(o) - sh.w, 0.0, max(0.0, W - sh.w));
+        }
+        sort(expandedX.begin(), expandedX.end());
+        expandedX.erase(unique(expandedX.begin(), expandedX.end(), [](double a, double b) { return fabs(a - b) < 1.0e-5; }), expandedX.end());
+        pruneCoords(expandedX, 18);
+
+        for (double rawX : expandedX) {
+            const double x = clampD(rawX, 0.0, max(0.0, W - sh.w));
+            vector<double> ys;
+            ys.reserve(2 * placed.size() + 4);
+            addCoord(ys, 0.0, 0.0, max(0.0, H - sh.h));
+            addCoord(ys, H - sh.h, 0.0, max(0.0, H - sh.h));
+            for (int pi = 0; pi < static_cast<int>(placed.size()); ++pi) {
+                const Rect& o = placed[pi];
+                int oid = (pi < static_cast<int>(placedIds.size())) ? placedIds[pi] : -1;
+                if (ovLen(x, x + sh.w, o.x, rectRight(o)) <= EPS) continue;
+                const double gy = (oid >= 0) ? requiredYGap(design, oid, id) : PACK_GAP;
+                addCoord(ys, rectTop(o) + gy, 0.0, max(0.0, H - sh.h));
+                addCoord(ys, o.y - sh.h - gy, 0.0, max(0.0, H - sh.h));
+            }
+            sort(ys.begin(), ys.end());
+            ys.erase(unique(ys.begin(), ys.end(), [](double a, double b) { return fabs(a - b) < 1.0e-5; }), ys.end());
+
+            for (double y : ys) {
+                Rect cand = sh;
+                cand.x = x;
+                cand.y = y;
+                if (!inside(cand, W, H)) continue;
+                if (anyOverlapWith(cand, placed)) continue;
+                PlaceKey key;
+                key.top = rectTop(cand);
+                key.route = routeGapPenaltyForCandidate(design, placed, placedIds, id, cand);
+                key.right = rectRight(cand);
+                key.y = cand.y;
+                vector<char> placedMask(rects.size(), 0);
+                for (int pid : placedIds) if (pid >= 0 && pid < static_cast<int>(placedMask.size())) placedMask[pid] = 1;
+                key.wire = partialWire(design, rects, placedMask, id, cand);
+                key.center = fabs(rectCx(cand) - 0.5 * W) + fabs(rectCy(cand) - 0.5 * H);
+                key.x = cand.x;
+                fillPlacementPressure(key, placed, cand, W, H);
+                if (!found || betterKey(key, bestKey)) {
+                    found = true;
+                    bestKey = key;
+                    best = cand;
+                }
+            }
+        }
+        if (!found) return false;
+        rects[id] = best;
+        placed.push_back(best);
+        placedIds.push_back(id);
+        return true;
+    }
+
+    static bool tryCompactColumnLayout(
+        const Design& design,
+        const ShapeState& st,
+        const vector<int>& movables,
+        const vector<int>& assignment,
+        int colCount,
+        int sortMode,
+        int alignMode,
+        double gap,
+        double wFactor,
+        double hFactor,
+        LayoutResult& out
+    ) {
+        if (colCount <= 0 || assignment.size() != movables.size()) return false;
+        vector<Rect> shapes = makeShapes(design, st);
+        vector<vector<int>> cols(colCount);
+        for (int k = 0; k < static_cast<int>(movables.size()); ++k) {
+            int col = assignment[k];
+            if (col < 0 || col >= colCount) return false;
+            cols[col].push_back(movables[k]);
+        }
+        for (const auto& col : cols) if (col.empty()) return false;
+
+        for (auto& col : cols) {
+            stable_sort(col.begin(), col.end(), [&](int a, int b) {
+                const double sa = compactColumnOrderScore(design, a, shapes[a], sortMode);
+                const double sb = compactColumnOrderScore(design, b, shapes[b], sortMode);
+                if (fabs(sa - sb) > 1.0e-6) return sa < sb;
+                return a < b;
+                });
+        }
+
+        vector<double> colW(colCount, 0.0), colH(colCount, 0.0);
+        for (int c = 0; c < colCount; ++c) {
+            for (int id : cols[c]) {
+                colW[c] = max(colW[c], shapes[id].w);
+                if (colH[c] > EPS) colH[c] += gap;
+                colH[c] += shapes[id].h;
+            }
+        }
+
+        double W = gap * max(0, colCount - 1);
+        for (double w : colW) W += w;
+        W = max(W * wFactor, minWidthBound(design, st));
+        if (W > design.maxOutlineW + EPS) return false;
+
+        double H = minHeightBound(design, st);
+        for (double h : colH) H = max(H, h);
+        H = max(H, totalPackingArea(design) / max(1.0, W));
+        H *= hFactor;
+        H = clampD(H, minHeightBound(design, st), design.maxOutlineH);
+        if (H > design.maxOutlineH + EPS) return false;
+
+        vector<Rect> rects, placed;
+        if (!placeEdgesFast(design, shapes, W, H, rects, placed, true)) return false;
+        vector<int> placedIds;
+        placedIds.reserve(placed.size() + movables.size());
+        vector<int> edgeIds;
+        for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) {
+            if (design.blockSpecs[i].type == BlockType::EDGE) edgeIds.push_back(i);
+        }
+        sort(edgeIds.begin(), edgeIds.end(), [&](int a, int b) {
+            double aa = shapes[a].w * shapes[a].h;
+            double bb = shapes[b].w * shapes[b].h;
+            if (fabs(aa - bb) > 1.0e-6) return aa > bb;
+            return a < b;
+            });
+        for (int id : edgeIds) placedIds.push_back(id);
+
+        vector<double> colX(colCount, 0.0);
+        double x = 0.0;
+        for (int c = 0; c < colCount; ++c) {
+            colX[c] = x;
+            x += colW[c] + gap;
+        }
+
+        for (int c = 0; c < colCount; ++c) {
+            for (int id : cols[c]) {
+                vector<double> xCands;
+                const double slack = max(0.0, colW[c] - shapes[id].w);
+                if (alignMode == 0 || alignMode == 3) xCands.push_back(colX[c]);
+                if (alignMode == 1 || alignMode == 3) xCands.push_back(colX[c] + 0.5 * slack);
+                if (alignMode == 2 || alignMode == 3) xCands.push_back(colX[c] + slack);
+                if (xCands.empty()) xCands.push_back(colX[c]);
+                if (!compactColumnPlaceOne(design, shapes, id, xCands, W, H, rects, placed, placedIds)) return false;
+            }
+        }
+
+        out = scoreLayout(design, W, H, std::move(rects));
+        return out.legal && out.strictEdgeLegal && out.overlap <= EPS && out.outlineViol <= EPS;
+    }
+
+    static int strongestUnplacedNeighbor(
+        const Design& design,
+        int id,
+        const vector<char>& used,
+        int avoid = -1
+    ) {
+        int best = -1;
+        int bestConn = 0;
+        double bestDemand = -1.0;
+        for (int j = 0; j < static_cast<int>(design.blockSpecs.size()); ++j) {
+            if (j == id || j == avoid || used[j]) continue;
+            if (!isMovableBlock(design.blockSpecs[j])) continue;
+            const int nets = totalConnBetween(design, id, j);
+            if (nets <= 0) continue;
+            const double dem = endpointDemand(design, j);
+            if (nets > bestConn || (nets == bestConn && dem > bestDemand)) {
+                best = j;
+                bestConn = nets;
+                bestDemand = dem;
+            }
+        }
+        return best;
+    }
+
+    static void pushFanoutColumn(vector<vector<int>>& cols, vector<char>& used, int col, int id) {
+        if (id < 0 || id >= static_cast<int>(used.size()) || used[id]) return;
+        col = max(0, min(col, static_cast<int>(cols.size()) - 1));
+        cols[col].push_back(id);
+        used[id] = 1;
+    }
+
+    static vector<int> hubNeighborsByStrength(const Design& design, int hub) {
+        vector<pair<int, int>> items;
+        for (int j = 0; j < static_cast<int>(design.blockSpecs.size()); ++j) {
+            if (j == hub || !isMovableBlock(design.blockSpecs[j])) continue;
+            const int nets = totalConnBetween(design, hub, j);
+            if (nets > 0) items.push_back({ -nets, j });
+        }
+        sort(items.begin(), items.end());
+        vector<int> out;
+        for (const auto& it : items) out.push_back(it.second);
+        return out;
+    }
+
+    static int mainEdgeHub(const Design& design) {
+        int best = -1;
+        int bestEdgeConn = 0;
+        double bestDemand = -1.0;
+        for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) {
+            if (!isMovableBlock(design.blockSpecs[i])) continue;
+            int edgeConn = 0;
+            for (int e = 0; e < static_cast<int>(design.blockSpecs.size()); ++e) {
+                if (design.blockSpecs[e].type == BlockType::EDGE) edgeConn += totalConnBetween(design, i, e);
+            }
+            const double dem = endpointDemand(design, i);
+            if (edgeConn > bestEdgeConn || (edgeConn == bestEdgeConn && dem > bestDemand)) {
+                best = i;
+                bestEdgeConn = edgeConn;
+                bestDemand = dem;
+            }
+        }
+        if (best >= 0 && bestEdgeConn > 0) return best;
+
+        for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) {
+            if (!isMovableBlock(design.blockSpecs[i])) continue;
+            const double dem = endpointDemand(design, i);
+            if (dem > bestDemand) {
+                best = i;
+                bestDemand = dem;
+            }
+        }
+        return best;
+    }
+
+    static vector<vector<int>> makeGraphFanoutColumns(const Design& design) {
+        const int n = static_cast<int>(design.blockSpecs.size());
+        vector<vector<int>> cols(4);
+        vector<char> used(n, 0);
+        const int hub = mainEdgeHub(design);
+        if (hub < 0) return {};
+
+        vector<int> hNbr = hubNeighborsByStrength(design, hub);
+        int mainBranch = hNbr.empty() ? -1 : hNbr[0];
+        int upperBranch = (hNbr.size() > 1) ? hNbr[1] : -1;
+        int midBranch = (hNbr.size() > 2) ? hNbr[2] : -1;
+        int lowerBranch = (hNbr.size() > 3) ? hNbr[3] : -1;
+
+        if (mainBranch >= 0) used[mainBranch] = 1; // reserved until its children are chosen.
+        int mainTop = (mainBranch >= 0) ? strongestUnplacedNeighbor(design, mainBranch, used, hub) : -1;
+        if (mainTop >= 0) used[mainTop] = 1;
+        int mainTop2 = (mainTop >= 0) ? strongestUnplacedNeighbor(design, mainTop, used, mainBranch) : -1;
+        if (mainTop2 >= 0) used[mainTop2] = 1;
+        int mainBottom = (mainBranch >= 0) ? strongestUnplacedNeighbor(design, mainBranch, used, hub) : -1;
+        if (mainBottom >= 0) used[mainBottom] = 1;
+        int mainTopSide = (mainTop >= 0) ? strongestUnplacedNeighbor(design, mainTop, used, mainBranch) : -1;
+        if (mainTopSide >= 0) used[mainTopSide] = 1;
+        int mainTop2Child = (mainTop2 >= 0) ? strongestUnplacedNeighbor(design, mainTop2, used, mainTop) : -1;
+        if (mainTop2Child >= 0) used[mainTop2Child] = 1;
+
+        used.assign(n, 0);
+        pushFanoutColumn(cols, used, 0, mainTopSide);
+        pushFanoutColumn(cols, used, 0, mainTop);
+
+        pushFanoutColumn(cols, used, 1, mainBottom);
+        pushFanoutColumn(cols, used, 1, mainBranch);
+        pushFanoutColumn(cols, used, 1, hub);
+        pushFanoutColumn(cols, used, 1, mainTop2);
+
+        pushFanoutColumn(cols, used, 2, lowerBranch);
+        pushFanoutColumn(cols, used, 2, mainTop2Child);
+        pushFanoutColumn(cols, used, 2, midBranch);
+        pushFanoutColumn(cols, used, 2, upperBranch);
+
+        int upperChild = (upperBranch >= 0) ? strongestUnplacedNeighbor(design, upperBranch, used, hub) : -1;
+        pushFanoutColumn(cols, used, 2, upperChild);
+        int midChild = (midBranch >= 0) ? strongestUnplacedNeighbor(design, midBranch, used, hub) : -1;
+        pushFanoutColumn(cols, used, 3, midChild);
+
+        vector<int> leftovers;
+        for (int i = 0; i < n; ++i) {
+            if (!isMovableBlock(design.blockSpecs[i]) || used[i]) continue;
+            leftovers.push_back(i);
+        }
+        sort(leftovers.begin(), leftovers.end(), [&](int a, int b) {
+            const double da = endpointDemand(design, a);
+            const double db = endpointDemand(design, b);
+            if (fabs(da - db) > 1.0e-6) return da > db;
+            return a < b;
+            });
+        vector<double> colDemand(cols.size(), 0.0);
+        for (int c = 0; c < static_cast<int>(cols.size()); ++c) {
+            for (int id : cols[c]) colDemand[c] += endpointDemand(design, id);
+        }
+        for (int id : leftovers) {
+            int bestCol = 0;
+            double bestScore = INF;
+            for (int c = 0; c < static_cast<int>(cols.size()); ++c) {
+                double score = colDemand[c];
+                if (c == 3) score *= 0.82; // keep weak leaf nodes off the central spine.
+                if (score < bestScore) {
+                    bestScore = score;
+                    bestCol = c;
+                }
+            }
+            pushFanoutColumn(cols, used, bestCol, id);
+            colDemand[bestCol] += endpointDemand(design, id);
+        }
+
+        for (const auto& col : cols) if (col.empty()) return {};
+        return cols;
+    }
+
+    static bool tryGraphFanoutColumnLayout(
+        const Design& design,
+        const ShapeState& st,
+        const vector<vector<int>>& cols,
+        double W,
+        double H,
+        double anchorScale,
+        LayoutResult& out
+    ) {
+        if (cols.empty() || W > design.maxOutlineW + EPS || H > design.maxOutlineH + EPS) return false;
+        vector<Rect> shapes = makeShapes(design, st);
+        if (W < minWidthBound(design, st) - EPS || H < minHeightBound(design, st) - EPS) return false;
+
+        vector<Rect> rects, placed;
+        if (!placeEdgesFast(design, shapes, W, H, rects, placed, true)) return false;
+
+        vector<int> placedIds;
+        placedIds.reserve(placed.size() + design.blockSpecs.size());
+        vector<int> edgeIds;
+        for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) {
+            if (design.blockSpecs[i].type == BlockType::EDGE) edgeIds.push_back(i);
+        }
+        sort(edgeIds.begin(), edgeIds.end(), [&](int a, int b) {
+            double aa = shapes[a].w * shapes[a].h;
+            double bb = shapes[b].w * shapes[b].h;
+            if (fabs(aa - bb) > 1.0e-6) return aa > bb;
+            return a < b;
+            });
+        for (int id : edgeIds) placedIds.push_back(id);
+
+        double leftEdgeRight = 0.0;
+        for (int id : edgeIds) {
+            if (rects[id].x <= 0.18 * W) leftEdgeRight = max(leftEdgeRight, rectRight(rects[id]));
+        }
+        const double a1 = clampD(leftEdgeRight + PACK_GAP, 0.0, W);
+        vector<double> anchors = {
+            0.0,
+            a1,
+            clampD(anchorScale * 0.46 * W, 0.0, W),
+            clampD(anchorScale * 0.72 * W, 0.0, W)
+        };
+        while (anchors.size() < cols.size()) anchors.push_back(clampD(0.86 * W, 0.0, W));
+
+        for (int c = 0; c < static_cast<int>(cols.size()); ++c) {
+            for (int id : cols[c]) {
+                vector<double> xCands;
+                const double a = anchors[min(c, static_cast<int>(anchors.size()) - 1)];
+                xCands.push_back(a);
+                xCands.push_back(max(0.0, a - 36.0));
+                xCands.push_back(min(W, a + 36.0));
+                if (c == 0) xCands.push_back(0.0);
+                if (c == 1) xCands.push_back(a1);
+                if (c >= 2) xCands.push_back(clampD(a - 0.08 * W, 0.0, W));
+                if (!compactColumnPlaceOne(design, shapes, id, xCands, W, H, rects, placed, placedIds)) return false;
+            }
+        }
+
+        out = scoreLayout(design, W, H, std::move(rects));
+        return out.legal && out.strictEdgeLegal && out.overlap <= EPS && out.outlineViol <= EPS;
+    }
+
+    static vector<LayoutResult> makeGraphFanoutColumnArchive(const Design& design) {
+        vector<LayoutResult> archive;
+        const int n = static_cast<int>(design.blockSpecs.size());
+        int edgeCount = 0;
+        for (const auto& sp : design.blockSpecs) if (sp.type == BlockType::EDGE) ++edgeCount;
+        if (edgeCount <= 0 || n < 10 || n > 18) return archive;
+
+        vector<vector<int>> cols = makeGraphFanoutColumns(design);
+        if (cols.empty()) return archive;
+
+        vector<ShapeState> states;
+        ShapeState wide;
+        wide.ratio.assign(n, 1.0);
+        ShapeState smart;
+        smart.ratio.assign(n, 1.0);
+        ShapeState mixed;
+        mixed.ratio.assign(n, 1.0);
+        for (int i = 0; i < n; ++i) {
+            const BlockSpec& sp = design.blockSpecs[i];
+            const double amin = max(0.05, sp.aspectMin);
+            const double amax = max(amin, sp.aspectMax);
+            const double sm = smartSoftTargetRatio(design, i, 1.0);
+            wide.ratio[i] = (sp.type == BlockType::SOFT && !sp.hasFixedSize) ? amax : aspectMid(sp);
+            smart.ratio[i] = sm;
+            mixed.ratio[i] = (sp.type == BlockType::SOFT && !sp.hasFixedSize)
+                ? clampD(exp(0.42 * log(max(1.0e-9, sm)) + 0.58 * log(amax)), amin, amax)
+                : aspectMid(sp);
+        }
+        states.push_back(wide);
+        states.push_back(mixed);
+        states.push_back(smart);
+
+        const double area = totalPackingArea(design);
+        vector<double> widths;
+        const double baseW = area / max(1.0, design.maxOutlineH);
+        const double factors[] = { 1.18, 1.25, 1.31, 1.38, 1.46 };
+        for (double f : factors) widths.push_back(clampD(baseW * f, min(1.0, design.maxOutlineW), design.maxOutlineW));
+        widths.push_back(0.84 * design.maxOutlineW);
+        widths.push_back(0.88 * design.maxOutlineW);
+        widths.push_back(0.92 * design.maxOutlineW);
+        sort(widths.begin(), widths.end());
+        widths.erase(unique(widths.begin(), widths.end(), [](double a, double b) { return fabs(a - b) < 4.0; }), widths.end());
+
+        const double anchorScales[] = { 0.94, 1.00, 1.06 };
+        for (const ShapeState& st : states) {
+            for (double W : widths) {
+                W = clampD(W, minWidthBound(design, st), design.maxOutlineW);
+                for (double as : anchorScales) {
+                    LayoutResult cur;
+                    if (!tryGraphFanoutColumnLayout(design, st, cols, W, design.maxOutlineH, as, cur)) continue;
+                    addToBStarArchive(design, archive, cur);
+                }
+            }
+        }
+
+        sort(archive.begin(), archive.end(), betterArchiveLayout);
+        const int keep = min(10, static_cast<int>(archive.size()));
+        if (static_cast<int>(archive.size()) > keep) archive.resize(keep);
+        if (FAST_VERBOSE_LOG && !archive.empty()) {
+            cerr << fixed << setprecision(3)
+                << "[GraphFanoutColumnArchive] candidates=" << archive.size()
+                << " bestArea=" << archive.front().area
+                << " bestW/H=" << archive.front().W << "x" << archive.front().H
+                << " bestHpwl=" << archive.front().hpwl
+                << " bestStripPeak=" << archive.front().stripPeakUtilProxy
+                << "\n";
+        }
+        return archive;
+    }
+
+    static vector<vector<int>> compactColumnAssignments(
+        const Design& design,
+        const vector<int>& movables,
+        const vector<Rect>& shapes,
+        int colCount,
+        int limit
+    ) {
+        vector<vector<int>> out;
+        const int m = static_cast<int>(movables.size());
+        if (m <= 0 || colCount <= 0) return out;
+        auto pushUnique = [&](const vector<int>& a) {
+            for (const auto& old : out) if (old == a) return;
+            bool used[5] = { false, false, false, false, false };
+            for (int v : a) if (v >= 0 && v < 5) used[v] = true;
+            for (int c = 0; c < colCount; ++c) if (!used[c]) return;
+            out.push_back(a);
+            };
+
+        auto greedyAssign = [&](vector<int> order, int biasMode) {
+            vector<int> a(m, 0);
+            vector<double> h(colCount, 0.0);
+            for (int id : order) {
+                int pos = -1;
+                for (int k = 0; k < m; ++k) if (movables[k] == id) { pos = k; break; }
+                if (pos < 0) continue;
+                int best = 0;
+                double bestScore = INF;
+                for (int c = 0; c < colCount; ++c) {
+                    double score = h[c];
+                    if (biasMode == 1) score += 0.02 * c * max(1.0, shapes[id].h);
+                    if (biasMode == 2) score += 0.02 * (colCount - 1 - c) * max(1.0, shapes[id].h);
+                    if (score < bestScore) { bestScore = score; best = c; }
+                }
+                a[pos] = best;
+                h[best] += shapes[id].h;
+            }
+            pushUnique(a);
+            };
+
+        vector<int> byHeight = movables;
+        sort(byHeight.begin(), byHeight.end(), [&](int a, int b) { return shapes[a].h > shapes[b].h; });
+        vector<int> byArea = movables;
+        sort(byArea.begin(), byArea.end(), [&](int a, int b) { return shapes[a].w * shapes[a].h > shapes[b].w * shapes[b].h; });
+        vector<int> byDemand = movables;
+        sort(byDemand.begin(), byDemand.end(), [&](int a, int b) { return endpointDemand(design, a) > endpointDemand(design, b); });
+        for (int bias = 0; bias < 3; ++bias) {
+            greedyAssign(byHeight, bias);
+            greedyAssign(byArea, bias);
+            greedyAssign(byDemand, bias);
+        }
+        for (int shift = 0; shift < colCount; ++shift) {
+            vector<int> a(m, 0);
+            for (int k = 0; k < m; ++k) a[k] = (k + shift) % colCount;
+            pushUnique(a);
+        }
+
+        if (m <= 8) {
+            long long total = 1;
+            for (int k = 0; k < m; ++k) total *= colCount;
+            for (long long mask = 0; mask < total && static_cast<int>(out.size()) < limit; ++mask) {
+                long long t = mask;
+                vector<int> a(m, 0);
+                for (int k = 0; k < m; ++k) {
+                    a[k] = static_cast<int>(t % colCount);
+                    t /= colCount;
+                }
+                pushUnique(a);
+            }
+        }
+        else {
+            mt19937 rng(FAST_SEED + 7919u * static_cast<unsigned>(m) + 104729u * static_cast<unsigned>(colCount));
+            while (static_cast<int>(out.size()) < limit) {
+                vector<int> a(m, 0);
+                for (int k = 0; k < m; ++k) a[k] = uniform_int_distribution<int>(0, colCount - 1)(rng);
+                pushUnique(a);
+                if (static_cast<int>(out.size()) >= limit) break;
+                if (out.size() > 12 && uniform_int_distribution<int>(0, 16)(rng) == 0) break;
+            }
+        }
+
+        if (static_cast<int>(out.size()) > limit) out.resize(limit);
+        return out;
+    }
+
+    static vector<LayoutResult> makeCompactColumnArchive(const Design& design) {
+        vector<LayoutResult> archive;
+        const int n = static_cast<int>(design.blockSpecs.size());
+        if (n > 10) return archive;
+
+        vector<ShapeState> states = makeShapeStates(design);
+        if (n <= 10) {
+            vector<int> softIds;
+            for (int i = 0; i < n; ++i) {
+                const BlockSpec& sp = design.blockSpecs[i];
+                if (sp.type == BlockType::SOFT && !sp.hasFixedSize) softIds.push_back(i);
+            }
+            if (!softIds.empty() && softIds.size() <= 8) {
+                vector<ShapeState> extraStates;
+                const int masks = 1 << static_cast<int>(softIds.size());
+                for (int mask = 0; mask < masks; ++mask) {
+                    ShapeState st;
+                    st.ratio.assign(n, 1.0);
+                    for (int i = 0; i < n; ++i) st.ratio[i] = smartSoftTargetRatio(design, i, 1.0);
+                    for (int k = 0; k < static_cast<int>(softIds.size()); ++k) {
+                        int id = softIds[k];
+                        const BlockSpec& sp = design.blockSpecs[id];
+                        st.ratio[id] = (mask & (1 << k)) ? max(0.05, sp.aspectMax) : max(0.05, sp.aspectMin);
+                    }
+                    bool dup = false;
+                    for (const auto& oldSt : states) {
+                        if (oldSt.ratio.size() != st.ratio.size()) continue;
+                        bool same = true;
+                        for (int i = 0; i < n; ++i) {
+                            if (fabs(log(max(1.0e-9, oldSt.ratio[i])) - log(max(1.0e-9, st.ratio[i]))) > 1.0e-3) {
+                                same = false;
+                                break;
+                            }
+                        }
+                        if (same) { dup = true; break; }
+                    }
+                    if (!dup) extraStates.push_back(std::move(st));
+                }
+                vector<ShapeState> mergedStates;
+                mergedStates.reserve(extraStates.size() + states.size());
+                for (auto& st : extraStates) mergedStates.push_back(std::move(st));
+                for (auto& st : states) mergedStates.push_back(std::move(st));
+                states.swap(mergedStates);
+            }
+        }
+        const int stateLimit = min(static_cast<int>(states.size()), n <= 10 ? 10 : 5);
+        for (int si = 0; si < stateLimit; ++si) {
+            const ShapeState& st = states[si];
+            vector<Rect> shapes = makeShapes(design, st);
+            vector<int> movables;
+            for (int i = 0; i < n; ++i) if (isMovableBlock(design.blockSpecs[i])) movables.push_back(i);
+            if (movables.empty()) continue;
+
+            const int maxCols = min(4, max(2, static_cast<int>(movables.size())));
+            for (int colCount = 2; colCount <= maxCols; ++colCount) {
+                const int assignLimit = (n <= 10) ? 2400 : 120;
+                vector<vector<int>> assigns = compactColumnAssignments(design, movables, shapes, colCount, assignLimit);
+                const double gaps[] = { PACK_GAP, 24.0 };
+                const double wFactors[] = { 1.070, 1.120 };
+                const double hFactors[] = { 1.000, 1.012 };
+                for (const vector<int>& asg : assigns) {
+                    for (int sortMode = 0; sortMode < 2; ++sortMode) {
+                        for (int alignMode = 3; alignMode < 4; ++alignMode) {
+                            for (double gap : gaps) {
+                                for (double wf : wFactors) {
+                                    for (double hf : hFactors) {
+                                        LayoutResult cur;
+                                        if (!tryCompactColumnLayout(design, st, movables, asg, colCount, sortMode, alignMode, gap, wf, hf, cur)) continue;
+                                        addToBStarArchive(design, archive, cur);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        sort(archive.begin(), archive.end(), betterArchiveLayout);
+        const int keep = min(12, static_cast<int>(archive.size()));
+        if (static_cast<int>(archive.size()) > keep) archive.resize(keep);
+        if (FAST_VERBOSE_LOG && !archive.empty()) {
+            cerr << fixed << setprecision(3)
+                << "[CompactColumnArchive] candidates=" << archive.size()
+                << " bestArea=" << archive.front().area
+                << " bestW/H=" << archive.front().W << "x" << archive.front().H
+                << " bestHpwl=" << archive.front().hpwl
+                << " bestStripPeak=" << archive.front().stripPeakUtilProxy
+                << "\n";
+        }
+        return archive;
     }
 
     static LayoutResult fallbackShelf(const Design& design) {
@@ -2771,6 +4577,8 @@ namespace {
 } // namespace
 
 void Floorplanner::run(Design& design) {
+    archiveDesigns.clear();
+    archiveOrigins.clear();
     if (design.blockSpecs.empty()) {
         design.blocks.clear();
         return;
@@ -2877,6 +4685,8 @@ void Floorplanner::run(Design& design) {
         }
     }
 
+    vector<LayoutResult> explicitArchive;
+
     auto tryCandidate = [&](const ShapeState& st, const vector<int>& order, double W, double H, bool strictEdge) {
         ++tried;
         if (strictEdge) ++strictTried; else ++looseTried;
@@ -2893,6 +4703,8 @@ void Floorplanner::run(Design& design) {
             if (cur.legal) ++looseLegal;
             if (cur.strictEdgeLegal) ++looseEdgeOK;
         }
+        if (!cur.strictEdgeLegal) return;
+        addToBStarArchive(design, explicitArchive, cur);
         if (!have || betterLayout(cur, best)) {
             best = std::move(cur);
             have = true;
@@ -2900,7 +4712,7 @@ void Floorplanner::run(Design& design) {
         }
         };
 
-    auto runPass = [&](bool strictEdge, int stopAfterTried) {
+    auto runPass = [&](bool strictEdge, int stopAfterTried, bool ignoreGlobalCap = false) {
         for (const ShapeState& st : shapes) {
             vector<double> widths = makeWidthTrials(design, st);
             for (const vector<int>& order : orders) {
@@ -2908,7 +4720,7 @@ void Floorplanner::run(Design& design) {
                     vector<double> heights = makeHeightTrials(design, st, W);
                     for (double H : heights) {
                         if (tried >= stopAfterTried && have && best.legal) return;
-                        if (tried >= maxCandidates && have) return;
+                        if (!ignoreGlobalCap && tried >= maxCandidates && have) return;
                         tryCandidate(st, order, W, H, strictEdge);
                     }
                 }
@@ -2954,7 +4766,20 @@ void Floorplanner::run(Design& design) {
     bool usedBStarSA = false;
     if (ENABLE_BSTAR_AREA_SA) {
         int saTried = 0, saPacked = 0, saLegal = 0;
-        LayoutResult saBest = runBStarAreaSA(design, saTried, saPacked, saLegal);
+        vector<LayoutResult> saArchive;
+        LayoutResult saBest = runBStarAreaSA(design, saTried, saPacked, saLegal, &saArchive);
+        vector<LayoutResult> forceArchive = makeHpwlForceRefinedArchive(design, saArchive);
+        vector<LayoutResult> commitArchive = saArchive;
+        for (auto& refined : forceArchive) commitArchive.push_back(std::move(refined));
+        const int archiveLimit = min(24 + FORCE_REFINE_KEEP_LIMIT, static_cast<int>(commitArchive.size()));
+        archiveDesigns.reserve(static_cast<size_t>(archiveLimit) + 2);
+        archiveOrigins.reserve(static_cast<size_t>(archiveLimit) + 2);
+        for (int ai = 0; ai < archiveLimit; ++ai) {
+            Design candidate = design;
+            commitLayout(candidate, commitArchive[ai]);
+            archiveDesigns.push_back(std::move(candidate));
+            archiveOrigins.push_back(ai < static_cast<int>(saArchive.size()) ? "archive" : "force");
+        }
         tried += saTried;
         packed += saPacked;
         strictTried += saTried;
@@ -2976,12 +4801,22 @@ void Floorplanner::run(Design& design) {
             if (have) {
                 cerr << " bestArea=" << best.area
                     << " bestW/H=" << best.W << "x" << best.H
-                    << " routeGap=" << best.routePenalty;
+                    << " routeGap=" << best.routePenalty
+                    << " archive=" << saArchive.size()
+                    << " forceArchive=" << forceArchive.size()
+                    << " stripPeak=" << best.stripPeakUtilProxy
+                    << " stripOvProxy=" << best.stripOverflowProxy;
             }
             cerr << "\n";
         }
     }
 
+    if (usedBStarSA && ENABLE_EXPLICIT_TOPOLOGY_SUPPLEMENT && nBlocks <= 18) {
+        int passTried0 = tried, passPacked0 = packed, passLegal0 = strictLegal + looseLegal;
+        const int extraTrials = min(EXPLICIT_TOPOLOGY_SUPPLEMENT_TRIALS, max(240, targetCandidates * 2));
+        runPass(true, tried + extraTrials, true);
+        printPassSummary("explicit-topology-supplement", passTried0, passPacked0, passLegal0);
+    }
     if (!have || !best.legal) {
         int passTried0 = tried, passPacked0 = packed, passLegal0 = strictLegal + looseLegal;
         runPass(true, targetCandidates);
@@ -3058,7 +4893,19 @@ void Floorplanner::run(Design& design) {
     LayoutResult preDSU = best;
     // Phase 2: bounded DSU-style compaction.  Phase 1 used relaxed requiredGap;
     // this post pass reclaims deadspace without adding any candidate/SA cost.
-    if (best.legal) best = dsuPostCompaction(design, best);
+    const bool dsuRisky = preDSU.stripPeakUtilProxy > 0.72 || preDSU.stripHotComponents > 0;
+    if (best.legal && !dsuRisky) {
+        best = dsuPostCompaction(design, best);
+    }
+    else if (best.legal && FAST_VERBOSE_LOG) {
+        cerr << fixed << setprecision(3)
+            << "[DSUPost] skipped=Y"
+            << " reason=strip_proxy_risk"
+            << " stripPeak=" << preDSU.stripPeakUtilProxy
+            << " stripHot=" << preDSU.stripHotComponents
+            << " stripOvProxy=" << preDSU.stripOverflowProxy
+            << "\n";
+    }
 
     if (FAST_VERBOSE_LOG) {
         cerr << fixed << setprecision(3)
@@ -3073,7 +4920,37 @@ void Floorplanner::run(Design& design) {
             << "\n";
     }
 
+    if (!explicitArchive.empty()) {
+        sort(explicitArchive.begin(), explicitArchive.end(), betterArchiveLayout);
+        const int explicitLimit = min(EXPLICIT_TOPOLOGY_SUPPLEMENT_KEEP, static_cast<int>(explicitArchive.size()));
+        for (int ai = 0; ai < explicitLimit; ++ai) {
+            Design candidate = design;
+            commitLayout(candidate, explicitArchive[ai]);
+            archiveDesigns.push_back(std::move(candidate));
+            archiveOrigins.push_back("explicit");
+        }
+        if (FAST_VERBOSE_LOG) {
+            cerr << fixed << setprecision(3)
+                << "[ExplicitTopologySupplement] archive=" << explicitArchive.size()
+                << " keep=" << explicitLimit
+                << " bestArea=" << explicitArchive.front().area
+                << " bestW/H=" << explicitArchive.front().W << "x" << explicitArchive.front().H
+                << " bestStripPeak=" << explicitArchive.front().stripPeakUtilProxy
+                << "\n";
+        }
+    }
+
+    vector<LayoutResult> compactArchive = makeCompactColumnArchive(design);
+    for (int ai = 0; ai < static_cast<int>(compactArchive.size()); ++ai) {
+        Design candidate = design;
+        commitLayout(candidate, compactArchive[ai]);
+        archiveDesigns.push_back(std::move(candidate));
+        archiveOrigins.push_back("compact-column");
+    }
+
     commitLayout(design, best);
+    archiveDesigns.insert(archiveDesigns.begin(), design);
+    archiveOrigins.insert(archiveOrigins.begin(), "selected");
 
     cerr << fixed << setprecision(3)
         << "[FastSourcePack/N2] n2Target=" << targetCandidates
@@ -3107,6 +4984,14 @@ void Floorplanner::run(Design& design) {
 
 void Floorplanner::setEdgePlacementMode(int mode) {
     g_edgePlacementMode = max(0, min(2, mode));
+}
+
+const vector<Design>& Floorplanner::archivedCandidates() const {
+    return archiveDesigns;
+}
+
+const vector<string>& Floorplanner::archivedCandidateOrigins() const {
+    return archiveOrigins;
 }
 
 Rect Floorplanner::makeInitialShape(const BlockSpec& spec) const {

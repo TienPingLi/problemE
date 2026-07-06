@@ -56,6 +56,7 @@ void ChannelBuilder::build(Design& design) {
             addChannel(design, ++chCount, x1, yPrev, x2 - x1, design.outlineH - yPrev);
         }
     }
+
 }
 
 vector<double> ChannelBuilder::collectXEdges(const Design& design) const {

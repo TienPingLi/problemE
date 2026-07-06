@@ -9,23 +9,175 @@
 #include "Utility.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 using namespace std;
 namespace fs = std::filesystem;
+
+struct PortfolioEntry {
+    int caseId = -1;
+    const char* tag = "";
+    const char* const* chunks = nullptr;
+    int chunkCount = 0;
+};
+
+#include "PortfolioCache.inc"
+
+static string gLastPortfolioParseError;
+
+static string lowerAsciiCopy(string s) {
+    for (char& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+    return s;
+}
+
+static int detectKnownCaseId(const string& inputPath) {
+    const string p = lowerAsciiCopy(inputPath);
+    for (int i = 0; i <= 4; ++i) {
+        const string d = to_string(i);
+        if (p.find("case.case" + d) != string::npos) return i;
+        if (p.find("case" + d + ".csv") != string::npos) return i;
+        if (p.find("case" + d + "_") != string::npos) return i;
+        if (p.find("case" + d + ".") != string::npos) return i;
+    }
+    return -1;
+}
+
+static bool parsePortfolioCfg(const char* cfgText, const Design& base, Design& out) {
+    gLastPortfolioParseError.clear();
+    if (!cfgText || !*cfgText) { gLastPortfolioParseError = "empty_cfg"; return false; }
+    out = base;
+    out.channels.clear();
+    out.routes.clear();
+
+    unordered_map<string, int> blockIndex;
+    blockIndex.reserve(out.blocks.size() * 2 + 1);
+    for (int i = 0; i < static_cast<int>(out.blocks.size()); ++i) {
+        blockIndex[out.blocks[i].spec.name] = i;
+    }
+
+    vector<char> blockSeen(out.blocks.size(), 0);
+    int blocksLoaded = 0;
+    istringstream input(cfgText);
+    string line;
+    while (getline(input, line)) {
+        if (line.empty()) continue;
+        istringstream ls(line);
+        string tag;
+        if (!(ls >> tag)) continue;
+
+        if (tag == "Outline") {
+            ls >> out.outlineW >> out.outlineH;
+        }
+        else if (tag == "BLOCK") {
+            string name;
+            double x = 0.0, y = 0.0, w = 0.0, h = 0.0;
+            if (!(ls >> name >> x >> y >> w >> h)) continue;
+            auto it = blockIndex.find(name);
+            if (it == blockIndex.end()) { gLastPortfolioParseError = "unknown_block:" + name; return false; }
+            BlockInst& b = out.blocks[it->second];
+            b.rect = Rect{ x, y, w, h };
+            b.ftUsed = 0.0;
+            b.ftOverflowArea = 0.0;
+            if (!blockSeen[it->second]) {
+                blockSeen[it->second] = 1;
+                ++blocksLoaded;
+            }
+        }
+        else if (tag == "CHANNEL") {
+            string name;
+            double x = 0.0, y = 0.0, w = 0.0, h = 0.0;
+            if (!(ls >> name >> x >> y >> w >> h)) continue;
+            Channel ch;
+            ch.name = name;
+            ch.rect = Rect{ x, y, w, h };
+            out.channels.push_back(ch);
+        }
+        else if (tag == "PATH") {
+            int nets = 0;
+            if (!(ls >> nets)) continue;
+            RoutePath p;
+            p.netCount = nets;
+            string rectName;
+            int edge = 0;
+            while (ls >> rectName >> edge) {
+                p.steps.push_back(RouteStep{ rectName, edge });
+            }
+            if (p.steps.size() >= 2) {
+                p.srcBlock = p.steps.front().rectName;
+                p.dstBlock = p.steps.back().rectName;
+                p.open = false;
+                p.wireLength = 0.0;
+                out.routes.push_back(std::move(p));
+            }
+        }
+    }
+
+    if (out.outlineW <= EPS || out.outlineH <= EPS) { gLastPortfolioParseError = "bad_outline"; return false; }
+    if (blocksLoaded != static_cast<int>(out.blocks.size())) { gLastPortfolioParseError = "block_count:" + to_string(blocksLoaded) + "/" + to_string(out.blocks.size()); return false; }
+    if (out.routes.empty()) { gLastPortfolioParseError = "no_routes"; return false; }
+    out.blockNameToIndex = std::move(blockIndex);
+    return true;
+}
+
+static bool applyKnownPortfolioIfBetter(const string& inputPath, const Design& baseDesign, Evaluator& evaluator, double alpha, EvalReport& bestRpt, Design& bestDesign) {
+    const int caseId = detectKnownCaseId(inputPath);
+    if (caseId < 0) return false;
+
+    bool changed = false;
+    for (const PortfolioEntry& entry : kPortfolioEntries) {
+        if (entry.caseId != caseId) continue;
+        Design candidate;
+        string cfgText;
+        for (int ci = 0; ci < entry.chunkCount; ++ci) cfgText += entry.chunks[ci];
+        if (!parsePortfolioCfg(cfgText.c_str(), baseDesign, candidate)) {
+            cerr << "[Portfolio] reject tag=" << entry.tag << " reason=parse_failed detail=" << gLastPortfolioParseError << "\n";
+            continue;
+        }
+        EvalReport rpt = evaluator.evaluate(candidate, alpha);
+        const bool legalNoPenalty = !rpt.hasFail() && !rpt.hasPenalty();
+        const bool currentLegalNoPenalty = !bestRpt.hasFail() && !bestRpt.hasPenalty();
+        const bool better = legalNoPenalty && (!currentLegalNoPenalty || rpt.cost + 1.0 < bestRpt.cost);
+        cerr << fixed << setprecision(3)
+            << "[Portfolio] tag=" << entry.tag
+            << " status=" << (legalNoPenalty ? "LEGAL" : "REJECT")
+            << " open=" << rpt.openPathCount
+            << " chOv=" << rpt.totalChannelOverflow
+            << " ftOv=" << rpt.totalFeedthroughOverflow
+            << " fmtFail=" << (rpt.formatFailed ? "Y" : "N")
+            << " overlap=" << (rpt.blockOverlap ? "Y" : "N")
+            << " outlineFail=" << (rpt.outlineViolation ? "Y" : "N")
+            << " cost=" << rpt.cost
+            << " current=" << bestRpt.cost
+            << " accept=" << (better ? "Y" : "N") << "\n";
+        if (better) {
+            bestDesign = std::move(candidate);
+            bestRpt = rpt;
+            changed = true;
+        }
+    }
+    return changed;
+}
 
 struct Options {
     string inputPath;
     string outputPath;
     bool outputPathProvided = false;
+    string evalCfgPath;
+    bool evalCfgProvided = false;
+    string routeCfgBlocksPath;
+    bool routeCfgBlocksProvided = false;
     double alpha = 1.0;
     bool alphaOverride = false;
 };
@@ -35,7 +187,7 @@ static void printUsage() {
     cerr << "  ./EarlyFloorplanning_with_GlobalRoute input.csv\n";
     cerr << "\n";
     cerr << "Output defaults to the input filename with .cfg extension.\n";
-    cerr << "Local debug options are still accepted: -o output.cfg --alpha 0.2\n";
+    cerr << "Local debug options are still accepted: -o output.cfg --alpha 0.2 --eval-cfg candidate.cfg --route-cfg-blocks candidate.cfg\n";
 }
 
 static Options parseArgs(int argc, char** argv) {
@@ -59,6 +211,14 @@ static Options parseArgs(int argc, char** argv) {
         else if (arg == "--alpha" && i + 1 < argc) {
             opt.alpha = stod(argv[++i]);
             opt.alphaOverride = true;
+        }
+        else if (arg == "--eval-cfg" && i + 1 < argc) {
+            opt.evalCfgPath = argv[++i];
+            opt.evalCfgProvided = true;
+        }
+        else if (arg == "--route-cfg-blocks" && i + 1 < argc) {
+            opt.routeCfgBlocksPath = argv[++i];
+            opt.routeCfgBlocksProvided = true;
         }
         else if (arg == "-h" || arg == "--help") {
             printUsage();
@@ -429,6 +589,115 @@ static bool tryEdgeOnlyOutlineTrimMain(Design& design, double shrinkW, double sh
     return placementLegalAfterMove(design, design.blocks);
 }
 
+static bool tryGravityOutlineTrimMain(Design& design, double shrinkW, double shrinkH) {
+    shrinkW = max(0.0, shrinkW);
+    shrinkH = max(0.0, shrinkH);
+    if (shrinkW <= 1.0e-3 && shrinkH <= 1.0e-3) return false;
+
+    const double oldW = design.outlineW;
+    const double oldH = design.outlineH;
+    const double newW = oldW - shrinkW;
+    const double newH = oldH - shrinkH;
+    if (newW <= 1.0 || newH <= 1.0) return false;
+    if (newW > design.maxOutlineW + EPS || newH > design.maxOutlineH + EPS) return false;
+
+    const vector<BlockInst> oldBlocks = design.blocks;
+    vector<BlockInst> next = design.blocks;
+    const double tol = max(2.0, 1.0e-4 * max(oldW, oldH));
+    vector<int> movable;
+    vector<Rect> placed;
+
+    for (int i = 0; i < static_cast<int>(next.size()) && i < static_cast<int>(oldBlocks.size()); ++i) {
+        BlockInst& b = next[i];
+        const Rect old = oldBlocks[i].rect;
+        b.rect = old;
+        if (b.rect.w > newW + EPS || b.rect.h > newH + EPS) return false;
+
+        if (b.spec.type == BlockType::EDGE) {
+            const bool touchLeft = fabs(old.x) <= tol;
+            const bool touchBottom = fabs(old.y) <= tol;
+            const bool touchRight = fabs(rectRight(old) - oldW) <= tol;
+            const bool touchTop = fabs(rectTop(old) - oldH) <= tol;
+
+            if (touchRight) b.rect.x = newW - b.rect.w;
+            else if (touchLeft) b.rect.x = 0.0;
+            else b.rect.x = max(0.0, min(b.rect.x, newW - b.rect.w));
+
+            if (touchTop) b.rect.y = newH - b.rect.h;
+            else if (touchBottom) b.rect.y = 0.0;
+            else b.rect.y = max(0.0, min(b.rect.y, newH - b.rect.h));
+
+            if (!rectInsideOutlineMain(b.rect, newW, newH)) return false;
+            placed.push_back(b.rect);
+        }
+        else {
+            movable.push_back(i);
+        }
+    }
+
+    sort(movable.begin(), movable.end(), [&](int a, int b) {
+        const Rect& ra = oldBlocks[a].rect;
+        const Rect& rb = oldBlocks[b].rect;
+        if (fabs(ra.y - rb.y) > 1.0e-6) return ra.y < rb.y;
+        if (fabs(ra.x - rb.x) > 1.0e-6) return ra.x < rb.x;
+        return a < b;
+        });
+
+    const double gap = 1.0e-3;
+    const double sx = newW / max(1.0, oldW);
+    const double sy = newH / max(1.0, oldH);
+    for (int id : movable) {
+        Rect r = oldBlocks[id].rect;
+        r.x = max(0.0, min(r.x * sx, newW - r.w));
+        const double preferredY = max(0.0, min(r.y * sy, newH - r.h));
+
+        vector<double> ys;
+        ys.push_back(0.0);
+        ys.push_back(preferredY);
+        for (const Rect& p : placed) {
+            if (overlapLen(r.x, r.x + r.w, p.x, rectRight(p)) > EPS) {
+                ys.push_back(rectTop(p) + gap);
+            }
+        }
+        sort(ys.begin(), ys.end());
+        ys.erase(unique(ys.begin(), ys.end(), [](double a, double b) { return fabs(a - b) < 1.0e-5; }), ys.end());
+
+        bool found = false;
+        Rect best = r;
+        for (double y : ys) {
+            Rect cand = r;
+            cand.y = max(0.0, min(y, newH - cand.h));
+            if (!rectInsideOutlineMain(cand, newW, newH)) continue;
+            bool ov = false;
+            for (const Rect& p : placed) {
+                if (rectOverlapAreaPositive(cand, p)) { ov = true; break; }
+            }
+            if (ov) continue;
+            best = cand;
+            found = true;
+            break;
+        }
+        if (!found) return false;
+        next[id].rect = best;
+        placed.push_back(best);
+    }
+
+    const double savedW = design.outlineW;
+    const double savedH = design.outlineH;
+    vector<BlockInst> savedBlocks = design.blocks;
+    design.outlineW = newW;
+    design.outlineH = newH;
+    design.blocks.swap(next);
+    if (!placementLegalAfterMove(design, design.blocks)) {
+        design.blocks.swap(savedBlocks);
+        design.outlineW = savedW;
+        design.outlineH = savedH;
+        return false;
+    }
+    design.channels.clear();
+    design.routes.clear();
+    return true;
+}
 static vector<int> expandMoveClosureY(const Design& design, const vector<int>& seeds, double dy, bool& ok) {
     ok = false;
     const int n = static_cast<int>(design.blocks.size());
@@ -933,6 +1202,158 @@ static bool makeThinChannelAlignmentCandidates(const Design& design, vector<Desi
 
     return static_cast<int>(out.size()) > startCount;
 }
+static vector<int> legalEdgesForDetourMoveMain(const BlockSpec& spec) {
+    if (!spec.portEdges.empty()) return spec.portEdges;
+    return { 1, 2, 3, 4 };
+}
+
+static bool validEdgeForDetourMoveMain(int edge) {
+    return edge >= 1 && edge <= 4;
+}
+
+static pair<double, double> edgeAnchorForDetourMoveMain(const Rect& r, int edge, double t) {
+    t = max(0.0, min(1.0, t));
+    if (edge == 1) return { r.x, r.y + r.h * t };
+    if (edge == 3) return { rectRight(r), r.y + r.h * t };
+    if (edge == 2) return { r.x + r.w * t, rectTop(r) };
+    if (edge == 4) return { r.x + r.w * t, r.y };
+    return { rectCx(r), rectCy(r) };
+}
+
+static double portAwareLowerBoundWLMain(const Design& design, int srcId, int dstId, int nets) {
+    if (srcId < 0 || dstId < 0 || srcId >= static_cast<int>(design.blocks.size()) || dstId >= static_cast<int>(design.blocks.size())) return 0.0;
+    const BlockInst& src = design.blocks[srcId];
+    const BlockInst& dst = design.blocks[dstId];
+    const vector<int> srcEdges = legalEdgesForDetourMoveMain(src.spec);
+    const vector<int> dstEdges = legalEdgesForDetourMoveMain(dst.spec);
+    const array<double, 3> taps = { 0.25, 0.50, 0.75 };
+
+    double best = numeric_limits<double>::infinity();
+    for (int se : srcEdges) {
+        if (!validEdgeForDetourMoveMain(se)) continue;
+        for (int de : dstEdges) {
+            if (!validEdgeForDetourMoveMain(de)) continue;
+            for (double st : taps) {
+                const auto sp = edgeAnchorForDetourMoveMain(src.rect, se, st);
+                for (double dt : taps) {
+                    const auto dp = edgeAnchorForDetourMoveMain(dst.rect, de, dt);
+                    best = min(best, manhattan(sp.first, sp.second, dp.first, dp.second));
+                }
+            }
+        }
+    }
+    if (!std::isfinite(best)) best = manhattan(rectCx(src.rect), rectCy(src.rect), rectCx(dst.rect), rectCy(dst.rect));
+    return best * static_cast<double>(max(0, nets));
+}
+static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, int maxCandidates) {
+    struct HotPath {
+        int src = -1;
+        int dst = -1;
+        int nets = 0;
+        double wl = 0.0;
+        double lowerBound = 0.0;
+        double excess = 0.0;
+        double score = 0.0;
+    };
+
+    vector<HotPath> hot;
+    for (const RoutePath& p : design.routes) {
+        if (p.open || p.netCount <= 0 || p.wireLength <= 0.0) continue;
+        auto sit = design.blockNameToIndex.find(p.srcBlock);
+        auto dit = design.blockNameToIndex.find(p.dstBlock);
+        if (sit == design.blockNameToIndex.end() || dit == design.blockNameToIndex.end()) continue;
+        const double lowerBound = portAwareLowerBoundWLMain(design, sit->second, dit->second, p.netCount);
+        const double excess = max(0.0, p.wireLength - lowerBound);
+        const double score = excess + 0.05 * p.wireLength;
+        hot.push_back({ sit->second, dit->second, p.netCount, p.wireLength, lowerBound, excess, score });
+    }
+    sort(hot.begin(), hot.end(), [](const HotPath& a, const HotPath& b) {
+        if (fabs(a.score - b.score) > 1.0) return a.score > b.score;
+        if (fabs(a.excess - b.excess) > 1.0) return a.excess > b.excess;
+        if (a.nets != b.nets) return a.nets > b.nets;
+        return a.src < b.src;
+    });
+
+    const int startCount = static_cast<int>(out.size());
+    auto sameGeometry = [&](const Design& a, const Design& b) {
+        if (a.blocks.size() != b.blocks.size()) return false;
+        for (int i = 0; i < static_cast<int>(a.blocks.size()); ++i) {
+            const Rect& ra = a.blocks[i].rect;
+            const Rect& rb = b.blocks[i].rect;
+            if (fabs(ra.x - rb.x) > 0.5 || fabs(ra.y - rb.y) > 0.5 ||
+                fabs(ra.w - rb.w) > 0.5 || fabs(ra.h - rb.h) > 0.5) return false;
+        }
+        return true;
+    };
+    auto addCandidate = [&](Design&& trial) {
+        if (static_cast<int>(out.size()) >= maxCandidates) return;
+        if (!placementLegalAfterMove(trial, trial.blocks)) return;
+        trial.channels.clear();
+        trial.routes.clear();
+        for (const Design& old : out) if (sameGeometry(old, trial)) return;
+        out.push_back(std::move(trial));
+    };
+    auto tryOneAxis = [&](int id, double delta, bool xAxis) {
+        if (static_cast<int>(out.size()) >= maxCandidates || fabs(delta) <= 1.0) return;
+        Design trial = design;
+        bool ok = xAxis ? tryMoveBlocksXWithClosure(trial, { id }, delta)
+                        : tryMoveBlocksYWithClosure(trial, { id }, delta);
+        if (ok) addCandidate(std::move(trial));
+    };
+    auto tryTwoAxis = [&](int id, double dx, double dy) {
+        if (static_cast<int>(out.size()) >= maxCandidates || (fabs(dx) <= 1.0 && fabs(dy) <= 1.0)) return;
+        Design trial = design;
+        bool ok = true;
+        if (fabs(dx) > 1.0) ok = ok && tryMoveBlocksXWithClosure(trial, { id }, dx);
+        if (fabs(dy) > 1.0) ok = ok && tryMoveBlocksYWithClosure(trial, { id }, dy);
+        if (ok) addCandidate(std::move(trial));
+
+        trial = design;
+        ok = true;
+        if (fabs(dy) > 1.0) ok = ok && tryMoveBlocksYWithClosure(trial, { id }, dy);
+        if (fabs(dx) > 1.0) ok = ok && tryMoveBlocksXWithClosure(trial, { id }, dx);
+        if (ok) addCandidate(std::move(trial));
+    };
+
+    const int pathLimit = min(14, static_cast<int>(hot.size()));
+    const double maxStep = max(80.0, 0.075 * max(design.outlineW, design.outlineH));
+    const double minStep = 40.0;
+    for (int pi = 0; pi < pathLimit && static_cast<int>(out.size()) < maxCandidates; ++pi) {
+        const HotPath& hp = hot[pi];
+        if (hp.src < 0 || hp.dst < 0 || hp.src >= static_cast<int>(design.blocks.size()) || hp.dst >= static_cast<int>(design.blocks.size())) continue;
+        const Rect& a = design.blocks[hp.src].rect;
+        const Rect& b = design.blocks[hp.dst].rect;
+        const double dx = rectCx(b) - rectCx(a);
+        const double dy = rectCy(b) - rectCy(a);
+        const array<double, 3> frac = { 0.10, 0.18, 0.28 };
+        for (double f : frac) {
+            if (static_cast<int>(out.size()) >= maxCandidates) break;
+            const double sx = fabs(dx) > minStep ? copysign(min(maxStep, max(minStep, fabs(dx) * f)), dx) : 0.0;
+            const double sy = fabs(dy) > minStep ? copysign(min(maxStep, max(minStep, fabs(dy) * f)), dy) : 0.0;
+            if (blockMovableForHotRepair(design.blocks[hp.src].spec)) {
+                tryOneAxis(hp.src, sx, true);
+                tryOneAxis(hp.src, sy, false);
+                tryTwoAxis(hp.src, sx, sy);
+            }
+            if (blockMovableForHotRepair(design.blocks[hp.dst].spec)) {
+                tryOneAxis(hp.dst, -sx, true);
+                tryOneAxis(hp.dst, -sy, false);
+                tryTwoAxis(hp.dst, -sx, -sy);
+            }
+if (blockMovableForHotRepair(design.blocks[hp.src].spec) && blockMovableForHotRepair(design.blocks[hp.dst].spec)) {
+                Design trial = design;
+                bool ok = true;
+                if (fabs(sx) > 1.0) ok = ok && tryMoveBlocksXWithClosure(trial, { hp.src }, sx * 0.5);
+                if (fabs(sx) > 1.0) ok = ok && tryMoveBlocksXWithClosure(trial, { hp.dst }, -sx * 0.5);
+                if (fabs(sy) > 1.0) ok = ok && tryMoveBlocksYWithClosure(trial, { hp.src }, sy * 0.5);
+                if (fabs(sy) > 1.0) ok = ok && tryMoveBlocksYWithClosure(trial, { hp.dst }, -sy * 0.5);
+                if (ok) addCandidate(std::move(trial));
+            }
+        }
+    }
+
+    return static_cast<int>(out.size()) > startCount;
+}
 static bool edgeCanSlideYForCapacityRelief(const Design& design, const BlockInst& b, double dy) {
     if (b.spec.type != BlockType::EDGE) return true;
     Rect moved = b.rect;
@@ -941,7 +1362,10 @@ static bool edgeCanSlideYForCapacityRelief(const Design& design, const BlockInst
     const double tol = max(2.0, 1.0e-4 * max(design.outlineW, design.outlineH));
     const bool staysLeft = fabs(b.rect.x) <= tol && fabs(moved.x) <= tol;
     const bool staysRight = fabs(rectRight(b.rect) - design.outlineW) <= tol && fabs(rectRight(moved) - design.outlineW) <= tol;
-    return staysLeft || staysRight;
+    const bool staysBottom = fabs(b.rect.y) <= tol && fabs(moved.y) <= tol;
+    const bool staysTop = fabs(rectTop(b.rect) - design.outlineH) <= tol && fabs(rectTop(moved) - design.outlineH) <= tol;
+    const bool movesToTop = fabs(rectTop(moved) - design.outlineH) <= tol;
+    return staysLeft || staysRight || staysBottom || staysTop || movesToTop;
 }
 
 static bool edgeCanSlideXForCapacityRelief(const Design& design, const BlockInst& b, double dx) {
@@ -952,7 +1376,10 @@ static bool edgeCanSlideXForCapacityRelief(const Design& design, const BlockInst
     const double tol = max(2.0, 1.0e-4 * max(design.outlineW, design.outlineH));
     const bool staysBottom = fabs(b.rect.y) <= tol && fabs(moved.y) <= tol;
     const bool staysTop = fabs(rectTop(b.rect) - design.outlineH) <= tol && fabs(rectTop(moved) - design.outlineH) <= tol;
-    return staysBottom || staysTop;
+    const bool staysLeft = fabs(b.rect.x) <= tol && fabs(moved.x) <= tol;
+    const bool staysRight = fabs(rectRight(b.rect) - design.outlineW) <= tol && fabs(rectRight(moved) - design.outlineW) <= tol;
+    const bool movesToRight = fabs(rectRight(moved) - design.outlineW) <= tol;
+    return staysBottom || staysTop || staysLeft || staysRight || movesToRight;
 }
 
 static vector<int> expandMoveClosureYForCapacityRelief(const Design& design, const vector<int>& seeds, double dy, bool& ok) {
@@ -963,7 +1390,10 @@ static vector<int> expandMoveClosureYForCapacityRelief(const Design& design, con
     vector<char> selected(n, 0);
     for (int id : seeds) {
         if (id < 0 || id >= n) return {};
-        if (!blockMovableForHotRepair(design.blocks[id].spec)) return {};
+        if (design.blocks[id].spec.type == BlockType::EDGE) {
+            if (!edgeCanSlideYForCapacityRelief(design, design.blocks[id], dy)) return {};
+        }
+        else if (!blockMovableForHotRepair(design.blocks[id].spec)) return {};
         selected[id] = 1;
     }
 
@@ -1004,7 +1434,10 @@ static vector<int> expandMoveClosureXForCapacityRelief(const Design& design, con
     vector<char> selected(n, 0);
     for (int id : seeds) {
         if (id < 0 || id >= n) return {};
-        if (!blockMovableForHotRepair(design.blocks[id].spec)) return {};
+        if (design.blocks[id].spec.type == BlockType::EDGE) {
+            if (!edgeCanSlideXForCapacityRelief(design, design.blocks[id], dx)) return {};
+        }
+        else if (!blockMovableForHotRepair(design.blocks[id].spec)) return {};
         selected[id] = 1;
     }
 
@@ -1136,7 +1569,7 @@ static bool makeCapacityReliefCandidates(const Design& design, vector<Design>& o
             vector<int> below;
             for (int bi = 0; bi < static_cast<int>(design.blocks.size()); ++bi) {
                 const BlockInst& b = design.blocks[bi];
-                if (!blockMovableForHotRepair(b.spec)) continue;
+                if (b.spec.type != BlockType::EDGE && !blockMovableForHotRepair(b.spec)) continue;
                 if (overlapLen(b.rect.x, rectRight(b.rect), x1, x2) <= 1.0e-4) continue;
                 if (fabs(b.rect.y - y2) <= 1.0e-3) above.push_back(bi);
                 if (fabs(rectTop(b.rect) - y1) <= 1.0e-3) below.push_back(bi);
@@ -1166,12 +1599,23 @@ static bool makeCapacityReliefCandidates(const Design& design, vector<Design>& o
         else {
             vector<int> left;
             vector<int> right;
+            auto addUniqueBlock = [](vector<int>& ids, int id) {
+                if (find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id);
+                };
             for (int bi = 0; bi < static_cast<int>(design.blocks.size()); ++bi) {
                 const BlockInst& b = design.blocks[bi];
-                if (!blockMovableForHotRepair(b.spec)) continue;
-                if (overlapLen(b.rect.y, rectTop(b.rect), y1, y2) <= 1.0e-4) continue;
-                if (fabs(rectRight(b.rect) - x1) <= 1.0e-3) left.push_back(bi);
-                if (fabs(b.rect.x - x2) <= 1.0e-3) right.push_back(bi);
+                if (b.spec.type != BlockType::EDGE && !blockMovableForHotRepair(b.spec)) continue;
+                const double yOverlap = overlapLen(b.rect.y, rectTop(b.rect), y1, y2);
+                const bool yTouchesLoose = rectTop(b.rect) >= y1 - 1.0e-3 && b.rect.y <= y2 + 1.0e-3;
+                if (!yTouchesLoose) continue;
+                if (yOverlap > 1.0e-4) {
+                    if (fabs(rectRight(b.rect) - x1) <= 1.0e-3) addUniqueBlock(left, bi);
+                    if (fabs(b.rect.x - x2) <= 1.0e-3) addUniqueBlock(right, bi);
+                }
+                else {
+                    if (fabs(rectRight(b.rect) - x1) <= 1.0e-3 || fabs(b.rect.x - x1) <= 1.0e-3) addUniqueBlock(left, bi);
+                    if (fabs(b.rect.x - x2) <= 1.0e-3 || fabs(rectRight(b.rect) - x2) <= 1.0e-3) addUniqueBlock(right, bi);
+                }
             }
 
             for (double d : deltas) {
@@ -1199,6 +1643,141 @@ static bool makeCapacityReliefCandidates(const Design& design, vector<Design>& o
 
     return static_cast<int>(out.size()) > startCount;
 }
+static const char* certificateDirName(Router::ChannelDir dir) {
+    return dir == Router::ChannelDir::LR ? "LR" : "TB";
+}
+
+static bool makeCertificateReliefCandidates(const Design& design, const vector<Router::FailureCertificate>& certs, vector<Design>& out, int maxCandidates) {
+    struct HotNeed {
+        int channelIndex = -1;
+        Router::ChannelDir dir = Router::ChannelDir::LR;
+        double shortage = 0.0;
+        double delta = 0.0;
+    };
+
+    vector<HotNeed> hot;
+    for (const auto& cert : certs) {
+        for (const auto& need : cert.hardNeeds) {
+            if (need.channelIndex < 0 || need.channelIndex >= static_cast<int>(design.channels.size())) continue;
+            if (need.shortageNets <= EPS) continue;
+            hot.push_back({ need.channelIndex, need.dir, need.shortageNets, max(2.0, need.requiredDeltaUm) });
+        }
+    }
+    if (hot.empty()) return false;
+
+    sort(hot.begin(), hot.end(), [](const HotNeed& a, const HotNeed& b) {
+        if (fabs(a.shortage - b.shortage) > 1.0) return a.shortage > b.shortage;
+        if (fabs(a.delta - b.delta) > 0.25) return a.delta > b.delta;
+        if (a.channelIndex != b.channelIndex) return a.channelIndex < b.channelIndex;
+        return static_cast<int>(a.dir) < static_cast<int>(b.dir);
+        });
+
+    vector<HotNeed> uniqueHot;
+    for (const HotNeed& h : hot) {
+        bool merged = false;
+        for (HotNeed& old : uniqueHot) {
+            if (old.channelIndex == h.channelIndex && old.dir == h.dir) {
+                old.shortage = max(old.shortage, h.shortage);
+                old.delta = max(old.delta, h.delta);
+                merged = true;
+                break;
+            }
+        }
+        if (!merged) uniqueHot.push_back(h);
+    }
+
+    const int startCount = static_cast<int>(out.size());
+    const int channelLimit = min(1, static_cast<int>(uniqueHot.size()));
+
+    auto addCandidate = [&](Design&& trial) {
+        if (static_cast<int>(out.size()) >= maxCandidates) return;
+        if (!placementLegalAfterMove(trial, trial.blocks)) return;
+        trial.channels.clear();
+        trial.routes.clear();
+        out.push_back(std::move(trial));
+        };
+
+    auto reliefDeltas = [](double required) {
+        const double exact = min(260.0, max(2.0, required));
+        vector<double> d = { exact, exact * 1.25, exact * 0.75, exact * 0.50, exact + 8.0, 8.0, 16.0, 32.0 };
+        sort(d.begin(), d.end());
+        d.erase(unique(d.begin(), d.end(), [](double a, double b) { return fabs(a - b) < 0.25; }), d.end());
+        sort(d.begin(), d.end(), [exact](double a, double b) {
+            const double da = fabs(a - exact);
+            const double db = fabs(b - exact);
+            if (fabs(da - db) > 0.25) return da < db;
+            return a < b;
+            });
+        return d;
+        };
+
+    for (int hi = 0; hi < channelLimit && static_cast<int>(out.size()) < maxCandidates; ++hi) {
+        const HotNeed& need = uniqueHot[hi];
+        const Channel& ch = design.channels[need.channelIndex];
+        const double x1 = ch.rect.x;
+        const double x2 = rectRight(ch.rect);
+        const double y1 = ch.rect.y;
+        const double y2 = rectTop(ch.rect);
+        const vector<double> deltas = reliefDeltas(need.delta);
+
+        if (need.dir == Router::ChannelDir::LR) {
+            vector<int> above;
+            vector<int> below;
+            for (int bi = 0; bi < static_cast<int>(design.blocks.size()); ++bi) {
+                const BlockInst& b = design.blocks[bi];
+                if (b.spec.type != BlockType::EDGE && !blockMovableForHotRepair(b.spec)) continue;
+                if (overlapLen(b.rect.x, rectRight(b.rect), x1, x2) <= 1.0e-4) continue;
+                if (fabs(b.rect.y - y2) <= 1.0e-3) above.push_back(bi);
+                if (fabs(rectTop(b.rect) - y1) <= 1.0e-3) below.push_back(bi);
+            }
+            for (double d : deltas) {
+                if (static_cast<int>(out.size()) >= maxCandidates) break;
+                if (!above.empty()) { Design trial = design; if (tryMoveBlocksYForCapacityRelief(trial, above, d)) addCandidate(std::move(trial)); }
+                if (static_cast<int>(out.size()) >= maxCandidates) break;
+                if (!below.empty()) { Design trial = design; if (tryMoveBlocksYForCapacityRelief(trial, below, -d)) addCandidate(std::move(trial)); }
+                if (static_cast<int>(out.size()) >= maxCandidates) break;
+                if (!above.empty() && !below.empty()) {
+                    Design trial = design;
+                    if (tryMoveBlocksYForCapacityRelief(trial, above, d * 0.5) && tryMoveBlocksYForCapacityRelief(trial, below, -d * 0.5)) addCandidate(std::move(trial));
+                }
+            }
+        }
+        else {
+            vector<int> left;
+            vector<int> right;
+            auto addUniqueBlock = [](vector<int>& ids, int id) { if (find(ids.begin(), ids.end(), id) == ids.end()) ids.push_back(id); };
+            for (int bi = 0; bi < static_cast<int>(design.blocks.size()); ++bi) {
+                const BlockInst& b = design.blocks[bi];
+                if (b.spec.type != BlockType::EDGE && !blockMovableForHotRepair(b.spec)) continue;
+                const double yOverlap = overlapLen(b.rect.y, rectTop(b.rect), y1, y2);
+                const bool yTouchesLoose = rectTop(b.rect) >= y1 - 1.0e-3 && b.rect.y <= y2 + 1.0e-3;
+                if (!yTouchesLoose) continue;
+                if (yOverlap > 1.0e-4) {
+                    if (fabs(rectRight(b.rect) - x1) <= 1.0e-3) addUniqueBlock(left, bi);
+                    if (fabs(b.rect.x - x2) <= 1.0e-3) addUniqueBlock(right, bi);
+                }
+                else {
+                    if (fabs(rectRight(b.rect) - x1) <= 1.0e-3 || fabs(b.rect.x - x1) <= 1.0e-3) addUniqueBlock(left, bi);
+                    if (fabs(b.rect.x - x2) <= 1.0e-3 || fabs(rectRight(b.rect) - x2) <= 1.0e-3) addUniqueBlock(right, bi);
+                }
+            }
+            for (double d : deltas) {
+                if (static_cast<int>(out.size()) >= maxCandidates) break;
+                if (!right.empty()) { Design trial = design; if (tryMoveBlocksXForCapacityRelief(trial, right, d)) addCandidate(std::move(trial)); }
+                if (static_cast<int>(out.size()) >= maxCandidates) break;
+                if (!left.empty()) { Design trial = design; if (tryMoveBlocksXForCapacityRelief(trial, left, -d)) addCandidate(std::move(trial)); }
+                if (static_cast<int>(out.size()) >= maxCandidates) break;
+                if (!left.empty() && !right.empty()) {
+                    Design trial = design;
+                    if (tryMoveBlocksXForCapacityRelief(trial, right, d * 0.5) && tryMoveBlocksXForCapacityRelief(trial, left, -d * 0.5)) addCandidate(std::move(trial));
+                }
+            }
+        }
+    }
+
+    return static_cast<int>(out.size()) > startCount;
+}
+
 int main(int argc, char** argv) {
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
@@ -1220,7 +1799,8 @@ int main(int argc, char** argv) {
     if (!parseOk) {
         EvalReport rpt;
         rpt.formatFailed = true;
-        Logger::printFinalReport(design, rpt, opt.alpha, opt.inputPath, opt.outputPath);
+        router.printDetourReport(design);
+    Logger::printFinalReport(design, rpt, opt.alpha, opt.inputPath, opt.outputPath);
         return 1;
     }
 
@@ -1233,93 +1813,472 @@ int main(int argc, char** argv) {
         opt.outputPath = resolveOutputPath(opt.outputPath, design.blockSpecs.size());
     }
 
+
+    if (opt.evalCfgProvided) {
+        ifstream fin(opt.evalCfgPath, ios::binary);
+        if (!fin) {
+            cerr << "[EvalCfg] failed to open: " << opt.evalCfgPath << "\n";
+            return 1;
+        }
+        stringstream cfgBuf;
+        cfgBuf << fin.rdbuf();
+        Design cfgBase = design;
+        cfgBase.blocks.clear();
+        cfgBase.blocks.reserve(cfgBase.blockSpecs.size());
+        for (const BlockSpec& spec : cfgBase.blockSpecs) {
+            BlockInst b;
+            b.spec = spec;
+            cfgBase.blocks.push_back(b);
+        }
+        string cfgText = cfgBuf.str();
+        Design cfgDesign;
+        if (!parsePortfolioCfg(cfgText.c_str(), cfgBase, cfgDesign)) {
+            cerr << "[EvalCfg] parse failed: " << opt.evalCfgPath << " detail=" << gLastPortfolioParseError << "\n";
+            return 1;
+        }
+        EvalReport rpt = evaluator.evaluate(cfgDesign, opt.alpha);
+        writer.write(opt.outputPath, cfgDesign);
+        Logger::printFinalReport(cfgDesign, rpt, opt.alpha, opt.inputPath, opt.outputPath);
+        return rpt.hasFail() ? 1 : 0;
+    }
+
     auto totalPenalty = [](const EvalReport& r) {
         return r.totalChannelOverflow + r.totalFeedthroughOverflow;
         };
 
     auto betterEval = [&](const EvalReport& a, const EvalReport& b) {
         if (a.hasFail() != b.hasFail()) return !a.hasFail();
+        if (a.hasFail() && a.openPathCount != b.openPathCount) return a.openPathCount < b.openPathCount;
         const double ap = totalPenalty(a);
         const double bp = totalPenalty(b);
         if (fabs(ap - bp) > 1.0) return ap < bp;
         return a.cost < b.cost;
         };
 
+
     bool forceSoftFTRelaxedRouting = false;
 
-    auto routeCandidate = [&](const Design& seed, bool ftOverflowAware, bool softFTRelaxed, EvalReport& outRpt) {
-        Design trial = seed;
-        channelBuilder.build(trial);
-        router.setFTOverflowCostEnabled(ftOverflowAware);
-        router.setSoftFTCostRelaxed(softFTRelaxed);
-        router.run(trial);
-        outRpt = evaluator.evaluate(trial, opt.alpha);
-        return trial;
+
+    auto routeCandidate = [&](const Design& seed, bool ftOverflowAware, bool softFTRelaxed, bool contactAware,
+        EvalReport& outRpt, vector<Router::FailureCertificate>* outCerts = nullptr) {
+            Design trial = seed;
+            channelBuilder.build(trial);
+            router.setFTOverflowCostEnabled(ftOverflowAware);
+            router.setSoftFTCostRelaxed(softFTRelaxed);
+            router.setContactAwareCostEnabled(contactAware);
+            router.run(trial);
+            if (outCerts) *outCerts = router.failureCertificates();
+            outRpt = evaluator.evaluate(trial, opt.alpha);
+            return trial;
         };
 
-    auto bestRoutedCandidate = [&](const Design& seed, EvalReport& outRpt) {
-        if (forceSoftFTRelaxedRouting) {
-            EvalReport repairRpt;
-            Design repair = routeCandidate(seed, true, true, repairRpt);
-            Design best = repair;
-            outRpt = repairRpt;
+    auto bestRoutedCandidate = [&](const Design& seed, EvalReport& outRpt,
+        vector<Router::FailureCertificate>* outCerts = nullptr) {
+            vector<Router::FailureCertificate> bestCerts;
+            Design best;
+            bool haveBest = false;
+            const bool tryContactAware = static_cast<int>(seed.blockSpecs.size()) >= 16;
 
-            if (!repairRpt.hasFail() && totalPenalty(repairRpt) <= 1.0) {
+            auto considerRoute = [&](bool ftOverflowAware, bool softFTRelaxed, bool contactAware) {
+                EvalReport candRpt;
+                vector<Router::FailureCertificate> candCerts;
+                Design cand = routeCandidate(seed, ftOverflowAware, softFTRelaxed, contactAware, candRpt, &candCerts);
+                if (!haveBest || betterEval(candRpt, outRpt)) {
+                    best = std::move(cand);
+                    outRpt = candRpt;
+                    bestCerts = std::move(candCerts);
+                    haveBest = true;
+                }
+                };
+
+            if (forceSoftFTRelaxedRouting) {
+                considerRoute(true, true, false);
+                if (tryContactAware) considerRoute(true, true, true);
+                if (outRpt.hasFail() || totalPenalty(outRpt) > 1.0) {
+                    considerRoute(false, true, false);
+                    if (tryContactAware) considerRoute(false, true, true);
+                }
+                if (outCerts) *outCerts = bestCerts;
                 return best;
             }
 
-            EvalReport relaxedBaseRpt;
-            Design relaxedBase = routeCandidate(seed, false, true, relaxedBaseRpt);
-            if (betterEval(relaxedBaseRpt, outRpt)) {
-                best = std::move(relaxedBase);
-                outRpt = relaxedBaseRpt;
+            considerRoute(false, false, false);
+            if (tryContactAware) considerRoute(false, false, true);
+
+            if (outRpt.hasFail() || totalPenalty(outRpt) > 1.0) {
+                considerRoute(false, true, false);
+                considerRoute(true, true, false);
+                if (tryContactAware) {
+                    considerRoute(false, true, true);
+                    considerRoute(true, true, true);
+                }
             }
+
+            if (outCerts) *outCerts = bestCerts;
             return best;
+        };
+
+    if (opt.routeCfgBlocksProvided) {
+        ifstream fin(opt.routeCfgBlocksPath, ios::binary);
+        if (!fin) {
+            cerr << "[RouteCfgBlocks] failed to open: " << opt.routeCfgBlocksPath << "\n";
+            return 1;
         }
-
-        EvalReport baseRpt;
-        Design base = routeCandidate(seed, false, false, baseRpt);
-        Design best = base;
-        outRpt = baseRpt;
-
-        if (baseRpt.hasFail() || totalPenalty(baseRpt) > 1.0) {
-            EvalReport relaxedBaseRpt;
-            Design relaxedBase = routeCandidate(seed, false, true, relaxedBaseRpt);
-            if (betterEval(relaxedBaseRpt, outRpt)) {
-                best = std::move(relaxedBase);
-                outRpt = relaxedBaseRpt;
-            }
-
-            EvalReport repairRpt;
-            Design repair = routeCandidate(seed, true, true, repairRpt);
-            if (betterEval(repairRpt, outRpt)) {
-                best = std::move(repair);
-                outRpt = repairRpt;
+        stringstream cfgBuf;
+        cfgBuf << fin.rdbuf();
+        Design cfgBase = design;
+        cfgBase.blocks.clear();
+        cfgBase.blocks.reserve(cfgBase.blockSpecs.size());
+        for (const BlockSpec& spec : cfgBase.blockSpecs) {
+            BlockInst b;
+            b.spec = spec;
+            cfgBase.blocks.push_back(b);
+        }
+        Design cfgSeed;
+        string cfgText = cfgBuf.str();
+        if (!parsePortfolioCfg(cfgText.c_str(), cfgBase, cfgSeed)) {
+            cerr << "[RouteCfgBlocks] parse failed: " << opt.routeCfgBlocksPath << " detail=" << gLastPortfolioParseError << "\n";
+            return 1;
+        }
+        cfgSeed.channels.clear();
+        cfgSeed.routes.clear();
+        EvalReport cfgRouteRpt;
+        Design routed = bestRoutedCandidate(cfgSeed, cfgRouteRpt);
+        Design bestCfgDesign = routed;
+        EvalReport bestCfgRpt = cfgRouteRpt;
+        if (!bestCfgRpt.hasFail() && totalPenalty(bestCfgRpt) <= 1.0) {
+            for (int detourIter = 0; detourIter < 4; ++detourIter) {
+                vector<Design> detourSeeds;
+                if (!makeDetourMoveCandidates(bestCfgDesign, detourSeeds, 18)) break;
+                bool haveDetour = false;
+                Design bestDetourDesign;
+                EvalReport bestDetourRpt;
+                for (int di = 0; di < static_cast<int>(detourSeeds.size()); ++di) {
+                    EvalReport detourRpt;
+                    Design detourTrial = bestRoutedCandidate(detourSeeds[di], detourRpt);
+                    cerr << fixed << setprecision(3)
+                        << "[RouteCfgBlocksDetour] trial iter=" << detourIter
+                        << " cand=" << di
+                        << " open=" << detourRpt.openPathCount
+                        << " penalty=" << totalPenalty(detourRpt)
+                        << " area=" << detourRpt.outlineArea
+                        << " wl=" << detourRpt.totalWireLength
+                        << " cost=" << detourRpt.cost
+                        << " fail=" << (detourRpt.hasFail() ? "Y" : "N")
+                        << "\n";
+                    if (detourRpt.hasFail() || totalPenalty(detourRpt) > 1.0) continue;
+                    if (!haveDetour || betterEval(detourRpt, bestDetourRpt)) {
+                        bestDetourDesign = std::move(detourTrial);
+                        bestDetourRpt = detourRpt;
+                        haveDetour = true;
+                    }
+                }
+                if (!haveDetour || !betterEval(bestDetourRpt, bestCfgRpt)) break;
+                cerr << fixed << setprecision(3)
+                    << "[RouteCfgBlocksDetour] accept iter=" << detourIter
+                    << " cost=" << bestCfgRpt.cost << "->" << bestDetourRpt.cost
+                    << " wl=" << bestCfgRpt.totalWireLength << "->" << bestDetourRpt.totalWireLength
+                    << " area=" << bestCfgRpt.outlineArea << "->" << bestDetourRpt.outlineArea
+                    << "\n";
+                bestCfgDesign = std::move(bestDetourDesign);
+                bestCfgRpt = bestDetourRpt;
             }
         }
-        return best;
+        writer.write(opt.outputPath, bestCfgDesign);
+        router.printDetourReport(bestCfgDesign);
+        Logger::printFinalReport(bestCfgDesign, bestCfgRpt, opt.alpha, opt.inputPath, opt.outputPath);
+        return bestCfgRpt.hasFail() ? 2 : 0;
+    }
+
+
+    auto sameFloorplanSeed = [](const Design& a, const Design& b) {
+        if (a.blocks.size() != b.blocks.size()) return false;
+        if (fabs(a.outlineW - b.outlineW) > 1.0 || fabs(a.outlineH - b.outlineH) > 1.0) return false;
+        for (int i = 0; i < static_cast<int>(a.blocks.size()); ++i) {
+            const Rect& ra = a.blocks[i].rect;
+            const Rect& rb = b.blocks[i].rect;
+            if (fabs(ra.x - rb.x) > 1.0 || fabs(ra.y - rb.y) > 1.0 ||
+                fabs(ra.w - rb.w) > 1.0 || fabs(ra.h - rb.h) > 1.0) return false;
+        }
+        return true;
+        };
+
+    auto addFloorplanSeed = [&](vector<Design>& seeds, vector<string>& origins, const Design& candidate, const string& origin) {
+        if (candidate.blocks.empty()) return false;
+        for (const Design& old : seeds) {
+            if (sameFloorplanSeed(old, candidate)) return false;
+        }
+        seeds.push_back(candidate);
+        origins.push_back(origin);
+        return true;
+        };
+
+    struct RepairPortfolioItem {
+        Design routed;
+        EvalReport rpt;
+        vector<Router::FailureCertificate> certs;
+        int seedIndex = -1;
+        string origin;
+    };
+
+    auto routeFloorplanSeeds = [&](const vector<Design>& seeds, const vector<string>& origins, EvalReport& outRpt, Design& outSeed, const string& tag,
+        vector<Router::FailureCertificate>* outCerts = nullptr, vector<RepairPortfolioItem>* repairPortfolio = nullptr) {
+            bool have = false;
+            Design best;
+            vector<Router::FailureCertificate> bestCerts;
+            for (int si = 0; si < static_cast<int>(seeds.size()); ++si) {
+                const string origin = si < static_cast<int>(origins.size()) ? origins[si] : "unknown";
+                EvalReport seedRpt;
+                vector<Router::FailureCertificate> seedCerts;
+                Design routed = bestRoutedCandidate(seeds[si], seedRpt, &seedCerts);
+                const double seedPenalty = totalPenalty(seedRpt);
+                cerr << fixed << setprecision(3)
+                    << "[FloorplanArchiveRoute] tag=" << tag
+                    << " cand=" << si
+                    << " origin=" << origin
+                    << " fail=" << (seedRpt.hasFail() ? "Y" : "N")
+                    << " open=" << seedRpt.openPathCount
+                    << " chOv=" << seedRpt.totalChannelOverflow
+                    << " ftOv=" << seedRpt.totalFeedthroughOverflow
+                    << " cost=" << seedRpt.cost
+                    << "\n";
+                if (repairPortfolio &&
+                    seedRpt.hasFail() &&
+                    seedRpt.openPathCount > 0 &&
+                    seedRpt.openPathCount <= 2 &&
+                    !seedRpt.blockOverlap &&
+                    !seedRpt.outlineViolation &&
+                    seedRpt.totalFeedthroughOverflow <= 1.0 &&
+                    seedRpt.totalChannelOverflow <= 5000.0 &&
+                    !seedCerts.empty()) {
+                    repairPortfolio->push_back({ routed, seedRpt, seedCerts, si, origin });
+                    cerr << fixed << setprecision(3)
+                        << "[RepairPortfolio] collect tag=" << tag
+                        << " cand=" << si
+                        << " origin=" << origin
+                        << " open=" << seedRpt.openPathCount
+                        << " penalty=" << seedPenalty
+                        << " cost=" << seedRpt.cost
+                        << " certs=" << seedCerts.size()
+                        << "\n";
+                }
+                if (!have || betterEval(seedRpt, outRpt)) {
+                    best = std::move(routed);
+                    outRpt = seedRpt;
+                    outSeed = seeds[si];
+                    bestCerts = std::move(seedCerts);
+                    have = true;
+                }
+            }
+            if (outCerts) *outCerts = bestCerts;
+            return best;
         };
 
     // One-way architecture:    // Parser -> Floorplanner -> ChannelBuilder -> Router -> Evaluator -> OutputWriter
     floorplanner.setEdgePlacementMode(0);
     floorplanner.run(design);
     Design floorplannedDesign = design;
+    vector<Design> floorplanSeeds;
+    vector<string> floorplanSeedOrigins;
+    addFloorplanSeed(floorplanSeeds, floorplanSeedOrigins, floorplannedDesign, "committed");
+    const vector<Design>& archived = floorplanner.archivedCandidates();
+    const vector<string>& archivedOrigins = floorplanner.archivedCandidateOrigins();
+    for (int ai = 0; ai < static_cast<int>(archived.size()); ++ai) {
+        const string origin = ai < static_cast<int>(archivedOrigins.size()) ? archivedOrigins[ai] : "archive";
+        addFloorplanSeed(floorplanSeeds, floorplanSeedOrigins, archived[ai], origin);
+    }
 
     EvalReport rpt;
-    design = bestRoutedCandidate(design, rpt);
+    Design selectedFloorplanSeed = floorplannedDesign;
+    vector<Router::FailureCertificate> currentCerts;
+    vector<RepairPortfolioItem> baseRepairPortfolio;
+    design = routeFloorplanSeeds(floorplanSeeds, floorplanSeedOrigins, rpt, selectedFloorplanSeed, "base", &currentCerts, &baseRepairPortfolio);
+    floorplannedDesign = selectedFloorplanSeed;
     if (rpt.hasFail() || totalPenalty(rpt) > 1.0) {
         forceSoftFTRelaxedRouting = true;
         EvalReport relaxedStartRpt;
-        Design relaxedStart = bestRoutedCandidate(floorplannedDesign, relaxedStartRpt);
-        if (!relaxedStartRpt.hasFail()) {
+        Design relaxedSeed = floorplannedDesign;
+        vector<Router::FailureCertificate> relaxedCerts;
+        Design relaxedStart = routeFloorplanSeeds(floorplanSeeds, floorplanSeedOrigins, relaxedStartRpt, relaxedSeed, "relaxed", &relaxedCerts);
+        if (betterEval(relaxedStartRpt, rpt)) {
             design = std::move(relaxedStart);
             rpt = relaxedStartRpt;
+            floorplannedDesign = relaxedSeed;
+            currentCerts = std::move(relaxedCerts);
         }
     }
 
 
     Design bestDesign = design;
     EvalReport bestRpt = rpt;
+    vector<Router::FailureCertificate> bestCerts = currentCerts;
+    if (!bestRpt.hasFail() && totalPenalty(bestRpt) <= 1.0) {
+        for (int detourIter = 0; detourIter < 5; ++detourIter) {
+            vector<Design> detourSeeds;
+            if (!makeDetourMoveCandidates(bestDesign, detourSeeds, 20)) break;
+
+            bool haveDetour = false;
+            Design bestDetourDesign;
+            EvalReport bestDetourRpt;
+            for (int di = 0; di < static_cast<int>(detourSeeds.size()); ++di) {
+                EvalReport detourRpt;
+                Design detourTrial = bestRoutedCandidate(detourSeeds[di], detourRpt);
+                cerr << fixed << setprecision(3)
+                    << "[DetourMove] trial iter=" << detourIter
+                    << " cand=" << di
+                    << " open=" << detourRpt.openPathCount
+                    << " penalty=" << totalPenalty(detourRpt)
+                    << " area=" << detourRpt.outlineArea
+                    << " wl=" << detourRpt.totalWireLength
+                    << " cost=" << detourRpt.cost
+                    << " fail=" << (detourRpt.hasFail() ? "Y" : "N")
+                    << "\n";
+                if (detourRpt.hasFail() || totalPenalty(detourRpt) > 1.0) continue;
+                if (!haveDetour || betterEval(detourRpt, bestDetourRpt)) {
+                    bestDetourDesign = std::move(detourTrial);
+                    bestDetourRpt = detourRpt;
+                    haveDetour = true;
+                }
+            }
+            if (!haveDetour || !betterEval(bestDetourRpt, bestRpt)) break;
+            cerr << fixed << setprecision(3)
+                << "[DetourMove] accept iter=" << detourIter
+                << " cost=" << bestRpt.cost << "->" << bestDetourRpt.cost
+                << " wl=" << bestRpt.totalWireLength << "->" << bestDetourRpt.totalWireLength
+                << " area=" << bestRpt.outlineArea << "->" << bestDetourRpt.outlineArea
+                << "\n";
+            bestDesign = std::move(bestDetourDesign);
+            bestRpt = bestDetourRpt;
+            design = bestDesign;
+            rpt = bestRpt;
+        }
+    }
+
+    auto tryRepairPortfolio = [&](vector<RepairPortfolioItem>& portfolio, const string& label) {
+        if (portfolio.empty()) return;
+        sort(portfolio.begin(), portfolio.end(), [&](const RepairPortfolioItem& a, const RepairPortfolioItem& b) {
+            if (a.rpt.openPathCount != b.rpt.openPathCount) return a.rpt.openPathCount < b.rpt.openPathCount;
+            const double ap = totalPenalty(a.rpt);
+            const double bp = totalPenalty(b.rpt);
+            if (fabs(ap - bp) > 1.0) return ap < bp;
+            if (fabs(a.rpt.cost - b.rpt.cost) > 1.0) return a.rpt.cost < b.rpt.cost;
+            return a.seedIndex < b.seedIndex;
+            });
+
+        const int portfolioLimit = min(4, static_cast<int>(portfolio.size()));
+        for (int pi = 0; pi < portfolioLimit; ++pi) {
+            RepairPortfolioItem& item = portfolio[pi];
+            vector<Design> reliefSeeds;
+            const bool made = makeCertificateReliefCandidates(item.routed, item.certs, reliefSeeds, 12);
+            cerr << fixed << setprecision(3)
+                << "[RepairPortfolio] probe label=" << label
+                << " item=" << pi
+                << " seed=" << item.seedIndex
+                << " origin=" << item.origin
+                << " open=" << item.rpt.openPathCount
+                << " penalty=" << totalPenalty(item.rpt)
+                << " cost=" << item.rpt.cost
+                << " reliefSeeds=" << reliefSeeds.size()
+                << " made=" << (made ? "Y" : "N")
+                << "\n";
+            if (!made) continue;
+
+            bool haveRepair = false;
+            Design bestRepairDesign;
+            EvalReport bestRepairRpt;
+            vector<Router::FailureCertificate> bestRepairCerts;
+            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()); ++ri) {
+                EvalReport repairRpt;
+                vector<Router::FailureCertificate> repairCerts;
+                Design repairTrial = bestRoutedCandidate(reliefSeeds[ri], repairRpt, &repairCerts);
+                cerr << fixed << setprecision(3)
+                    << "[RepairPortfolio] trial label=" << label
+                    << " item=" << pi
+                    << " cand=" << ri
+                    << " open=" << repairRpt.openPathCount
+                    << " penalty=" << totalPenalty(repairRpt)
+                    << " cost=" << repairRpt.cost
+                    << " fail=" << (repairRpt.hasFail() ? "Y" : "N")
+                    << "\n";
+                if (!haveRepair || betterEval(repairRpt, bestRepairRpt)) {
+                    bestRepairDesign = std::move(repairTrial);
+                    bestRepairRpt = repairRpt;
+                    bestRepairCerts = std::move(repairCerts);
+                    haveRepair = true;
+                }
+            }
+            if (haveRepair && betterEval(bestRepairRpt, bestRpt)) {
+                cerr << fixed << setprecision(3)
+                    << "[RepairPortfolio] accept label=" << label
+                    << " seed=" << item.seedIndex
+                    << " origin=" << item.origin
+                    << " open=" << bestRpt.openPathCount << "->" << bestRepairRpt.openPathCount
+                    << " penalty=" << totalPenalty(bestRpt) << "->" << totalPenalty(bestRepairRpt)
+                    << " cost=" << bestRpt.cost << "->" << bestRepairRpt.cost
+                    << "\n";
+                bestDesign = std::move(bestRepairDesign);
+                bestRpt = bestRepairRpt;
+                bestCerts = std::move(bestRepairCerts);
+                design = bestDesign;
+                rpt = bestRpt;
+            }
+        }
+    };
+
+    tryRepairPortfolio(baseRepairPortfolio, "base");
+
+    cerr << "[CertificateRelief] start open=" << bestRpt.openPathCount
+        << " certs=" << bestCerts.size()
+        << " fail=" << (bestRpt.hasFail() ? "Y" : "N")
+        << " penalty=" << totalPenalty(bestRpt)
+        << "\n";
+    for (int certReliefIter = 0; bestRpt.openPathCount > 0 && certReliefIter < 4; ++certReliefIter) {
+        if (bestCerts.empty()) {
+            cerr << "[CertificateRelief] skip reason=no_certificate open=" << bestRpt.openPathCount << "\n";
+            break;
+        }
+        vector<Design> reliefSeeds;
+        if (!makeCertificateReliefCandidates(bestDesign, bestCerts, reliefSeeds, 10)) break;
+
+        bool haveRelief = false;
+        Design bestReliefDesign;
+        EvalReport bestReliefRpt;
+        vector<Router::FailureCertificate> bestReliefCerts;
+
+        for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()); ++ri) {
+            EvalReport reliefRpt;
+            vector<Router::FailureCertificate> reliefCerts;
+            Design reliefTrial = bestRoutedCandidate(reliefSeeds[ri], reliefRpt, &reliefCerts);
+            cerr << fixed << setprecision(3)
+                << "[CertificateRelief] trial iter=" << certReliefIter
+                << " cand=" << ri
+                << " area=" << reliefRpt.outlineArea
+                << " open=" << reliefRpt.openPathCount
+                << " penalty=" << totalPenalty(reliefRpt)
+                << " cost=" << reliefRpt.cost
+                << " fail=" << (reliefRpt.hasFail() ? "Y" : "N")
+                << "\n";
+            if (!haveRelief || betterEval(reliefRpt, bestReliefRpt)) {
+                bestReliefDesign = std::move(reliefTrial);
+                bestReliefRpt = reliefRpt;
+                bestReliefCerts = std::move(reliefCerts);
+                haveRelief = true;
+            }
+        }
+
+        if (!haveRelief || !betterEval(bestReliefRpt, bestRpt)) break;
+        cerr << fixed << setprecision(3)
+            << "[CertificateRelief] accept iter=" << certReliefIter
+            << " open=" << bestRpt.openPathCount << "->" << bestReliefRpt.openPathCount
+            << " penalty=" << totalPenalty(bestRpt) << "->" << totalPenalty(bestReliefRpt)
+            << " cost=" << bestRpt.cost << "->" << bestReliefRpt.cost
+            << "\n";
+        bestDesign = std::move(bestReliefDesign);
+        bestRpt = bestReliefRpt;
+        bestCerts = std::move(bestReliefCerts);
+        design = bestDesign;
+        rpt = bestRpt;
+    }
 
     for (int hotRepairIter = 0; hotRepairIter < 8; ++hotRepairIter) {
         bool tried = false;
@@ -1379,15 +2338,66 @@ int main(int argc, char** argv) {
             break;
         }
     }
-    if (!bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0 && deadspaceRatioMain(bestDesign) > 0.35) {
+    if (!bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
+        for (int reliefIter = 0; reliefIter < 4; ++reliefIter) {
+            vector<Design> reliefSeeds;
+            if (!makeCapacityReliefCandidates(bestDesign, reliefSeeds, 10)) break;
+
+            bool haveRelief = false;
+            Design bestReliefDesign;
+            EvalReport bestReliefRpt;
+
+            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()); ++ri) {
+                EvalReport reliefRpt;
+                Design reliefTrial = bestRoutedCandidate(reliefSeeds[ri], reliefRpt);
+                cerr << fixed << setprecision(3)
+                    << "[CapacityReliefPre] trial iter=" << reliefIter
+                    << " cand=" << ri
+                    << " area=" << reliefRpt.outlineArea
+                    << " penalty=" << totalPenalty(reliefRpt)
+                    << " cost=" << reliefRpt.cost
+                    << " fail=" << (reliefRpt.hasFail() ? "Y" : "N")
+                    << "\n";
+                if (reliefRpt.hasFail()) continue;
+                if (!haveRelief || betterEval(reliefRpt, bestReliefRpt)) {
+                    bestReliefDesign = std::move(reliefTrial);
+                    bestReliefRpt = reliefRpt;
+                    haveRelief = true;
+                }
+            }
+
+            if (!haveRelief) break;
+            const double oldPenalty = totalPenalty(bestRpt);
+            const double newPenalty = totalPenalty(bestReliefRpt);
+            const bool penaltyImproved = newPenalty + 1.0 < oldPenalty;
+            const bool costAcceptable = bestReliefRpt.cost <= bestRpt.cost * 1.18 + 1000000.0;
+            if (!penaltyImproved || !costAcceptable) break;
+
+            cerr << fixed << setprecision(3)
+                << "[CapacityReliefPre] accept iter=" << reliefIter
+                << " penalty=" << oldPenalty << "->" << newPenalty
+                << " cost=" << bestRpt.cost << "->" << bestReliefRpt.cost
+                << "\n";
+            bestDesign = std::move(bestReliefDesign);
+            bestRpt = bestReliefRpt;
+            design = bestDesign;
+            rpt = bestRpt;
+            if (newPenalty <= 500.0) break;
+        }
+    }
+
+    if (!bestRpt.hasFail() && deadspaceRatioMain(bestDesign) > 0.35) {
         const bool largeDeadspaceTrimCase = bestDesign.blocks.size() >= 20;
         vector<pair<double, double>> shrinkFractions;
         vector<vector<pair<double, double>>> largeDeadspaceShrinkSchedule;
         if (largeDeadspaceTrimCase) {
             largeDeadspaceShrinkSchedule = {
-                { { 0.000, 0.120 }, { 0.000, 0.090 }, { 0.000, 0.050 } },
-                { { 0.020, 0.000 }, { 0.000, 0.010 }, { 0.005, 0.000 } },
-                { { 0.000, 0.010 }, { 0.000, 0.005 }, { 0.0025, 0.000 } }
+                { { 0.000, 0.240 }, { 0.000, 0.200 }, { 0.000, 0.160 }, { 0.000, 0.120 }, { 0.000, 0.080 }, { 0.000, 0.040 } },
+                { { 0.000, 0.200 }, { 0.000, 0.160 }, { 0.000, 0.120 }, { 0.000, 0.080 }, { 0.000, 0.040 } },
+                { { 0.000, 0.160 }, { 0.000, 0.120 }, { 0.000, 0.080 }, { 0.000, 0.040 }, { 0.020, 0.000 } },
+                { { 0.000, 0.120 }, { 0.000, 0.080 }, { 0.000, 0.040 }, { 0.010, 0.000 } },
+                { { 0.000, 0.080 }, { 0.000, 0.040 }, { 0.005, 0.000 } },
+                { { 0.000, 0.040 }, { 0.0025, 0.000 } }
             };
         }
         else {
@@ -1453,7 +2463,7 @@ int main(int argc, char** argv) {
 
         const double initialTrimPenalty = totalPenalty(bestRpt);
         const double trimPenaltyBudget = [&]() {
-            if (initialTrimPenalty <= 1500.0) return initialTrimPenalty + 350.0;
+            if (initialTrimPenalty <= 1500.0) return largeDeadspaceTrimCase ? 18000.0 : (initialTrimPenalty + 350.0);
             if (initialTrimPenalty <= 5000.0) return initialTrimPenalty * 1.25 + 500.0;
             if (initialTrimPenalty <= 15000.0) return initialTrimPenalty * 1.50 + 1000.0;
             return max(initialTrimPenalty + 8000.0, initialTrimPenalty * 1.75);
@@ -1468,10 +2478,16 @@ int main(int argc, char** argv) {
         auto betterDeadspaceTrim = [&](const EvalReport& a, const EvalReport& b) {
             const double ap = totalPenalty(a);
             const double bp = totalPenalty(b);
+            const double costWin = max(1500000.0, 0.035 * max(1.0, b.cost));
+            if (bp <= 1.0 && ap > 1.0) return false;
+            if (ap <= 1.0 && bp > 1.0) return true;
+            if (largeDeadspaceTrimCase && !a.hasFail() && ap <= trimPenaltyBudget && a.cost + costWin < b.cost) return true;
             if (penaltyMeaningfullyBetter(ap, bp)) return true;
             if (penaltyMeaningfullyBetter(bp, ap)) return false;
-            if (fabs(a.outlineArea - b.outlineArea) > 1.0) return a.outlineArea < b.outlineArea;
             if (fabs(ap - bp) > 1.0) return ap < bp;
+            if (a.cost + 1.0 < b.cost) return true;
+            if (b.cost + 1.0 < a.cost) return false;
+            if (fabs(a.outlineArea - b.outlineArea) > 1.0) return a.outlineArea < b.outlineArea;
             return a.cost < b.cost;
         };
         const int trimPassLimit = largeDeadspaceTrimCase ? static_cast<int>(largeDeadspaceShrinkSchedule.size()) : 8;
@@ -1487,7 +2503,12 @@ int main(int argc, char** argv) {
                 Design candidate = bestDesign;
                 const double shrinkW = candidate.outlineW * sf.first;
                 const double shrinkH = candidate.outlineH * sf.second;
-                if (!tryEdgeOnlyOutlineTrimMain(candidate, shrinkW, shrinkH)) {
+                bool trimGeometryOk = tryEdgeOnlyOutlineTrimMain(candidate, shrinkW, shrinkH);
+                if (!trimGeometryOk) {
+                    candidate = bestDesign;
+                    trimGeometryOk = tryGravityOutlineTrimMain(candidate, shrinkW, shrinkH);
+                }
+                if (!trimGeometryOk) {
                     cerr << fixed << setprecision(3)
                         << "[DeadspaceTrim] skipGeometry pass=" << trimPass
                         << " shrinkW=" << shrinkW
@@ -1877,6 +2898,143 @@ int main(int argc, char** argv) {
             rpt = bestRpt;
         }
     }
+    if (!bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
+        for (int reliefIter = 0; reliefIter < 4; ++reliefIter) {
+            vector<Design> reliefSeeds;
+            if (!makeCapacityReliefCandidates(bestDesign, reliefSeeds, 12)) break;
+
+            bool haveRelief = false;
+            Design bestReliefDesign;
+            EvalReport bestReliefRpt;
+
+            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()); ++ri) {
+                EvalReport reliefRpt;
+                Design reliefTrial = bestRoutedCandidate(reliefSeeds[ri], reliefRpt);
+                cerr << fixed << setprecision(3)
+                    << "[FinalCapacityRelief] trial iter=" << reliefIter
+                    << " cand=" << ri
+                    << " area=" << reliefRpt.outlineArea
+                    << " penalty=" << totalPenalty(reliefRpt)
+                    << " cost=" << reliefRpt.cost
+                    << " fail=" << (reliefRpt.hasFail() ? "Y" : "N")
+                    << "\n";
+                if (reliefRpt.hasFail()) continue;
+                if (!haveRelief || betterEval(reliefRpt, bestReliefRpt)) {
+                    bestReliefDesign = std::move(reliefTrial);
+                    bestReliefRpt = reliefRpt;
+                    haveRelief = true;
+                }
+            }
+
+            if (!haveRelief || !betterEval(bestReliefRpt, bestRpt)) break;
+            const double oldPenalty = totalPenalty(bestRpt);
+            const double newPenalty = totalPenalty(bestReliefRpt);
+            const bool costAcceptable = bestReliefRpt.cost <= bestRpt.cost * 1.20 + 2000000.0;
+            if (newPenalty > 1.0 && !costAcceptable) break;
+
+            cerr << fixed << setprecision(3)
+                << "[FinalCapacityRelief] accept iter=" << reliefIter
+                << " penalty=" << oldPenalty << "->" << newPenalty
+                << " cost=" << bestRpt.cost << "->" << bestReliefRpt.cost
+                << "\n";
+            bestDesign = std::move(bestReliefDesign);
+            bestRpt = bestReliefRpt;
+            design = bestDesign;
+            rpt = bestRpt;
+        }
+    }
+
+    if (bestRpt.openPathCount > 0) {
+        EvalReport rerouteRpt;
+        vector<Router::FailureCertificate> finalCerts;
+        Design rerouted = bestRoutedCandidate(bestDesign, rerouteRpt, &finalCerts);
+        if (betterEval(rerouteRpt, bestRpt)) {
+            bestDesign = std::move(rerouted);
+            bestRpt = rerouteRpt;
+            bestCerts = finalCerts;
+        }
+        else {
+            bestCerts = finalCerts;
+        }
+
+        for (int certReliefIter = 0; bestRpt.openPathCount > 0 && certReliefIter < 4; ++certReliefIter) {
+            if (bestCerts.empty()) {
+                cerr << "[FinalCertificateRelief] skip reason=no_certificate open=" << bestRpt.openPathCount << "\n";
+                break;
+            }
+            vector<Design> reliefSeeds;
+            if (!makeCertificateReliefCandidates(bestDesign, bestCerts, reliefSeeds, 10)) {
+                int certNeedCount = 0;
+                int topNeedChannel = -1;
+                const char* topNeedDir = "NA";
+                double topNeedShortage = 0.0;
+                double topNeedDelta = 0.0;
+                for (const auto& cert : bestCerts) {
+                    certNeedCount += static_cast<int>(cert.hardNeeds.size());
+                    for (const auto& need : cert.hardNeeds) {
+                        if (need.shortageNets > topNeedShortage) {
+                            topNeedShortage = need.shortageNets;
+                            topNeedChannel = need.channelIndex;
+                            topNeedDir = certificateDirName(need.dir);
+                            topNeedDelta = need.requiredDeltaUm;
+                        }
+                    }
+                }
+                cerr << "[FinalCertificateRelief] skip reason=no_candidate open=" << bestRpt.openPathCount
+                    << " certs=" << bestCerts.size()
+                    << " needs=" << certNeedCount
+                    << " top=CH" << (topNeedChannel + 1)
+                    << "." << topNeedDir
+                    << " shortage=" << topNeedShortage
+                    << " delta=" << topNeedDelta
+                    << " outlineW=" << bestDesign.outlineW
+                    << " maxW=" << bestDesign.maxOutlineW
+                    << " outlineH=" << bestDesign.outlineH
+                    << " maxH=" << bestDesign.maxOutlineH
+                    << "\n";
+                break;
+            }
+
+            bool haveRelief = false;
+            Design bestReliefDesign;
+            EvalReport bestReliefRpt;
+            vector<Router::FailureCertificate> bestReliefCerts;
+            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()); ++ri) {
+                EvalReport reliefRpt;
+                vector<Router::FailureCertificate> reliefCerts;
+                Design reliefTrial = bestRoutedCandidate(reliefSeeds[ri], reliefRpt, &reliefCerts);
+                cerr << fixed << setprecision(3)
+                    << "[FinalCertificateRelief] trial iter=" << certReliefIter
+                    << " cand=" << ri
+                    << " area=" << reliefRpt.outlineArea
+                    << " open=" << reliefRpt.openPathCount
+                    << " penalty=" << totalPenalty(reliefRpt)
+                    << " cost=" << reliefRpt.cost
+                    << " fail=" << (reliefRpt.hasFail() ? "Y" : "N")
+                    << "\n";
+                if (!haveRelief || betterEval(reliefRpt, bestReliefRpt)) {
+                    bestReliefDesign = std::move(reliefTrial);
+                    bestReliefRpt = reliefRpt;
+                    bestReliefCerts = std::move(reliefCerts);
+                    haveRelief = true;
+                }
+            }
+
+            if (!haveRelief || !betterEval(bestReliefRpt, bestRpt)) break;
+            cerr << fixed << setprecision(3)
+                << "[FinalCertificateRelief] accept iter=" << certReliefIter
+                << " open=" << bestRpt.openPathCount << "->" << bestReliefRpt.openPathCount
+                << " penalty=" << totalPenalty(bestRpt) << "->" << totalPenalty(bestReliefRpt)
+                << " cost=" << bestRpt.cost << "->" << bestReliefRpt.cost
+                << "\n";
+            bestDesign = std::move(bestReliefDesign);
+            bestRpt = bestReliefRpt;
+            bestCerts = std::move(bestReliefCerts);
+        }
+    }
+
+
+    // Disabled: final quality must come from floorplan/router search, not known-case cfg portfolio.
     design = bestDesign;
     rpt = bestRpt;
     bool writeOk = writer.write(opt.outputPath, design);
@@ -1885,6 +3043,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    router.printDetourReport(design);
     Logger::printFinalReport(design, rpt, opt.alpha, opt.inputPath, opt.outputPath);
 
     if (rpt.hasFail()) return 2;

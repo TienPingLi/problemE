@@ -6,8 +6,13 @@ class Floorplanner {
 public:
     void setEdgePlacementMode(int mode);
     void run(Design& design);
+    const std::vector<Design>& archivedCandidates() const;
+    const std::vector<std::string>& archivedCandidateOrigins() const;
 
 private:
+    std::vector<Design> archiveDesigns;
+    std::vector<std::string> archiveOrigins;
+
     Rect makeInitialShape(const BlockSpec& spec) const;
     void initBlockShapes(Design& design);
     Rect placeByLocation(const Rect& shape, const std::string& loc, double W, double H) const;
