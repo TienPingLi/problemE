@@ -7,6 +7,7 @@
 #include "OutputWriter.hpp"
 #include "Logger.hpp"
 #include "Utility.hpp"
+#include "IOUtils.hpp"
 
 #include <algorithm>
 #include <array>
@@ -181,15 +182,15 @@ struct Options {
     double alpha = 1.0;
     bool alphaOverride = false;
 };
-
+/*
 static void printUsage() {
     cerr << "Usage:\n";
     cerr << "  ./EarlyFloorplanning_with_GlobalRoute input.csv\n";
     cerr << "\n";
     cerr << "Output defaults to the input filename with .cfg extension.\n";
     cerr << "Local debug options are still accepted: -o output.cfg --alpha 0.2 --eval-cfg candidate.cfg --route-cfg-blocks candidate.cfg\n";
-}
-
+}*/
+/*
 static Options parseArgs(int argc, char** argv) {
     Options opt;
 
@@ -230,9 +231,9 @@ static Options parseArgs(int argc, char** argv) {
     }
 
     return opt;
-}
+}*/
 
-static bool endsWithCfg(const string& s) {
+/*static bool endsWithCfg(const string& s) {
     if (s.size() < 4) return false;
 
     string tail = s.substr(s.size() - 4);
@@ -241,15 +242,15 @@ static bool endsWithCfg(const string& s) {
     }
 
     return tail == ".cfg";
-}
+}*/
 
-static string makeDefaultOutputPathFromInput(const string& inputPath) {
+/*static string makeDefaultOutputPathFromInput(const string& inputPath) {
     fs::path filename = fs::path(inputPath).filename();
     filename.replace_extension(".cfg");
     return filename.string();
-}
+}*/
 
-static tm getLocalTimeNow() {
+/*static tm getLocalTimeNow() {
     auto now = chrono::system_clock::now();
     time_t tt = chrono::system_clock::to_time_t(now);
 
@@ -261,11 +262,9 @@ static tm getLocalTimeNow() {
 #endif
 
     return localTm;
-}
+}*/
 
-// 產生檔名：07blk05240238.cfg
-// 格式：<兩位數block數>blk<月日時分>.cfg
-static string makeAutoCfgFileName(size_t blockCount) {
+/*static string makeAutoCfgFileName(size_t blockCount) {
     tm localTm = getLocalTimeNow();
 
     ostringstream oss;
@@ -279,13 +278,9 @@ static string makeAutoCfgFileName(size_t blockCount) {
         << ".cfg";
 
     return oss.str();
-}
+}*/
 
-// 如果 -o 給的是資料夾，例如 C:\problemE\problemE\result
-// 就自動變成 C:\problemE\problemE\result\07blk05240238.cfg
-//
-// 如果 -o 給的是完整檔名，例如 C:\problemE\problemE\result\my.cfg
-// 就照原本檔名輸出。
+/*
 static string resolveOutputPath(const string& rawOutputPath, size_t blockCount) {
     fs::path p(rawOutputPath);
 
@@ -310,7 +305,7 @@ static string resolveOutputPath(const string& rawOutputPath, size_t blockCount) 
     }
 
     return p.string();
-}
+}*/
 
 static double ftRateForNetsMain(const BlockSpec& spec, double ftNets) {
     if (ftNets <= 3000.0) return spec.ftRate[0];
@@ -519,7 +514,7 @@ static bool repairEdgeTrimOverlapsMain(Design& design) {
 
                 sort(moves.begin(), moves.end(), [](const pair<char, double>& a, const pair<char, double>& b) {
                     return fabs(a.second) < fabs(b.second);
-                });
+                    });
 
                 for (const auto& mv : moves) {
                     if (fabs(mv.second) <= EPS) continue;
@@ -1111,7 +1106,7 @@ static bool makeThinChannelAlignmentCandidates(const Design& design, vector<Desi
         s += max(0.0, 0.12 - util) * 3000.0;
         s -= used;
         hot.push_back({ i, thickness, s, horizontalGap });
-    };
+        };
 
     for (int i = 0; i < static_cast<int>(design.channels.size()); ++i) {
         const Channel& ch = design.channels[i];
@@ -1272,7 +1267,7 @@ static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, 
         if (fabs(a.excess - b.excess) > 1.0) return a.excess > b.excess;
         if (a.nets != b.nets) return a.nets > b.nets;
         return a.src < b.src;
-    });
+        });
 
     const int startCount = static_cast<int>(out.size());
     auto sameGeometry = [&](const Design& a, const Design& b) {
@@ -1284,7 +1279,7 @@ static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, 
                 fabs(ra.w - rb.w) > 0.5 || fabs(ra.h - rb.h) > 0.5) return false;
         }
         return true;
-    };
+        };
     auto addCandidate = [&](Design&& trial) {
         if (static_cast<int>(out.size()) >= maxCandidates) return;
         if (!placementLegalAfterMove(trial, trial.blocks)) return;
@@ -1292,14 +1287,14 @@ static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, 
         trial.routes.clear();
         for (const Design& old : out) if (sameGeometry(old, trial)) return;
         out.push_back(std::move(trial));
-    };
+        };
     auto tryOneAxis = [&](int id, double delta, bool xAxis) {
         if (static_cast<int>(out.size()) >= maxCandidates || fabs(delta) <= 1.0) return;
         Design trial = design;
         bool ok = xAxis ? tryMoveBlocksXWithClosure(trial, { id }, delta)
-                        : tryMoveBlocksYWithClosure(trial, { id }, delta);
+            : tryMoveBlocksYWithClosure(trial, { id }, delta);
         if (ok) addCandidate(std::move(trial));
-    };
+        };
     auto tryTwoAxis = [&](int id, double dx, double dy) {
         if (static_cast<int>(out.size()) >= maxCandidates || (fabs(dx) <= 1.0 && fabs(dy) <= 1.0)) return;
         Design trial = design;
@@ -1313,7 +1308,7 @@ static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, 
         if (fabs(dy) > 1.0) ok = ok && tryMoveBlocksYWithClosure(trial, { id }, dy);
         if (fabs(dx) > 1.0) ok = ok && tryMoveBlocksXWithClosure(trial, { id }, dx);
         if (ok) addCandidate(std::move(trial));
-    };
+        };
 
     const int pathLimit = min(14, static_cast<int>(hot.size()));
     const double maxStep = max(80.0, 0.075 * max(design.outlineW, design.outlineH));
@@ -1340,7 +1335,7 @@ static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, 
                 tryOneAxis(hp.dst, -sy, false);
                 tryTwoAxis(hp.dst, -sx, -sy);
             }
-if (blockMovableForHotRepair(design.blocks[hp.src].spec) && blockMovableForHotRepair(design.blocks[hp.dst].spec)) {
+            if (blockMovableForHotRepair(design.blocks[hp.src].spec) && blockMovableForHotRepair(design.blocks[hp.dst].spec)) {
                 Design trial = design;
                 bool ok = true;
                 if (fabs(sx) > 1.0) ok = ok && tryMoveBlocksXWithClosure(trial, { hp.src }, sx * 0.5);
@@ -1779,13 +1774,10 @@ static bool makeCertificateReliefCandidates(const Design& design, const vector<R
 }
 
 int main(int argc, char** argv) {
+
+    //1.create 
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
-
-    Options opt = parseArgs(argc, argv);
-    if (!opt.outputPathProvided) {
-        opt.outputPath = makeDefaultOutputPathFromInput(opt.inputPath);
-    }
 
     Design design;
     Parser parser;
@@ -1795,12 +1787,18 @@ int main(int argc, char** argv) {
     Evaluator evaluator;
     OutputWriter writer;
 
+    //read
+    IOUtils::Options opt = IOUtils::parseArgs(argc, argv);
+    if (!opt.outputPathProvided) {
+        opt.outputPath = IOUtils::makeDefaultOutputPathFromInput(opt.inputPath);
+    }
+
     bool parseOk = parser.read(opt.inputPath, design);
     if (!parseOk) {
         EvalReport rpt;
         rpt.formatFailed = true;
         router.printDetourReport(design);
-    Logger::printFinalReport(design, rpt, opt.alpha, opt.inputPath, opt.outputPath);
+        Logger::printFinalReport(design, rpt, opt.alpha, opt.inputPath, opt.outputPath);
         return 1;
     }
 
@@ -1810,7 +1808,7 @@ int main(int argc, char** argv) {
 
     // 讀完 parser 後才知道 block 數量，所以在這裡決定真正 output cfg 路徑。
     if (opt.outputPathProvided) {
-        opt.outputPath = resolveOutputPath(opt.outputPath, design.blockSpecs.size());
+        opt.outputPath = IOUtils::resolveOutputPath(opt.outputPath, design.blockSpecs.size());
     }
 
 
@@ -1842,6 +1840,7 @@ int main(int argc, char** argv) {
         return rpt.hasFail() ? 1 : 0;
     }
 
+    //set basic status
     auto totalPenalty = [](const EvalReport& r) {
         return r.totalChannelOverflow + r.totalFeedthroughOverflow;
         };
@@ -2223,7 +2222,7 @@ int main(int argc, char** argv) {
                 rpt = bestRpt;
             }
         }
-    };
+        };
 
     tryRepairPortfolio(baseRepairPortfolio, "base");
 
@@ -2294,7 +2293,7 @@ int main(int argc, char** argv) {
                 bestHotRpt = trialRpt;
                 hasTrial = true;
             }
-        };
+            };
 
         Design movedH = bestDesign;
         if (relieveHorizontalHotChannels(movedH)) {
@@ -2489,7 +2488,7 @@ int main(int argc, char** argv) {
             if (b.cost + 1.0 < a.cost) return false;
             if (fabs(a.outlineArea - b.outlineArea) > 1.0) return a.outlineArea < b.outlineArea;
             return a.cost < b.cost;
-        };
+            };
         const int trimPassLimit = largeDeadspaceTrimCase ? static_cast<int>(largeDeadspaceShrinkSchedule.size()) : 8;
         for (int trimPass = 0; trimPass < trimPassLimit; ++trimPass) {
             bool improved = false;
@@ -2534,7 +2533,7 @@ int main(int argc, char** argv) {
                                 bestRepairRpt = repairRpt;
                                 haveRepair = true;
                             }
-                        };
+                            };
 
                         Design movedH = routed;
                         if (relieveHorizontalHotChannels(movedH)) tryTrimRepair(movedH);
@@ -3049,6 +3048,3 @@ int main(int argc, char** argv) {
     if (rpt.hasFail()) return 2;
     return 0;
 }
-
-//git push test 
-//

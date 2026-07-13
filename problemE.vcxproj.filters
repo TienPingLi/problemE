@@ -45,6 +45,9 @@
     <ClCompile Include="Utility.cpp">
       <Filter>來源檔案</Filter>
     </ClCompile>
+    <ClCompile Include="IOUtils.cpp">
+      <Filter>來源檔案</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="ChannelBuilder.hpp">
@@ -72,6 +75,9 @@
       <Filter>標頭檔</Filter>
     </ClInclude>
     <ClInclude Include="Utility.hpp">
+      <Filter>標頭檔</Filter>
+    </ClInclude>
+    <ClInclude Include="IOUtils.hpp">
       <Filter>標頭檔</Filter>
     </ClInclude>
   </ItemGroup>
