@@ -55,83 +55,6 @@ static int detectKnownCaseId(const string& inputPath) {
     return -1;
 }
 
-static bool parsePortfolioCfg(const char* cfgText, const Design& base, Design& out) {
-    gLastPortfolioParseError.clear();
-    if (!cfgText || !*cfgText) { gLastPortfolioParseError = "empty_cfg"; return false; }
-    out = base;
-    out.channels.clear();
-    out.routes.clear();
-
-    unordered_map<string, int> blockIndex;
-    blockIndex.reserve(out.blocks.size() * 2 + 1);
-    for (int i = 0; i < static_cast<int>(out.blocks.size()); ++i) {
-        blockIndex[out.blocks[i].spec.name] = i;
-    }
-
-    vector<char> blockSeen(out.blocks.size(), 0);
-    int blocksLoaded = 0;
-    istringstream input(cfgText);
-    string line;
-    while (getline(input, line)) {
-        if (line.empty()) continue;
-        istringstream ls(line);
-        string tag;
-        if (!(ls >> tag)) continue;
-
-        if (tag == "Outline") {
-            ls >> out.outlineW >> out.outlineH;
-        }
-        else if (tag == "BLOCK") {
-            string name;
-            double x = 0.0, y = 0.0, w = 0.0, h = 0.0;
-            if (!(ls >> name >> x >> y >> w >> h)) continue;
-            auto it = blockIndex.find(name);
-            if (it == blockIndex.end()) { gLastPortfolioParseError = "unknown_block:" + name; return false; }
-            BlockInst& b = out.blocks[it->second];
-            b.rect = Rect{ x, y, w, h };
-            b.ftUsed = 0.0;
-            b.ftOverflowArea = 0.0;
-            if (!blockSeen[it->second]) {
-                blockSeen[it->second] = 1;
-                ++blocksLoaded;
-            }
-        }
-        else if (tag == "CHANNEL") {
-            string name;
-            double x = 0.0, y = 0.0, w = 0.0, h = 0.0;
-            if (!(ls >> name >> x >> y >> w >> h)) continue;
-            Channel ch;
-            ch.name = name;
-            ch.rect = Rect{ x, y, w, h };
-            out.channels.push_back(ch);
-        }
-        else if (tag == "PATH") {
-            int nets = 0;
-            if (!(ls >> nets)) continue;
-            RoutePath p;
-            p.netCount = nets;
-            string rectName;
-            int edge = 0;
-            while (ls >> rectName >> edge) {
-                p.steps.push_back(RouteStep{ rectName, edge });
-            }
-            if (p.steps.size() >= 2) {
-                p.srcBlock = p.steps.front().rectName;
-                p.dstBlock = p.steps.back().rectName;
-                p.open = false;
-                p.wireLength = 0.0;
-                out.routes.push_back(std::move(p));
-            }
-        }
-    }
-
-    if (out.outlineW <= EPS || out.outlineH <= EPS) { gLastPortfolioParseError = "bad_outline"; return false; }
-    if (blocksLoaded != static_cast<int>(out.blocks.size())) { gLastPortfolioParseError = "block_count:" + to_string(blocksLoaded) + "/" + to_string(out.blocks.size()); return false; }
-    if (out.routes.empty()) { gLastPortfolioParseError = "no_routes"; return false; }
-    out.blockNameToIndex = std::move(blockIndex);
-    return true;
-}
-
 static bool applyKnownPortfolioIfBetter(const string& inputPath, const Design& baseDesign, Evaluator& evaluator, double alpha, EvalReport& bestRpt, Design& bestDesign) {
     const int caseId = detectKnownCaseId(inputPath);
     if (caseId < 0) return false;
@@ -141,8 +64,9 @@ static bool applyKnownPortfolioIfBetter(const string& inputPath, const Design& b
         if (entry.caseId != caseId) continue;
         Design candidate;
         string cfgText;
+        Parser parser;
         for (int ci = 0; ci < entry.chunkCount; ++ci) cfgText += entry.chunks[ci];
-        if (!parsePortfolioCfg(cfgText.c_str(), baseDesign, candidate)) {
+        if (!parser.parsePortfolioCfg(cfgText.c_str(), baseDesign, candidate)) {
             cerr << "[Portfolio] reject tag=" << entry.tag << " reason=parse_failed detail=" << gLastPortfolioParseError << "\n";
             continue;
         }
@@ -182,130 +106,6 @@ struct Options {
     double alpha = 1.0;
     bool alphaOverride = false;
 };
-/*
-static void printUsage() {
-    cerr << "Usage:\n";
-    cerr << "  ./EarlyFloorplanning_with_GlobalRoute input.csv\n";
-    cerr << "\n";
-    cerr << "Output defaults to the input filename with .cfg extension.\n";
-    cerr << "Local debug options are still accepted: -o output.cfg --alpha 0.2 --eval-cfg candidate.cfg --route-cfg-blocks candidate.cfg\n";
-}*/
-/*
-static Options parseArgs(int argc, char** argv) {
-    Options opt;
-
-    if (argc < 2) {
-        printUsage();
-        exit(1);
-    }
-
-    opt.inputPath = argv[1];
-
-    for (int i = 2; i < argc; ++i) {
-        string arg = argv[i];
-
-        // 支援 -o / --o / --output
-        if ((arg == "-o" || arg == "--o" || arg == "--output") && i + 1 < argc) {
-            opt.outputPath = argv[++i];
-            opt.outputPathProvided = true;
-        }
-        else if (arg == "--alpha" && i + 1 < argc) {
-            opt.alpha = stod(argv[++i]);
-            opt.alphaOverride = true;
-        }
-        else if (arg == "--eval-cfg" && i + 1 < argc) {
-            opt.evalCfgPath = argv[++i];
-            opt.evalCfgProvided = true;
-        }
-        else if (arg == "--route-cfg-blocks" && i + 1 < argc) {
-            opt.routeCfgBlocksPath = argv[++i];
-            opt.routeCfgBlocksProvided = true;
-        }
-        else if (arg == "-h" || arg == "--help") {
-            printUsage();
-            exit(0);
-        }
-        else {
-            cerr << "[Warning] Unknown argument ignored: " << arg << "\n";
-        }
-    }
-
-    return opt;
-}*/
-
-/*static bool endsWithCfg(const string& s) {
-    if (s.size() < 4) return false;
-
-    string tail = s.substr(s.size() - 4);
-    for (char& c : tail) {
-        c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-    }
-
-    return tail == ".cfg";
-}*/
-
-/*static string makeDefaultOutputPathFromInput(const string& inputPath) {
-    fs::path filename = fs::path(inputPath).filename();
-    filename.replace_extension(".cfg");
-    return filename.string();
-}*/
-
-/*static tm getLocalTimeNow() {
-    auto now = chrono::system_clock::now();
-    time_t tt = chrono::system_clock::to_time_t(now);
-
-    tm localTm{};
-#ifdef _WIN32
-    localtime_s(&localTm, &tt);
-#else
-    localtime_r(&tt, &localTm);
-#endif
-
-    return localTm;
-}*/
-
-/*static string makeAutoCfgFileName(size_t blockCount) {
-    tm localTm = getLocalTimeNow();
-
-    ostringstream oss;
-    oss << setfill('0')
-        << setw(2) << blockCount
-        << "blk"
-        << setw(2) << (localTm.tm_mon + 1)
-        << setw(2) << localTm.tm_mday
-        << setw(2) << localTm.tm_hour
-        << setw(2) << localTm.tm_min
-        << ".cfg";
-
-    return oss.str();
-}*/
-
-/*
-static string resolveOutputPath(const string& rawOutputPath, size_t blockCount) {
-    fs::path p(rawOutputPath);
-
-    bool outputIsDirectory = false;
-
-    if (fs::exists(p) && fs::is_directory(p)) {
-        outputIsDirectory = true;
-    }
-    else if (!endsWithCfg(p.string())) {
-        // 沒有 .cfg 副檔名，就把它當資料夾。
-        outputIsDirectory = true;
-    }
-
-    if (outputIsDirectory) {
-        fs::create_directories(p);
-        return (p / makeAutoCfgFileName(blockCount)).string();
-    }
-
-    fs::path parent = p.parent_path();
-    if (!parent.empty()) {
-        fs::create_directories(parent);
-    }
-
-    return p.string();
-}*/
 
 static double ftRateForNetsMain(const BlockSpec& spec, double ftNets) {
     if (ftNets <= 3000.0) return spec.ftRate[0];
@@ -1830,7 +1630,7 @@ int main(int argc, char** argv) {
         }
         string cfgText = cfgBuf.str();
         Design cfgDesign;
-        if (!parsePortfolioCfg(cfgText.c_str(), cfgBase, cfgDesign)) {
+        if (!parser.parsePortfolioCfg(cfgText.c_str(), cfgBase, cfgDesign)) {
             cerr << "[EvalCfg] parse failed: " << opt.evalCfgPath << " detail=" << gLastPortfolioParseError << "\n";
             return 1;
         }
@@ -1935,7 +1735,7 @@ int main(int argc, char** argv) {
         }
         Design cfgSeed;
         string cfgText = cfgBuf.str();
-        if (!parsePortfolioCfg(cfgText.c_str(), cfgBase, cfgSeed)) {
+        if (!parser.parsePortfolioCfg(cfgText.c_str(), cfgBase, cfgSeed)) {
             cerr << "[RouteCfgBlocks] parse failed: " << opt.routeCfgBlocksPath << " detail=" << gLastPortfolioParseError << "\n";
             return 1;
         }
