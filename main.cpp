@@ -8,6 +8,7 @@
 #include "Logger.hpp"
 #include "Utility.hpp"
 #include "IOUtils.hpp"
+#include "GeometryUtils.hpp" //07/16
 
 #include <algorithm>
 #include <array>
@@ -123,18 +124,6 @@ static double requiredSoftAreaWithFTMain(const BlockInst& b) {
     return side * side;
 }
 
-static bool rectInsideOutlineMain(const Rect& r, double W, double H) {
-    return r.x >= -EPS && r.y >= -EPS && rectRight(r) <= W + EPS && rectTop(r) <= H + EPS;
-}
-
-static bool overlapsAnyOtherBlockMain(const vector<BlockInst>& blocks, int id, const Rect& cand) {
-    for (int i = 0; i < static_cast<int>(blocks.size()); ++i) {
-        if (i == id) continue;
-        if (rectOverlapAreaPositive(cand, blocks[i].rect)) return true;
-    }
-    return false;
-}
-
 static int ftResizeIterationLimit(const Design& design) {
     const int n = static_cast<int>(design.blockSpecs.size());
     if (n >= 45) return 0;
@@ -215,8 +204,8 @@ static bool resizeSoftBlocksForActualFeedthrough(Design& design) {
                     Rect cand = shape;
                     cand.x = max(0.0, min(x, design.outlineW - cand.w));
                     cand.y = max(0.0, min(y, design.outlineH - cand.h));
-                    if (!rectInsideOutlineMain(cand, design.outlineW, design.outlineH)) continue;
-                    if (overlapsAnyOtherBlockMain(design.blocks, need.id, cand)) continue;
+                    if (!GeometryUtils::rectInsideOutline(cand, design.outlineW, design.outlineH)) continue;
+                    if (GeometryUtils::overlapsAnyOtherBlock(design.blocks, need.id, cand)) continue;
 
                     const double move = fabs(rectCx(cand) - oldCx) + fabs(rectCy(cand) - oldCy);
                     const double grow = max(0.0, cand.w - b.rect.w) + max(0.0, cand.h - b.rect.h);
@@ -240,30 +229,6 @@ static bool resizeSoftBlocksForActualFeedthrough(Design& design) {
 static bool blockMovableForHotRepair(const BlockSpec& spec) {
     return spec.type != BlockType::EDGE;
 }
-
-static bool placementLegalAfterMove(const Design& design, const vector<BlockInst>& blocks) {
-    for (const auto& b : blocks) {
-        if (!rectInsideOutlineMain(b.rect, design.outlineW, design.outlineH)) return false;
-    }
-    for (int i = 0; i < static_cast<int>(blocks.size()); ++i) {
-        for (int j = i + 1; j < static_cast<int>(blocks.size()); ++j) {
-            if (rectOverlapAreaPositive(blocks[i].rect, blocks[j].rect)) return false;
-        }
-    }
-    return true;
-}
-
-static double placedBlockAreaMain(const Design& design) {
-    double area = 0.0;
-    for (const auto& b : design.blocks) area += max(0.0, b.rect.w * b.rect.h);
-    return area;
-}
-
-static double deadspaceRatioMain(const Design& design) {
-    const double outlineArea = max(1.0, design.outlineW * design.outlineH);
-    return max(0.0, (outlineArea - placedBlockAreaMain(design)) / outlineArea);
-}
-
 
 static bool tryMoveBlocksYWithClosure(Design& design, const vector<int>& ids, double dy);
 static bool tryMoveBlocksXWithClosure(Design& design, const vector<int>& ids, double dx);
@@ -330,11 +295,11 @@ static bool repairEdgeTrimOverlapsMain(Design& design) {
             }
         }
 
-        if (!found) return placementLegalAfterMove(design, design.blocks);
+        if (!found) return GeometryUtils::placementLegalAfterMove(design, design.blocks);
         if (!moved) return false;
     }
 
-    return placementLegalAfterMove(design, design.blocks);
+    return GeometryUtils::placementLegalAfterMove(design, design.blocks);
 }
 
 static bool tryEdgeOnlyOutlineTrimMain(Design& design, double shrinkW, double shrinkH) {
@@ -372,7 +337,7 @@ static bool tryEdgeOnlyOutlineTrimMain(Design& design, double shrinkW, double sh
             else if (touchBottom) b.rect.y = 0.0;
             else b.rect.y = max(0.0, min(b.rect.y, newH - b.rect.h));
         }
-        else if (!rectInsideOutlineMain(b.rect, design.outlineW, design.outlineH)) {
+        else if (!GeometryUtils::rectInsideOutline(b.rect, design.outlineW, design.outlineH)) {
             return false;
         }
     }
@@ -381,7 +346,7 @@ static bool tryEdgeOnlyOutlineTrimMain(Design& design, double shrinkW, double sh
 
     design.channels.clear();
     design.routes.clear();
-    return placementLegalAfterMove(design, design.blocks);
+    return GeometryUtils::placementLegalAfterMove(design, design.blocks);
 }
 
 static bool tryGravityOutlineTrimMain(Design& design, double shrinkW, double shrinkH) {
@@ -422,7 +387,7 @@ static bool tryGravityOutlineTrimMain(Design& design, double shrinkW, double shr
             else if (touchBottom) b.rect.y = 0.0;
             else b.rect.y = max(0.0, min(b.rect.y, newH - b.rect.h));
 
-            if (!rectInsideOutlineMain(b.rect, newW, newH)) return false;
+            if (!GeometryUtils::rectInsideOutline(b.rect, newW, newH)) return false;
             placed.push_back(b.rect);
         }
         else {
@@ -462,7 +427,7 @@ static bool tryGravityOutlineTrimMain(Design& design, double shrinkW, double shr
         for (double y : ys) {
             Rect cand = r;
             cand.y = max(0.0, min(y, newH - cand.h));
-            if (!rectInsideOutlineMain(cand, newW, newH)) continue;
+            if (!GeometryUtils::rectInsideOutline(cand, newW, newH)) continue;
             bool ov = false;
             for (const Rect& p : placed) {
                 if (rectOverlapAreaPositive(cand, p)) { ov = true; break; }
@@ -483,7 +448,7 @@ static bool tryGravityOutlineTrimMain(Design& design, double shrinkW, double shr
     design.outlineW = newW;
     design.outlineH = newH;
     design.blocks.swap(next);
-    if (!placementLegalAfterMove(design, design.blocks)) {
+    if (!GeometryUtils::placementLegalAfterMove(design, design.blocks)) {
         design.blocks.swap(savedBlocks);
         design.outlineW = savedW;
         design.outlineH = savedH;
@@ -573,7 +538,7 @@ static bool tryMoveBlocksY(Design& design, const vector<int>& ids, double dy) {
         if (!blockMovableForHotRepair(moved[id].spec)) return false;
         moved[id].rect.y += dy;
     }
-    if (!placementLegalAfterMove(design, moved)) return false;
+    if (!GeometryUtils::placementLegalAfterMove(design, moved)) return false;
     design.blocks.swap(moved);
     return true;
 }
@@ -593,7 +558,7 @@ static bool tryMoveBlocksX(Design& design, const vector<int>& ids, double dx) {
         if (!blockMovableForHotRepair(moved[id].spec)) return false;
         moved[id].rect.x += dx;
     }
-    if (!placementLegalAfterMove(design, moved)) return false;
+    if (!GeometryUtils::placementLegalAfterMove(design, moved)) return false;
     design.blocks.swap(moved);
     return true;
 }
@@ -759,7 +724,7 @@ static bool makeCommonEdgeSnapCandidates(const Design& design, vector<Design>& o
 
     auto addCandidate = [&](Design&& trial) {
         if (static_cast<int>(out.size()) >= maxCandidates) return;
-        if (!placementLegalAfterMove(trial, trial.blocks)) return;
+        if (!GeometryUtils::placementLegalAfterMove(trial, trial.blocks)) return;
         trial.channels.clear();
         trial.routes.clear();
         out.push_back(std::move(trial));
@@ -925,7 +890,7 @@ static bool makeThinChannelAlignmentCandidates(const Design& design, vector<Desi
 
     auto addCandidate = [&](Design&& trial) {
         if (static_cast<int>(out.size()) >= maxCandidates) return;
-        if (!placementLegalAfterMove(trial, trial.blocks)) return;
+        if (!GeometryUtils::placementLegalAfterMove(trial, trial.blocks)) return;
         trial.channels.clear();
         trial.routes.clear();
         out.push_back(std::move(trial));
@@ -997,49 +962,7 @@ static bool makeThinChannelAlignmentCandidates(const Design& design, vector<Desi
 
     return static_cast<int>(out.size()) > startCount;
 }
-static vector<int> legalEdgesForDetourMoveMain(const BlockSpec& spec) {
-    if (!spec.portEdges.empty()) return spec.portEdges;
-    return { 1, 2, 3, 4 };
-}
 
-static bool validEdgeForDetourMoveMain(int edge) {
-    return edge >= 1 && edge <= 4;
-}
-
-static pair<double, double> edgeAnchorForDetourMoveMain(const Rect& r, int edge, double t) {
-    t = max(0.0, min(1.0, t));
-    if (edge == 1) return { r.x, r.y + r.h * t };
-    if (edge == 3) return { rectRight(r), r.y + r.h * t };
-    if (edge == 2) return { r.x + r.w * t, rectTop(r) };
-    if (edge == 4) return { r.x + r.w * t, r.y };
-    return { rectCx(r), rectCy(r) };
-}
-
-static double portAwareLowerBoundWLMain(const Design& design, int srcId, int dstId, int nets) {
-    if (srcId < 0 || dstId < 0 || srcId >= static_cast<int>(design.blocks.size()) || dstId >= static_cast<int>(design.blocks.size())) return 0.0;
-    const BlockInst& src = design.blocks[srcId];
-    const BlockInst& dst = design.blocks[dstId];
-    const vector<int> srcEdges = legalEdgesForDetourMoveMain(src.spec);
-    const vector<int> dstEdges = legalEdgesForDetourMoveMain(dst.spec);
-    const array<double, 3> taps = { 0.25, 0.50, 0.75 };
-
-    double best = numeric_limits<double>::infinity();
-    for (int se : srcEdges) {
-        if (!validEdgeForDetourMoveMain(se)) continue;
-        for (int de : dstEdges) {
-            if (!validEdgeForDetourMoveMain(de)) continue;
-            for (double st : taps) {
-                const auto sp = edgeAnchorForDetourMoveMain(src.rect, se, st);
-                for (double dt : taps) {
-                    const auto dp = edgeAnchorForDetourMoveMain(dst.rect, de, dt);
-                    best = min(best, manhattan(sp.first, sp.second, dp.first, dp.second));
-                }
-            }
-        }
-    }
-    if (!std::isfinite(best)) best = manhattan(rectCx(src.rect), rectCy(src.rect), rectCx(dst.rect), rectCy(dst.rect));
-    return best * static_cast<double>(max(0, nets));
-}
 static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, int maxCandidates) {
     struct HotPath {
         int src = -1;
@@ -1057,7 +980,7 @@ static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, 
         auto sit = design.blockNameToIndex.find(p.srcBlock);
         auto dit = design.blockNameToIndex.find(p.dstBlock);
         if (sit == design.blockNameToIndex.end() || dit == design.blockNameToIndex.end()) continue;
-        const double lowerBound = portAwareLowerBoundWLMain(design, sit->second, dit->second, p.netCount);
+        const double lowerBound = GeometryUtils::portAwareLowerBoundWL(design, sit->second, dit->second, p.netCount);
         const double excess = max(0.0, p.wireLength - lowerBound);
         const double score = excess + 0.05 * p.wireLength;
         hot.push_back({ sit->second, dit->second, p.netCount, p.wireLength, lowerBound, excess, score });
@@ -1082,7 +1005,7 @@ static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, 
         };
     auto addCandidate = [&](Design&& trial) {
         if (static_cast<int>(out.size()) >= maxCandidates) return;
-        if (!placementLegalAfterMove(trial, trial.blocks)) return;
+        if (!GeometryUtils::placementLegalAfterMove(trial, trial.blocks)) return;
         trial.channels.clear();
         trial.routes.clear();
         for (const Design& old : out) if (sameGeometry(old, trial)) return;
@@ -1153,7 +1076,7 @@ static bool edgeCanSlideYForCapacityRelief(const Design& design, const BlockInst
     if (b.spec.type != BlockType::EDGE) return true;
     Rect moved = b.rect;
     moved.y += dy;
-    if (!rectInsideOutlineMain(moved, design.outlineW, design.outlineH)) return false;
+    if (!GeometryUtils::rectInsideOutline(moved, design.outlineW, design.outlineH)) return false;
     const double tol = max(2.0, 1.0e-4 * max(design.outlineW, design.outlineH));
     const bool staysLeft = fabs(b.rect.x) <= tol && fabs(moved.x) <= tol;
     const bool staysRight = fabs(rectRight(b.rect) - design.outlineW) <= tol && fabs(rectRight(moved) - design.outlineW) <= tol;
@@ -1167,7 +1090,7 @@ static bool edgeCanSlideXForCapacityRelief(const Design& design, const BlockInst
     if (b.spec.type != BlockType::EDGE) return true;
     Rect moved = b.rect;
     moved.x += dx;
-    if (!rectInsideOutlineMain(moved, design.outlineW, design.outlineH)) return false;
+    if (!GeometryUtils::rectInsideOutline(moved, design.outlineW, design.outlineH)) return false;
     const double tol = max(2.0, 1.0e-4 * max(design.outlineW, design.outlineH));
     const bool staysBottom = fabs(b.rect.y) <= tol && fabs(moved.y) <= tol;
     const bool staysTop = fabs(rectTop(b.rect) - design.outlineH) <= tol && fabs(rectTop(moved) - design.outlineH) <= tol;
@@ -1280,7 +1203,7 @@ static bool tryMoveBlocksYForCapacityRelief(Design& design, const vector<int>& i
         }
         moved[id].rect.y += dy;
     }
-    if (!placementLegalAfterMove(design, moved)) return false;
+    if (!GeometryUtils::placementLegalAfterMove(design, moved)) return false;
     design.blocks.swap(moved);
     return true;
 }
@@ -1300,7 +1223,7 @@ static bool tryMoveBlocksXForCapacityRelief(Design& design, const vector<int>& i
         }
         moved[id].rect.x += dx;
     }
-    if (!placementLegalAfterMove(design, moved)) return false;
+    if (!GeometryUtils::placementLegalAfterMove(design, moved)) return false;
     design.blocks.swap(moved);
     return true;
 }
@@ -1331,7 +1254,7 @@ static bool makeCapacityReliefCandidates(const Design& design, vector<Design>& o
 
     auto addCandidate = [&](Design&& trial) {
         if (static_cast<int>(out.size()) >= maxCandidates) return;
-        if (!placementLegalAfterMove(trial, trial.blocks)) return;
+        if (!GeometryUtils::placementLegalAfterMove(trial, trial.blocks)) return;
         trial.channels.clear();
         trial.routes.clear();
         out.push_back(std::move(trial));
@@ -1486,7 +1409,7 @@ static bool makeCertificateReliefCandidates(const Design& design, const vector<R
 
     auto addCandidate = [&](Design&& trial) {
         if (static_cast<int>(out.size()) >= maxCandidates) return;
-        if (!placementLegalAfterMove(trial, trial.blocks)) return;
+        if (!GeometryUtils::placementLegalAfterMove(trial, trial.blocks)) return;
         trial.channels.clear();
         trial.routes.clear();
         out.push_back(std::move(trial));
@@ -2185,7 +2108,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!bestRpt.hasFail() && deadspaceRatioMain(bestDesign) > 0.35) {
+    if (!bestRpt.hasFail() && GeometryUtils::deadspaceRatio(bestDesign) > 0.35) {
         const bool largeDeadspaceTrimCase = bestDesign.blocks.size() >= 20;
         vector<pair<double, double>> shrinkFractions;
         vector<vector<pair<double, double>>> largeDeadspaceShrinkSchedule;
@@ -2615,7 +2538,7 @@ int main(int argc, char** argv) {
         return routedStructureScoreMain(ad) + 1.0 < routedStructureScoreMain(bd);
         };
 
-    if (!bestRpt.hasFail() && deadspaceRatioMain(bestDesign) > 0.28) {
+    if (!bestRpt.hasFail() && GeometryUtils::deadspaceRatio(bestDesign) > 0.28) {
         vector<pair<double, double>> utilShrinkFractions = {
             { 0.0000, 0.0050 },
             { 0.0000, 0.0010 },
