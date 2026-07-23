@@ -139,6 +139,8 @@
     <ClCompile Include="DataModel.cpp" />
     <ClCompile Include="Evaluator.cpp" />
     <ClCompile Include="Floorplanner.cpp" />
+    <ClCompile Include="GeometryUtils.cpp" />
+    <ClCompile Include="IOUtils.cpp" />
     <ClCompile Include="Logger.cpp" />
     <ClCompile Include="main.cpp">
       <LanguageStandard Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">stdcpp14</LanguageStandard>
@@ -154,6 +156,8 @@
     <ClInclude Include="DataModel.hpp" />
     <ClInclude Include="Evaluator.hpp" />
     <ClInclude Include="Floorplanner.hpp" />
+    <ClInclude Include="GeometryUtils.hpp" />
+    <ClInclude Include="IOUtils.hpp" />
     <ClInclude Include="Logger.hpp" />
     <ClInclude Include="OutputWriter.hpp" />
     <ClInclude Include="Parser.hpp" />

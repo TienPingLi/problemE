@@ -7,10 +7,14 @@
 #include <iostream>
 #include <set>
 #include <unordered_map>
+#include <sstream>
 
 using namespace std;
 
 namespace {
+
+
+
 
 string stripUtf8Bom(string s) {
     if (s.size() >= 3 &&
@@ -559,4 +563,90 @@ void Parser::buildConnections(Design& design) {
             if (nets > 0) design.connections.push_back({ i, j, nets });
         }
     }
+}
+
+//added 7/16
+bool Parser::parsePortfolioCfg(const char* cfgText, const Design& base, Design& out) {
+    lastError.clear();
+    if (!cfgText || !*cfgText) { lastError = "empty_cfg"; return false; }
+    
+    out = base;
+    out.channels.clear();
+    out.routes.clear();
+
+    std::unordered_map<std::string, int> blockIndex;
+    blockIndex.reserve(out.blocks.size() * 2 + 1);
+    for (int i = 0; i < static_cast<int>(out.blocks.size()); ++i) {
+        blockIndex[out.blocks[i].spec.name] = i;
+    }
+
+    std::vector<char> blockSeen(out.blocks.size(), 0);
+    int blocksLoaded = 0;
+    std::istringstream input(cfgText);
+    std::string line;
+    while (getline(input, line)) {
+        if (line.empty()) continue;
+        std::istringstream ls(line);
+        std::string tag;
+        if (!(ls >> tag)) continue;
+
+        if (tag == "Outline") {
+            ls >> out.outlineW >> out.outlineH;
+        }
+        else if (tag == "BLOCK") {
+            std::string name;
+            double x = 0.0, y = 0.0, w = 0.0, h = 0.0;
+            if (!(ls >> name >> x >> y >> w >> h)) continue;
+            auto it = blockIndex.find(name);
+            if (it == blockIndex.end()) { 
+                lastError = "unknown_block:" + name; 
+                return false; 
+            }
+            BlockInst& b = out.blocks[it->second];
+            b.rect = Rect{ x, y, w, h };
+            b.ftUsed = 0.0;
+            b.ftOverflowArea = 0.0;
+            if (!blockSeen[it->second]) {
+                blockSeen[it->second] = 1;
+                ++blocksLoaded;
+            }
+        }
+        else if (tag == "CHANNEL") {
+            std::string name;
+            double x = 0.0, y = 0.0, w = 0.0, h = 0.0;
+            if (!(ls >> name >> x >> y >> w >> h)) continue;
+            Channel ch;
+            ch.name = name;
+            ch.rect = Rect{ x, y, w, h };
+            out.channels.push_back(ch);
+        }
+        else if (tag == "PATH") {
+            int nets = 0;
+            if (!(ls >> nets)) continue;
+            RoutePath p;
+            p.netCount = nets;
+            std::string rectName;
+            int edge = 0;
+            while (ls >> rectName >> edge) {
+                p.steps.push_back(RouteStep{ rectName, edge });
+            }
+            if (p.steps.size() >= 2) {
+                p.srcBlock = p.steps.front().rectName;
+                p.dstBlock = p.steps.back().rectName;
+                p.open = false;
+                p.wireLength = 0.0;
+                out.routes.push_back(std::move(p));
+            }
+        }
+    }
+
+    if (out.outlineW <= EPS || out.outlineH <= EPS) { lastError = "bad_outline"; return false; }
+    if (blocksLoaded != static_cast<int>(out.blocks.size())) { 
+        lastError = "block_count:" + std::to_string(blocksLoaded) + "/" + std::to_string(out.blocks.size());
+        return false; 
+    }
+    if (out.routes.empty()) { lastError = "no_routes"; return false; }
+    
+    out.blockNameToIndex = std::move(blockIndex);
+    return true;
 }

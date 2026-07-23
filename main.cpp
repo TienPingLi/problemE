@@ -7,6 +7,8 @@
 #include "OutputWriter.hpp"
 #include "Logger.hpp"
 #include "Utility.hpp"
+#include "IOUtils.hpp"
+#include "GeometryUtils.hpp" //07/16
 
 #include <algorithm>
 #include <array>
@@ -54,83 +56,6 @@ static int detectKnownCaseId(const string& inputPath) {
     return -1;
 }
 
-static bool parsePortfolioCfg(const char* cfgText, const Design& base, Design& out) {
-    gLastPortfolioParseError.clear();
-    if (!cfgText || !*cfgText) { gLastPortfolioParseError = "empty_cfg"; return false; }
-    out = base;
-    out.channels.clear();
-    out.routes.clear();
-
-    unordered_map<string, int> blockIndex;
-    blockIndex.reserve(out.blocks.size() * 2 + 1);
-    for (int i = 0; i < static_cast<int>(out.blocks.size()); ++i) {
-        blockIndex[out.blocks[i].spec.name] = i;
-    }
-
-    vector<char> blockSeen(out.blocks.size(), 0);
-    int blocksLoaded = 0;
-    istringstream input(cfgText);
-    string line;
-    while (getline(input, line)) {
-        if (line.empty()) continue;
-        istringstream ls(line);
-        string tag;
-        if (!(ls >> tag)) continue;
-
-        if (tag == "Outline") {
-            ls >> out.outlineW >> out.outlineH;
-        }
-        else if (tag == "BLOCK") {
-            string name;
-            double x = 0.0, y = 0.0, w = 0.0, h = 0.0;
-            if (!(ls >> name >> x >> y >> w >> h)) continue;
-            auto it = blockIndex.find(name);
-            if (it == blockIndex.end()) { gLastPortfolioParseError = "unknown_block:" + name; return false; }
-            BlockInst& b = out.blocks[it->second];
-            b.rect = Rect{ x, y, w, h };
-            b.ftUsed = 0.0;
-            b.ftOverflowArea = 0.0;
-            if (!blockSeen[it->second]) {
-                blockSeen[it->second] = 1;
-                ++blocksLoaded;
-            }
-        }
-        else if (tag == "CHANNEL") {
-            string name;
-            double x = 0.0, y = 0.0, w = 0.0, h = 0.0;
-            if (!(ls >> name >> x >> y >> w >> h)) continue;
-            Channel ch;
-            ch.name = name;
-            ch.rect = Rect{ x, y, w, h };
-            out.channels.push_back(ch);
-        }
-        else if (tag == "PATH") {
-            int nets = 0;
-            if (!(ls >> nets)) continue;
-            RoutePath p;
-            p.netCount = nets;
-            string rectName;
-            int edge = 0;
-            while (ls >> rectName >> edge) {
-                p.steps.push_back(RouteStep{ rectName, edge });
-            }
-            if (p.steps.size() >= 2) {
-                p.srcBlock = p.steps.front().rectName;
-                p.dstBlock = p.steps.back().rectName;
-                p.open = false;
-                p.wireLength = 0.0;
-                out.routes.push_back(std::move(p));
-            }
-        }
-    }
-
-    if (out.outlineW <= EPS || out.outlineH <= EPS) { gLastPortfolioParseError = "bad_outline"; return false; }
-    if (blocksLoaded != static_cast<int>(out.blocks.size())) { gLastPortfolioParseError = "block_count:" + to_string(blocksLoaded) + "/" + to_string(out.blocks.size()); return false; }
-    if (out.routes.empty()) { gLastPortfolioParseError = "no_routes"; return false; }
-    out.blockNameToIndex = std::move(blockIndex);
-    return true;
-}
-
 static bool applyKnownPortfolioIfBetter(const string& inputPath, const Design& baseDesign, Evaluator& evaluator, double alpha, EvalReport& bestRpt, Design& bestDesign) {
     const int caseId = detectKnownCaseId(inputPath);
     if (caseId < 0) return false;
@@ -140,8 +65,9 @@ static bool applyKnownPortfolioIfBetter(const string& inputPath, const Design& b
         if (entry.caseId != caseId) continue;
         Design candidate;
         string cfgText;
+        Parser parser;
         for (int ci = 0; ci < entry.chunkCount; ++ci) cfgText += entry.chunks[ci];
-        if (!parsePortfolioCfg(cfgText.c_str(), baseDesign, candidate)) {
+        if (!parser.parsePortfolioCfg(cfgText.c_str(), baseDesign, candidate)) {
             cerr << "[Portfolio] reject tag=" << entry.tag << " reason=parse_failed detail=" << gLastPortfolioParseError << "\n";
             continue;
         }
@@ -182,136 +108,6 @@ struct Options {
     bool alphaOverride = false;
 };
 
-static void printUsage() {
-    cerr << "Usage:\n";
-    cerr << "  ./EarlyFloorplanning_with_GlobalRoute input.csv\n";
-    cerr << "\n";
-    cerr << "Output defaults to the input filename with .cfg extension.\n";
-    cerr << "Local debug options are still accepted: -o output.cfg --alpha 0.2 --eval-cfg candidate.cfg --route-cfg-blocks candidate.cfg\n";
-}
-
-static Options parseArgs(int argc, char** argv) {
-    Options opt;
-
-    if (argc < 2) {
-        printUsage();
-        exit(1);
-    }
-
-    opt.inputPath = argv[1];
-
-    for (int i = 2; i < argc; ++i) {
-        string arg = argv[i];
-
-        // 支援 -o / --o / --output
-        if ((arg == "-o" || arg == "--o" || arg == "--output") && i + 1 < argc) {
-            opt.outputPath = argv[++i];
-            opt.outputPathProvided = true;
-        }
-        else if (arg == "--alpha" && i + 1 < argc) {
-            opt.alpha = stod(argv[++i]);
-            opt.alphaOverride = true;
-        }
-        else if (arg == "--eval-cfg" && i + 1 < argc) {
-            opt.evalCfgPath = argv[++i];
-            opt.evalCfgProvided = true;
-        }
-        else if (arg == "--route-cfg-blocks" && i + 1 < argc) {
-            opt.routeCfgBlocksPath = argv[++i];
-            opt.routeCfgBlocksProvided = true;
-        }
-        else if (arg == "-h" || arg == "--help") {
-            printUsage();
-            exit(0);
-        }
-        else {
-            cerr << "[Warning] Unknown argument ignored: " << arg << "\n";
-        }
-    }
-
-    return opt;
-}
-
-static bool endsWithCfg(const string& s) {
-    if (s.size() < 4) return false;
-
-    string tail = s.substr(s.size() - 4);
-    for (char& c : tail) {
-        c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-    }
-
-    return tail == ".cfg";
-}
-
-static string makeDefaultOutputPathFromInput(const string& inputPath) {
-    fs::path filename = fs::path(inputPath).filename();
-    filename.replace_extension(".cfg");
-    return filename.string();
-}
-
-static tm getLocalTimeNow() {
-    auto now = chrono::system_clock::now();
-    time_t tt = chrono::system_clock::to_time_t(now);
-
-    tm localTm{};
-#ifdef _WIN32
-    localtime_s(&localTm, &tt);
-#else
-    localtime_r(&tt, &localTm);
-#endif
-
-    return localTm;
-}
-
-// 產生檔名：07blk05240238.cfg
-// 格式：<兩位數block數>blk<月日時分>.cfg
-static string makeAutoCfgFileName(size_t blockCount) {
-    tm localTm = getLocalTimeNow();
-
-    ostringstream oss;
-    oss << setfill('0')
-        << setw(2) << blockCount
-        << "blk"
-        << setw(2) << (localTm.tm_mon + 1)
-        << setw(2) << localTm.tm_mday
-        << setw(2) << localTm.tm_hour
-        << setw(2) << localTm.tm_min
-        << ".cfg";
-
-    return oss.str();
-}
-
-// 如果 -o 給的是資料夾，例如 C:\problemE\problemE\result
-// 就自動變成 C:\problemE\problemE\result\07blk05240238.cfg
-//
-// 如果 -o 給的是完整檔名，例如 C:\problemE\problemE\result\my.cfg
-// 就照原本檔名輸出。
-static string resolveOutputPath(const string& rawOutputPath, size_t blockCount) {
-    fs::path p(rawOutputPath);
-
-    bool outputIsDirectory = false;
-
-    if (fs::exists(p) && fs::is_directory(p)) {
-        outputIsDirectory = true;
-    }
-    else if (!endsWithCfg(p.string())) {
-        // 沒有 .cfg 副檔名，就把它當資料夾。
-        outputIsDirectory = true;
-    }
-
-    if (outputIsDirectory) {
-        fs::create_directories(p);
-        return (p / makeAutoCfgFileName(blockCount)).string();
-    }
-
-    fs::path parent = p.parent_path();
-    if (!parent.empty()) {
-        fs::create_directories(parent);
-    }
-
-    return p.string();
-}
-
 static double ftRateForNetsMain(const BlockSpec& spec, double ftNets) {
     if (ftNets <= 3000.0) return spec.ftRate[0];
     if (ftNets <= 6000.0) return spec.ftRate[1];
@@ -326,18 +122,6 @@ static double requiredSoftAreaWithFTMain(const BlockInst& b) {
     const double delta = (b.ftUsed / CHANNEL_DENSITY) * rate / 2.0;
     const double side = sqrt(baseArea) + delta;
     return side * side;
-}
-
-static bool rectInsideOutlineMain(const Rect& r, double W, double H) {
-    return r.x >= -EPS && r.y >= -EPS && rectRight(r) <= W + EPS && rectTop(r) <= H + EPS;
-}
-
-static bool overlapsAnyOtherBlockMain(const vector<BlockInst>& blocks, int id, const Rect& cand) {
-    for (int i = 0; i < static_cast<int>(blocks.size()); ++i) {
-        if (i == id) continue;
-        if (rectOverlapAreaPositive(cand, blocks[i].rect)) return true;
-    }
-    return false;
 }
 
 static int ftResizeIterationLimit(const Design& design) {
@@ -420,8 +204,8 @@ static bool resizeSoftBlocksForActualFeedthrough(Design& design) {
                     Rect cand = shape;
                     cand.x = max(0.0, min(x, design.outlineW - cand.w));
                     cand.y = max(0.0, min(y, design.outlineH - cand.h));
-                    if (!rectInsideOutlineMain(cand, design.outlineW, design.outlineH)) continue;
-                    if (overlapsAnyOtherBlockMain(design.blocks, need.id, cand)) continue;
+                    if (!GeometryUtils::rectInsideOutline(cand, design.outlineW, design.outlineH)) continue;
+                    if (GeometryUtils::overlapsAnyOtherBlock(design.blocks, need.id, cand)) continue;
 
                     const double move = fabs(rectCx(cand) - oldCx) + fabs(rectCy(cand) - oldCy);
                     const double grow = max(0.0, cand.w - b.rect.w) + max(0.0, cand.h - b.rect.h);
@@ -445,30 +229,6 @@ static bool resizeSoftBlocksForActualFeedthrough(Design& design) {
 static bool blockMovableForHotRepair(const BlockSpec& spec) {
     return spec.type != BlockType::EDGE;
 }
-
-static bool placementLegalAfterMove(const Design& design, const vector<BlockInst>& blocks) {
-    for (const auto& b : blocks) {
-        if (!rectInsideOutlineMain(b.rect, design.outlineW, design.outlineH)) return false;
-    }
-    for (int i = 0; i < static_cast<int>(blocks.size()); ++i) {
-        for (int j = i + 1; j < static_cast<int>(blocks.size()); ++j) {
-            if (rectOverlapAreaPositive(blocks[i].rect, blocks[j].rect)) return false;
-        }
-    }
-    return true;
-}
-
-static double placedBlockAreaMain(const Design& design) {
-    double area = 0.0;
-    for (const auto& b : design.blocks) area += max(0.0, b.rect.w * b.rect.h);
-    return area;
-}
-
-static double deadspaceRatioMain(const Design& design) {
-    const double outlineArea = max(1.0, design.outlineW * design.outlineH);
-    return max(0.0, (outlineArea - placedBlockAreaMain(design)) / outlineArea);
-}
-
 
 static bool tryMoveBlocksYWithClosure(Design& design, const vector<int>& ids, double dy);
 static bool tryMoveBlocksXWithClosure(Design& design, const vector<int>& ids, double dx);
@@ -519,7 +279,7 @@ static bool repairEdgeTrimOverlapsMain(Design& design) {
 
                 sort(moves.begin(), moves.end(), [](const pair<char, double>& a, const pair<char, double>& b) {
                     return fabs(a.second) < fabs(b.second);
-                });
+                    });
 
                 for (const auto& mv : moves) {
                     if (fabs(mv.second) <= EPS) continue;
@@ -535,11 +295,11 @@ static bool repairEdgeTrimOverlapsMain(Design& design) {
             }
         }
 
-        if (!found) return placementLegalAfterMove(design, design.blocks);
+        if (!found) return GeometryUtils::placementLegalAfterMove(design, design.blocks);
         if (!moved) return false;
     }
 
-    return placementLegalAfterMove(design, design.blocks);
+    return GeometryUtils::placementLegalAfterMove(design, design.blocks);
 }
 
 static bool tryEdgeOnlyOutlineTrimMain(Design& design, double shrinkW, double shrinkH) {
@@ -577,7 +337,7 @@ static bool tryEdgeOnlyOutlineTrimMain(Design& design, double shrinkW, double sh
             else if (touchBottom) b.rect.y = 0.0;
             else b.rect.y = max(0.0, min(b.rect.y, newH - b.rect.h));
         }
-        else if (!rectInsideOutlineMain(b.rect, design.outlineW, design.outlineH)) {
+        else if (!GeometryUtils::rectInsideOutline(b.rect, design.outlineW, design.outlineH)) {
             return false;
         }
     }
@@ -586,7 +346,7 @@ static bool tryEdgeOnlyOutlineTrimMain(Design& design, double shrinkW, double sh
 
     design.channels.clear();
     design.routes.clear();
-    return placementLegalAfterMove(design, design.blocks);
+    return GeometryUtils::placementLegalAfterMove(design, design.blocks);
 }
 
 static bool tryGravityOutlineTrimMain(Design& design, double shrinkW, double shrinkH) {
@@ -627,7 +387,7 @@ static bool tryGravityOutlineTrimMain(Design& design, double shrinkW, double shr
             else if (touchBottom) b.rect.y = 0.0;
             else b.rect.y = max(0.0, min(b.rect.y, newH - b.rect.h));
 
-            if (!rectInsideOutlineMain(b.rect, newW, newH)) return false;
+            if (!GeometryUtils::rectInsideOutline(b.rect, newW, newH)) return false;
             placed.push_back(b.rect);
         }
         else {
@@ -667,7 +427,7 @@ static bool tryGravityOutlineTrimMain(Design& design, double shrinkW, double shr
         for (double y : ys) {
             Rect cand = r;
             cand.y = max(0.0, min(y, newH - cand.h));
-            if (!rectInsideOutlineMain(cand, newW, newH)) continue;
+            if (!GeometryUtils::rectInsideOutline(cand, newW, newH)) continue;
             bool ov = false;
             for (const Rect& p : placed) {
                 if (rectOverlapAreaPositive(cand, p)) { ov = true; break; }
@@ -688,7 +448,7 @@ static bool tryGravityOutlineTrimMain(Design& design, double shrinkW, double shr
     design.outlineW = newW;
     design.outlineH = newH;
     design.blocks.swap(next);
-    if (!placementLegalAfterMove(design, design.blocks)) {
+    if (!GeometryUtils::placementLegalAfterMove(design, design.blocks)) {
         design.blocks.swap(savedBlocks);
         design.outlineW = savedW;
         design.outlineH = savedH;
@@ -778,7 +538,7 @@ static bool tryMoveBlocksY(Design& design, const vector<int>& ids, double dy) {
         if (!blockMovableForHotRepair(moved[id].spec)) return false;
         moved[id].rect.y += dy;
     }
-    if (!placementLegalAfterMove(design, moved)) return false;
+    if (!GeometryUtils::placementLegalAfterMove(design, moved)) return false;
     design.blocks.swap(moved);
     return true;
 }
@@ -798,7 +558,7 @@ static bool tryMoveBlocksX(Design& design, const vector<int>& ids, double dx) {
         if (!blockMovableForHotRepair(moved[id].spec)) return false;
         moved[id].rect.x += dx;
     }
-    if (!placementLegalAfterMove(design, moved)) return false;
+    if (!GeometryUtils::placementLegalAfterMove(design, moved)) return false;
     design.blocks.swap(moved);
     return true;
 }
@@ -964,7 +724,7 @@ static bool makeCommonEdgeSnapCandidates(const Design& design, vector<Design>& o
 
     auto addCandidate = [&](Design&& trial) {
         if (static_cast<int>(out.size()) >= maxCandidates) return;
-        if (!placementLegalAfterMove(trial, trial.blocks)) return;
+        if (!GeometryUtils::placementLegalAfterMove(trial, trial.blocks)) return;
         trial.channels.clear();
         trial.routes.clear();
         out.push_back(std::move(trial));
@@ -1111,7 +871,7 @@ static bool makeThinChannelAlignmentCandidates(const Design& design, vector<Desi
         s += max(0.0, 0.12 - util) * 3000.0;
         s -= used;
         hot.push_back({ i, thickness, s, horizontalGap });
-    };
+        };
 
     for (int i = 0; i < static_cast<int>(design.channels.size()); ++i) {
         const Channel& ch = design.channels[i];
@@ -1130,7 +890,7 @@ static bool makeThinChannelAlignmentCandidates(const Design& design, vector<Desi
 
     auto addCandidate = [&](Design&& trial) {
         if (static_cast<int>(out.size()) >= maxCandidates) return;
-        if (!placementLegalAfterMove(trial, trial.blocks)) return;
+        if (!GeometryUtils::placementLegalAfterMove(trial, trial.blocks)) return;
         trial.channels.clear();
         trial.routes.clear();
         out.push_back(std::move(trial));
@@ -1202,49 +962,7 @@ static bool makeThinChannelAlignmentCandidates(const Design& design, vector<Desi
 
     return static_cast<int>(out.size()) > startCount;
 }
-static vector<int> legalEdgesForDetourMoveMain(const BlockSpec& spec) {
-    if (!spec.portEdges.empty()) return spec.portEdges;
-    return { 1, 2, 3, 4 };
-}
 
-static bool validEdgeForDetourMoveMain(int edge) {
-    return edge >= 1 && edge <= 4;
-}
-
-static pair<double, double> edgeAnchorForDetourMoveMain(const Rect& r, int edge, double t) {
-    t = max(0.0, min(1.0, t));
-    if (edge == 1) return { r.x, r.y + r.h * t };
-    if (edge == 3) return { rectRight(r), r.y + r.h * t };
-    if (edge == 2) return { r.x + r.w * t, rectTop(r) };
-    if (edge == 4) return { r.x + r.w * t, r.y };
-    return { rectCx(r), rectCy(r) };
-}
-
-static double portAwareLowerBoundWLMain(const Design& design, int srcId, int dstId, int nets) {
-    if (srcId < 0 || dstId < 0 || srcId >= static_cast<int>(design.blocks.size()) || dstId >= static_cast<int>(design.blocks.size())) return 0.0;
-    const BlockInst& src = design.blocks[srcId];
-    const BlockInst& dst = design.blocks[dstId];
-    const vector<int> srcEdges = legalEdgesForDetourMoveMain(src.spec);
-    const vector<int> dstEdges = legalEdgesForDetourMoveMain(dst.spec);
-    const array<double, 3> taps = { 0.25, 0.50, 0.75 };
-
-    double best = numeric_limits<double>::infinity();
-    for (int se : srcEdges) {
-        if (!validEdgeForDetourMoveMain(se)) continue;
-        for (int de : dstEdges) {
-            if (!validEdgeForDetourMoveMain(de)) continue;
-            for (double st : taps) {
-                const auto sp = edgeAnchorForDetourMoveMain(src.rect, se, st);
-                for (double dt : taps) {
-                    const auto dp = edgeAnchorForDetourMoveMain(dst.rect, de, dt);
-                    best = min(best, manhattan(sp.first, sp.second, dp.first, dp.second));
-                }
-            }
-        }
-    }
-    if (!std::isfinite(best)) best = manhattan(rectCx(src.rect), rectCy(src.rect), rectCx(dst.rect), rectCy(dst.rect));
-    return best * static_cast<double>(max(0, nets));
-}
 static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, int maxCandidates) {
     struct HotPath {
         int src = -1;
@@ -1262,7 +980,7 @@ static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, 
         auto sit = design.blockNameToIndex.find(p.srcBlock);
         auto dit = design.blockNameToIndex.find(p.dstBlock);
         if (sit == design.blockNameToIndex.end() || dit == design.blockNameToIndex.end()) continue;
-        const double lowerBound = portAwareLowerBoundWLMain(design, sit->second, dit->second, p.netCount);
+        const double lowerBound = GeometryUtils::portAwareLowerBoundWL(design, sit->second, dit->second, p.netCount);
         const double excess = max(0.0, p.wireLength - lowerBound);
         const double score = excess + 0.05 * p.wireLength;
         hot.push_back({ sit->second, dit->second, p.netCount, p.wireLength, lowerBound, excess, score });
@@ -1272,7 +990,7 @@ static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, 
         if (fabs(a.excess - b.excess) > 1.0) return a.excess > b.excess;
         if (a.nets != b.nets) return a.nets > b.nets;
         return a.src < b.src;
-    });
+        });
 
     const int startCount = static_cast<int>(out.size());
     auto sameGeometry = [&](const Design& a, const Design& b) {
@@ -1284,22 +1002,22 @@ static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, 
                 fabs(ra.w - rb.w) > 0.5 || fabs(ra.h - rb.h) > 0.5) return false;
         }
         return true;
-    };
+        };
     auto addCandidate = [&](Design&& trial) {
         if (static_cast<int>(out.size()) >= maxCandidates) return;
-        if (!placementLegalAfterMove(trial, trial.blocks)) return;
+        if (!GeometryUtils::placementLegalAfterMove(trial, trial.blocks)) return;
         trial.channels.clear();
         trial.routes.clear();
         for (const Design& old : out) if (sameGeometry(old, trial)) return;
         out.push_back(std::move(trial));
-    };
+        };
     auto tryOneAxis = [&](int id, double delta, bool xAxis) {
         if (static_cast<int>(out.size()) >= maxCandidates || fabs(delta) <= 1.0) return;
         Design trial = design;
         bool ok = xAxis ? tryMoveBlocksXWithClosure(trial, { id }, delta)
-                        : tryMoveBlocksYWithClosure(trial, { id }, delta);
+            : tryMoveBlocksYWithClosure(trial, { id }, delta);
         if (ok) addCandidate(std::move(trial));
-    };
+        };
     auto tryTwoAxis = [&](int id, double dx, double dy) {
         if (static_cast<int>(out.size()) >= maxCandidates || (fabs(dx) <= 1.0 && fabs(dy) <= 1.0)) return;
         Design trial = design;
@@ -1313,7 +1031,7 @@ static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, 
         if (fabs(dy) > 1.0) ok = ok && tryMoveBlocksYWithClosure(trial, { id }, dy);
         if (fabs(dx) > 1.0) ok = ok && tryMoveBlocksXWithClosure(trial, { id }, dx);
         if (ok) addCandidate(std::move(trial));
-    };
+        };
 
     const int pathLimit = min(14, static_cast<int>(hot.size()));
     const double maxStep = max(80.0, 0.075 * max(design.outlineW, design.outlineH));
@@ -1340,7 +1058,7 @@ static bool makeDetourMoveCandidates(const Design& design, vector<Design>& out, 
                 tryOneAxis(hp.dst, -sy, false);
                 tryTwoAxis(hp.dst, -sx, -sy);
             }
-if (blockMovableForHotRepair(design.blocks[hp.src].spec) && blockMovableForHotRepair(design.blocks[hp.dst].spec)) {
+            if (blockMovableForHotRepair(design.blocks[hp.src].spec) && blockMovableForHotRepair(design.blocks[hp.dst].spec)) {
                 Design trial = design;
                 bool ok = true;
                 if (fabs(sx) > 1.0) ok = ok && tryMoveBlocksXWithClosure(trial, { hp.src }, sx * 0.5);
@@ -1358,7 +1076,7 @@ static bool edgeCanSlideYForCapacityRelief(const Design& design, const BlockInst
     if (b.spec.type != BlockType::EDGE) return true;
     Rect moved = b.rect;
     moved.y += dy;
-    if (!rectInsideOutlineMain(moved, design.outlineW, design.outlineH)) return false;
+    if (!GeometryUtils::rectInsideOutline(moved, design.outlineW, design.outlineH)) return false;
     const double tol = max(2.0, 1.0e-4 * max(design.outlineW, design.outlineH));
     const bool staysLeft = fabs(b.rect.x) <= tol && fabs(moved.x) <= tol;
     const bool staysRight = fabs(rectRight(b.rect) - design.outlineW) <= tol && fabs(rectRight(moved) - design.outlineW) <= tol;
@@ -1372,7 +1090,7 @@ static bool edgeCanSlideXForCapacityRelief(const Design& design, const BlockInst
     if (b.spec.type != BlockType::EDGE) return true;
     Rect moved = b.rect;
     moved.x += dx;
-    if (!rectInsideOutlineMain(moved, design.outlineW, design.outlineH)) return false;
+    if (!GeometryUtils::rectInsideOutline(moved, design.outlineW, design.outlineH)) return false;
     const double tol = max(2.0, 1.0e-4 * max(design.outlineW, design.outlineH));
     const bool staysBottom = fabs(b.rect.y) <= tol && fabs(moved.y) <= tol;
     const bool staysTop = fabs(rectTop(b.rect) - design.outlineH) <= tol && fabs(rectTop(moved) - design.outlineH) <= tol;
@@ -1485,7 +1203,7 @@ static bool tryMoveBlocksYForCapacityRelief(Design& design, const vector<int>& i
         }
         moved[id].rect.y += dy;
     }
-    if (!placementLegalAfterMove(design, moved)) return false;
+    if (!GeometryUtils::placementLegalAfterMove(design, moved)) return false;
     design.blocks.swap(moved);
     return true;
 }
@@ -1505,7 +1223,7 @@ static bool tryMoveBlocksXForCapacityRelief(Design& design, const vector<int>& i
         }
         moved[id].rect.x += dx;
     }
-    if (!placementLegalAfterMove(design, moved)) return false;
+    if (!GeometryUtils::placementLegalAfterMove(design, moved)) return false;
     design.blocks.swap(moved);
     return true;
 }
@@ -1536,7 +1254,7 @@ static bool makeCapacityReliefCandidates(const Design& design, vector<Design>& o
 
     auto addCandidate = [&](Design&& trial) {
         if (static_cast<int>(out.size()) >= maxCandidates) return;
-        if (!placementLegalAfterMove(trial, trial.blocks)) return;
+        if (!GeometryUtils::placementLegalAfterMove(trial, trial.blocks)) return;
         trial.channels.clear();
         trial.routes.clear();
         out.push_back(std::move(trial));
@@ -1691,7 +1409,7 @@ static bool makeCertificateReliefCandidates(const Design& design, const vector<R
 
     auto addCandidate = [&](Design&& trial) {
         if (static_cast<int>(out.size()) >= maxCandidates) return;
-        if (!placementLegalAfterMove(trial, trial.blocks)) return;
+        if (!GeometryUtils::placementLegalAfterMove(trial, trial.blocks)) return;
         trial.channels.clear();
         trial.routes.clear();
         out.push_back(std::move(trial));
@@ -1779,13 +1497,10 @@ static bool makeCertificateReliefCandidates(const Design& design, const vector<R
 }
 
 int main(int argc, char** argv) {
+
+    //1.create 
     ios::sync_with_stdio(false);
     cin.tie(nullptr);
-
-    Options opt = parseArgs(argc, argv);
-    if (!opt.outputPathProvided) {
-        opt.outputPath = makeDefaultOutputPathFromInput(opt.inputPath);
-    }
 
     Design design;
     Parser parser;
@@ -1795,12 +1510,18 @@ int main(int argc, char** argv) {
     Evaluator evaluator;
     OutputWriter writer;
 
+    //read
+    IOUtils::Options opt = IOUtils::parseArgs(argc, argv);
+    if (!opt.outputPathProvided) {
+        opt.outputPath = IOUtils::makeDefaultOutputPathFromInput(opt.inputPath);
+    }
+
     bool parseOk = parser.read(opt.inputPath, design);
     if (!parseOk) {
         EvalReport rpt;
         rpt.formatFailed = true;
         router.printDetourReport(design);
-    Logger::printFinalReport(design, rpt, opt.alpha, opt.inputPath, opt.outputPath);
+        Logger::printFinalReport(design, rpt, opt.alpha, opt.inputPath, opt.outputPath);
         return 1;
     }
 
@@ -1810,7 +1531,7 @@ int main(int argc, char** argv) {
 
     // 讀完 parser 後才知道 block 數量，所以在這裡決定真正 output cfg 路徑。
     if (opt.outputPathProvided) {
-        opt.outputPath = resolveOutputPath(opt.outputPath, design.blockSpecs.size());
+        opt.outputPath = IOUtils::resolveOutputPath(opt.outputPath, design.blockSpecs.size());
     }
 
 
@@ -1832,7 +1553,7 @@ int main(int argc, char** argv) {
         }
         string cfgText = cfgBuf.str();
         Design cfgDesign;
-        if (!parsePortfolioCfg(cfgText.c_str(), cfgBase, cfgDesign)) {
+        if (!parser.parsePortfolioCfg(cfgText.c_str(), cfgBase, cfgDesign)) {
             cerr << "[EvalCfg] parse failed: " << opt.evalCfgPath << " detail=" << gLastPortfolioParseError << "\n";
             return 1;
         }
@@ -1842,6 +1563,7 @@ int main(int argc, char** argv) {
         return rpt.hasFail() ? 1 : 0;
     }
 
+    //set basic status
     auto totalPenalty = [](const EvalReport& r) {
         return r.totalChannelOverflow + r.totalFeedthroughOverflow;
         };
@@ -1936,7 +1658,7 @@ int main(int argc, char** argv) {
         }
         Design cfgSeed;
         string cfgText = cfgBuf.str();
-        if (!parsePortfolioCfg(cfgText.c_str(), cfgBase, cfgSeed)) {
+        if (!parser.parsePortfolioCfg(cfgText.c_str(), cfgBase, cfgSeed)) {
             cerr << "[RouteCfgBlocks] parse failed: " << opt.routeCfgBlocksPath << " detail=" << gLastPortfolioParseError << "\n";
             return 1;
         }
@@ -2223,7 +1945,7 @@ int main(int argc, char** argv) {
                 rpt = bestRpt;
             }
         }
-    };
+        };
 
     tryRepairPortfolio(baseRepairPortfolio, "base");
 
@@ -2294,7 +2016,7 @@ int main(int argc, char** argv) {
                 bestHotRpt = trialRpt;
                 hasTrial = true;
             }
-        };
+            };
 
         Design movedH = bestDesign;
         if (relieveHorizontalHotChannels(movedH)) {
@@ -2386,7 +2108,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!bestRpt.hasFail() && deadspaceRatioMain(bestDesign) > 0.35) {
+    if (!bestRpt.hasFail() && GeometryUtils::deadspaceRatio(bestDesign) > 0.35) {
         const bool largeDeadspaceTrimCase = bestDesign.blocks.size() >= 20;
         vector<pair<double, double>> shrinkFractions;
         vector<vector<pair<double, double>>> largeDeadspaceShrinkSchedule;
@@ -2489,7 +2211,7 @@ int main(int argc, char** argv) {
             if (b.cost + 1.0 < a.cost) return false;
             if (fabs(a.outlineArea - b.outlineArea) > 1.0) return a.outlineArea < b.outlineArea;
             return a.cost < b.cost;
-        };
+            };
         const int trimPassLimit = largeDeadspaceTrimCase ? static_cast<int>(largeDeadspaceShrinkSchedule.size()) : 8;
         for (int trimPass = 0; trimPass < trimPassLimit; ++trimPass) {
             bool improved = false;
@@ -2534,7 +2256,7 @@ int main(int argc, char** argv) {
                                 bestRepairRpt = repairRpt;
                                 haveRepair = true;
                             }
-                        };
+                            };
 
                         Design movedH = routed;
                         if (relieveHorizontalHotChannels(movedH)) tryTrimRepair(movedH);
@@ -2816,7 +2538,7 @@ int main(int argc, char** argv) {
         return routedStructureScoreMain(ad) + 1.0 < routedStructureScoreMain(bd);
         };
 
-    if (!bestRpt.hasFail() && deadspaceRatioMain(bestDesign) > 0.28) {
+    if (!bestRpt.hasFail() && GeometryUtils::deadspaceRatio(bestDesign) > 0.28) {
         vector<pair<double, double>> utilShrinkFractions = {
             { 0.0000, 0.0050 },
             { 0.0000, 0.0010 },
