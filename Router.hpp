@@ -34,6 +34,7 @@ public:
     void setFTOverflowCostEnabled(bool enabled);
     void setSoftFTCostRelaxed(bool enabled);
     void setContactAwareCostEnabled(bool enabled);
+    void setDetailedFailureAnalysisEnabled(bool enabled);
     void run(Design& design);
     void printDetourReport(const Design& design) const;
     const std::vector<FailureCertificate>& failureCertificates() const;
@@ -66,6 +67,7 @@ private:
     void updateUsage(Design& design, const RoutePath& path) const;
 
     std::vector<FailureCertificate> lastFailureCertificates;
+    bool detailedFailureAnalysisEnabled = false;
 
     mutable bool routeGraphCacheValid = false;
     mutable std::vector<Node> routeGraphNodes;

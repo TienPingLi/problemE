@@ -16,13 +16,22 @@ using namespace std;
 
 namespace {
 
-    static constexpr double CONTACT_EPS = 1.0e-3;
+    static constexpr double CHECKER_GEOM_EPS = 3.0;
+    static constexpr double CHECKER_BETA_LIN = 20.0;
+    static constexpr double CHECKER_BETA_TAIL = 1.5;
+    static constexpr double CHECKER_BETA_FT = 3.0;
+    static constexpr double CHECKER_LAMBDA_FT = 10.0;
+    static constexpr double CHECKER_OVERFLOW_THRESHOLD = 0.05;
+    static constexpr double CHECKER_GAMMA_EDGE = 1.0;
+    static constexpr double CHECKER_DELTA_RUNTIME = 0.5;
+
+    static constexpr double CONTACT_EPS = CHECKER_GEOM_EPS;
     // Rectangles may touch on a very small overlap segment after floating-point
     // placement/channel construction.  For contact validity, require positive
     // overlap, but do not require a large 1e-3 overlap.  This avoids false
     // routing-open reports for paths that the router built from touching geometry.
     static constexpr double CONTACT_OVERLAP_EPS = 1.0e-7;
-    static constexpr double SHAPE_EPS = 1.0e-3;
+    static constexpr double SHAPE_EPS = CHECKER_GEOM_EPS;
 
     struct Point {
         double x = 0.0;
@@ -210,8 +219,8 @@ namespace {
     }
 
     static bool rectOverlapAreaPositiveLocal(const Rect& a, const Rect& b) {
-        return overlapLen(a.x, rectRight(a), b.x, rectRight(b)) > EPS &&
-            overlapLen(a.y, rectTop(a), b.y, rectTop(b)) > EPS;
+        return overlapLen(a.x, rectRight(a), b.x, rectRight(b)) > CHECKER_GEOM_EPS &&
+            overlapLen(a.y, rectTop(a), b.y, rectTop(b)) > CHECKER_GEOM_EPS;
     }
 
     static Point edgeCenter(const Rect& r, int edge) {
@@ -292,42 +301,9 @@ namespace {
         return out;
     }
 
-    static bool edgeBlockMatchesOneLocation(const Rect& r, const string& loc, double W, double H) {
-        if (loc.size() < 2) return false;
-        char a = loc[0];
-        char b = loc[1];
-
-        auto spanInsideZone = [](double loVal, double hiVal, int zone, double span) {
-            double lo = zone * span / 3.0;
-            double hi = (zone + 1) * span / 3.0;
-            return loVal >= lo - SHAPE_EPS && hiVal <= hi + SHAPE_EPS;
-            };
-
-        if (a == 'T' && (b == 'L' || b == 'M' || b == 'R')) {
-            int zone = (b == 'L') ? 0 : (b == 'M' ? 1 : 2);
-            return fabs(rectTop(r) - H) <= SHAPE_EPS && spanInsideZone(r.x, rectRight(r), zone, W);
-        }
-        if (a == 'B' && (b == 'L' || b == 'M' || b == 'R')) {
-            int zone = (b == 'L') ? 0 : (b == 'M' ? 1 : 2);
-            return fabs(r.y) <= SHAPE_EPS && spanInsideZone(r.x, rectRight(r), zone, W);
-        }
-        if (a == 'L' && (b == 'B' || b == 'M' || b == 'T')) {
-            int zone = (b == 'B') ? 0 : (b == 'M' ? 1 : 2);
-            return fabs(r.x) <= SHAPE_EPS && spanInsideZone(r.y, rectTop(r), zone, H);
-        }
-        if (a == 'R' && (b == 'B' || b == 'M' || b == 'T')) {
-            int zone = (b == 'B') ? 0 : (b == 'M' ? 1 : 2);
-            return fabs(rectRight(r) - W) <= SHAPE_EPS && spanInsideZone(r.y, rectTop(r), zone, H);
-        }
-
-        return false;
-    }
-
     static bool edgeBlockMatchesLocationUnion(const Rect& r, const vector<string>& locs, double W, double H) {
         struct SideRange {
-            bool used = false;
-            double lo = 0.0;
-            double hi = 0.0;
+            vector<pair<double, double>> intervals;
         };
 
         SideRange ranges[4]; // T, B, L, R
@@ -342,15 +318,7 @@ namespace {
             double span = (side == 'T' || side == 'B') ? W : H;
             double lo = static_cast<double>(zone) * span / 3.0;
             double hi = static_cast<double>(zone + 1) * span / 3.0;
-            if (!ranges[idx].used) {
-                ranges[idx].used = true;
-                ranges[idx].lo = lo;
-                ranges[idx].hi = hi;
-            }
-            else {
-                ranges[idx].lo = min(ranges[idx].lo, lo);
-                ranges[idx].hi = max(ranges[idx].hi, hi);
-            }
+            ranges[idx].intervals.push_back({ lo, hi });
             };
 
         for (string loc : locs) {
@@ -364,27 +332,124 @@ namespace {
             else if (a == 'R' && (b == 'B' || b == 'M' || b == 'T')) addRange('R', (b == 'B') ? 0 : (b == 'M' ? 1 : 2));
         }
 
-        if (ranges[0].used && fabs(rectTop(r) - H) <= SHAPE_EPS &&
-            r.x >= ranges[0].lo - SHAPE_EPS && rectRight(r) <= ranges[0].hi + SHAPE_EPS) return true;
-        if (ranges[1].used && fabs(r.y) <= SHAPE_EPS &&
-            r.x >= ranges[1].lo - SHAPE_EPS && rectRight(r) <= ranges[1].hi + SHAPE_EPS) return true;
-        if (ranges[2].used && fabs(r.x) <= SHAPE_EPS &&
-            r.y >= ranges[2].lo - SHAPE_EPS && rectTop(r) <= ranges[2].hi + SHAPE_EPS) return true;
-        if (ranges[3].used && fabs(rectRight(r) - W) <= SHAPE_EPS &&
-            r.y >= ranges[3].lo - SHAPE_EPS && rectTop(r) <= ranges[3].hi + SHAPE_EPS) return true;
+        auto overlapsAny = [](double loVal, double hiVal, const vector<pair<double, double>>& intervals) {
+            if (intervals.empty()) return true;
+            for (const auto& seg : intervals) {
+                if (min(hiVal, seg.second) > max(loVal, seg.first) + CONTACT_OVERLAP_EPS) return true;
+            }
+            return false;
+            };
 
+        bool requiredAnySide = false;
+
+        if (!ranges[0].intervals.empty()) {
+            requiredAnySide = true;
+            if (fabs(rectTop(r) - H) > SHAPE_EPS || !overlapsAny(r.x, rectRight(r), ranges[0].intervals)) return false;
+        }
+        if (!ranges[1].intervals.empty()) {
+            requiredAnySide = true;
+            if (fabs(r.y) > SHAPE_EPS || !overlapsAny(r.x, rectRight(r), ranges[1].intervals)) return false;
+        }
+        if (!ranges[2].intervals.empty()) {
+            requiredAnySide = true;
+            if (fabs(r.x) > SHAPE_EPS || !overlapsAny(r.y, rectTop(r), ranges[2].intervals)) return false;
+        }
+        if (!ranges[3].intervals.empty()) {
+            requiredAnySide = true;
+            if (fabs(rectRight(r) - W) > SHAPE_EPS || !overlapsAny(r.y, rectTop(r), ranges[3].intervals)) return false;
+        }
+
+        return requiredAnySide;
+    }
+
+    static bool decodeLocationToken(const string& raw, char& side, int& zone) {
+        const string loc = upperStr(trim(raw));
+        if (loc.size() < 2) return false;
+
+        const char a = loc[0];
+        const char b = loc[1];
+        if (a == 'T' && (b == 'L' || b == 'M' || b == 'R')) {
+            side = 'T';
+            zone = (b == 'L') ? 0 : (b == 'M' ? 1 : 2);
+            return true;
+        }
+        if (a == 'B' && (b == 'L' || b == 'M' || b == 'R')) {
+            side = 'B';
+            zone = (b == 'L') ? 0 : (b == 'M' ? 1 : 2);
+            return true;
+        }
+        if (a == 'L' && (b == 'B' || b == 'M' || b == 'T')) {
+            side = 'L';
+            zone = (b == 'B') ? 0 : (b == 'M' ? 1 : 2);
+            return true;
+        }
+        if (a == 'R' && (b == 'B' || b == 'M' || b == 'T')) {
+            side = 'R';
+            zone = (b == 'B') ? 0 : (b == 'M' ? 1 : 2);
+            return true;
+        }
         return false;
+    }
+
+    static double intervalGap(double loA, double hiA, double loB, double hiB) {
+        if (min(hiA, hiB) > max(loA, loB) + CONTACT_OVERLAP_EPS) return 0.0;
+        if (hiA < loB) return loB - hiA;
+        if (hiB < loA) return loA - hiB;
+        return 0.0;
+    }
+
+    static double edgeLocationOffsetToTarget(const Rect& r, char side, int zone, double W, double H) {
+        const bool horizontalSide = (side == 'T' || side == 'B');
+        const double span = horizontalSide ? W : H;
+        const double targetLo = static_cast<double>(zone) * span / 3.0;
+        const double targetHi = static_cast<double>(zone + 1) * span / 3.0;
+
+        double sideOffset = 0.0;
+        double segLo = 0.0;
+        double segHi = 0.0;
+        if (side == 'T') {
+            sideOffset = fabs(rectTop(r) - H);
+            segLo = r.x;
+            segHi = rectRight(r);
+        }
+        else if (side == 'B') {
+            sideOffset = fabs(r.y);
+            segLo = r.x;
+            segHi = rectRight(r);
+        }
+        else if (side == 'L') {
+            sideOffset = fabs(r.x);
+            segLo = r.y;
+            segHi = rectTop(r);
+        }
+        else {
+            sideOffset = fabs(rectRight(r) - W);
+            segLo = r.y;
+            segHi = rectTop(r);
+        }
+
+        return sideOffset + intervalGap(segLo, segHi, targetLo, targetHi);
+    }
+
+    static double edgeBlockLocationOffset(const BlockInst& b, double W, double H) {
+        if (b.spec.type != BlockType::EDGE) return 0.0;
+        const vector<string> locs = splitLocTokens(b.spec.locations);
+        if (locs.empty()) return 0.0;
+
+        double best = numeric_limits<double>::infinity();
+        for (const string& loc : locs) {
+            char side = 0;
+            int zone = -1;
+            if (!decodeLocationToken(loc, side, zone)) continue;
+            best = min(best, edgeLocationOffsetToTarget(b.rect, side, zone, W, H));
+        }
+        if (!isfinite(best)) return 0.0;
+        return best > CHECKER_GEOM_EPS ? best : 0.0;
     }
 
     static bool edgeBlockLocationOK(const BlockInst& b, double W, double H) {
         if (b.spec.type != BlockType::EDGE) return true;
-        vector<string> locs = splitLocTokens(b.spec.locations);
-        if (locs.empty()) return true;
-        if (edgeBlockMatchesLocationUnion(b.rect, locs, W, H)) return true;
-        for (const string& loc : locs) {
-            if (edgeBlockMatchesOneLocation(b.rect, loc, W, H)) return true;
-        }
-        return false;
+        return edgeBlockLocationOffset(b, W, H) <= 0.0;
     }
 
     static bool blockPortEdgeOK(const BlockInst& b, int edge) {
@@ -469,7 +534,11 @@ namespace {
     }
 
     static void addChannelDirectionalUse(ChannelUse& use, int inEdge, int outEdge, double nets) {
-        if (inEdge == outEdge) return;
+        if (inEdge == outEdge) {
+            if (inEdge == 1 || inEdge == 3) use.tbNets += nets;
+            else if (inEdge == 2 || inEdge == 4) use.lrNets += nets;
+            return;
+        }
 
         if (isOppositeLR(inEdge, outEdge)) {
             use.lrNets += nets;
@@ -486,11 +555,24 @@ namespace {
     }
 
     static double ftRateForNetsLocal(const BlockSpec& spec, double ftNets) {
-        if (ftNets <= 3000.0) return spec.ftRate[0];
-        if (ftNets <= 6000.0) return spec.ftRate[1];
-        if (ftNets <= 9000.0) return spec.ftRate[2];
-        return spec.ftRate[3];
+        return feedthroughRateForNets(spec, ftNets);
     }
+
+    static double requiredAreaWithFeedthroughForAnyBlock(const BlockInst& b, double ftNets) {
+        const double baseArea = max(1.0, max(rectArea(b.rect), b.spec.area));
+        if (ftNets <= EPS) return baseArea;
+
+        const double rate = ftRateForNetsLocal(b.spec, ftNets);
+        const double delta = (ftNets / CHANNEL_DENSITY) * rate / 2.0;
+        const double side = sqrt(baseArea) + delta;
+        return max(baseArea, side * side);
+    }
+
+    struct RoutingRecomputeSummary {
+        vector<double> illegalFeedthroughUsed;
+        double illegalFeedthroughDeltaArea = 0.0;
+        int illegalFeedthroughCount = 0;
+    };
 
 
     enum class RouteInvalidReason {
@@ -553,6 +635,7 @@ namespace {
         const unordered_map<string, int>& channelMap,
         const Design& design
     ) {
+        (void)design;
         if (items.size() < 2) return false;
         if ((items.size() % 2) != 0) return false;
         if (!blockMap.count(items.front().name)) return false;
@@ -564,16 +647,11 @@ namespace {
 
             if (in.name != out.name) return false;
             if (!validEdge(in.edge) || !validEdge(out.edge)) return false;
-            if (in.edge == out.edge) return false;
-
             auto cit = channelMap.find(in.name);
             if (cit != channelMap.end()) continue;
 
             auto bit = blockMap.find(in.name);
             if (bit == blockMap.end()) return false;
-
-            // Only SOFT blocks can be intermediate feedthrough rectangles.
-            if (design.blocks[bit->second].spec.type != BlockType::SOFT) return false;
         }
 
         return true;
@@ -587,6 +665,7 @@ namespace {
         const Design& design,
         string& detail
     ) {
+        (void)design;
         if (items.size() < 2) { detail = "path has fewer than 2 items"; return RouteInvalidReason::BAD_NETS_OR_TOO_SHORT; }
         if ((items.size() % 2) != 0) { detail = "item count is odd; intermediate rectangles must be in/out pairs"; return RouteInvalidReason::BAD_TOPOLOGY; }
         if (!blockMap.count(items.front().name)) { detail = "first item is not a block: " + items.front().name; return RouteInvalidReason::BAD_TOPOLOGY; }
@@ -607,11 +686,6 @@ namespace {
                 detail = "invalid edge in intermediate pair: " + in.name;
                 return RouteInvalidReason::BAD_ITEM;
             }
-            if (in.edge == out.edge) {
-                detail = "same in/out edge in intermediate pair: " + in.name;
-                return RouteInvalidReason::SAME_OBJECT_SAME_EDGE;
-            }
-
             auto cit = channelMap.find(in.name);
             if (cit != channelMap.end()) continue;
 
@@ -619,11 +693,6 @@ namespace {
             if (bit == blockMap.end()) {
                 detail = "intermediate object is neither channel nor block: " + in.name;
                 return RouteInvalidReason::UNKNOWN_OBJECT;
-            }
-
-            if (design.blocks[bit->second].spec.type != BlockType::SOFT) {
-                detail = "non-soft block used as intermediate feedthrough: " + in.name;
-                return RouteInvalidReason::ILLEGAL_FEEDTHROUGH;
             }
         }
 
@@ -776,7 +845,8 @@ namespace {
         int routeId,
         const unordered_map<string, int>& blockMap,
         const unordered_map<string, int>& channelMap,
-        vector<ChannelUse>& channelUse
+        vector<ChannelUse>& channelUse,
+        RoutingRecomputeSummary& summary
     ) {
         const bool explicitOpen = routeOpen(route);
         const int nets = routeNetCount(route);
@@ -868,13 +938,9 @@ namespace {
                 }
 
                 if (a.name == b.name) {
-                    if (a.edge == b.edge) {
-                        markInvalid(RouteInvalidReason::SAME_OBJECT_SAME_EDGE, "same object traversal with identical in/out edge: " + a.name);
-                    }
-
                     auto cit = channelMap.find(a.name);
                     if (cit != channelMap.end()) {
-                        if (validEdge(a.edge) && validEdge(b.edge) && a.edge != b.edge) {
+                        if (validEdge(a.edge) && validEdge(b.edge)) {
                             addChannelDirectionalUse(channelUse[cit->second], a.edge, b.edge, static_cast<double>(max(0, nets)));
                         }
                     }
@@ -886,7 +952,9 @@ namespace {
                                 blk.ftUsed += static_cast<double>(max(0, nets));
                             }
                             else {
-                                markInvalid(RouteInvalidReason::ILLEGAL_FEEDTHROUGH, "non-soft block feedthrough: " + a.name);
+                                if (bit->second >= 0 && bit->second < static_cast<int>(summary.illegalFeedthroughUsed.size())) {
+                                    summary.illegalFeedthroughUsed[bit->second] += static_cast<double>(max(0, nets));
+                                }
                             }
                         }
                     }
@@ -928,11 +996,13 @@ namespace {
         setRouteWireLength(route, wl);
     }
 
-    static void recomputeRoutingStatsFromPaths(Design& design) {
+    static RoutingRecomputeSummary recomputeRoutingStatsFromPaths(Design& design) {
         auto blockMap = buildBlockMap(design);
         auto channelMap = buildChannelMap(design);
 
         vector<ChannelUse> channelUse(design.channels.size());
+        RoutingRecomputeSummary summary;
+        summary.illegalFeedthroughUsed.assign(design.blocks.size(), 0.0);
 
         for (auto& ch : design.channels) {
             ch.usedNets = 0.0;
@@ -946,7 +1016,7 @@ namespace {
 
         for (int rid = 0; rid < static_cast<int>(design.routes.size()); ++rid) {
             auto& route = design.routes[rid];
-            validateAndAccumulateOneRoute(design, route, rid, blockMap, channelMap, channelUse);
+            validateAndAccumulateOneRoute(design, route, rid, blockMap, channelMap, channelUse, summary);
         }
 
         for (int i = 0; i < static_cast<int>(design.channels.size()); ++i) {
@@ -974,28 +1044,75 @@ namespace {
             }
             ch.overflow = ovLR + ovTB;
         }
+
+        for (int i = 0; i < static_cast<int>(design.blocks.size()); ++i) {
+            const double illegalUsed = summary.illegalFeedthroughUsed[i];
+            if (illegalUsed <= EPS) continue;
+            const double baseArea = max(1.0, max(rectArea(design.blocks[i].rect), design.blocks[i].spec.area));
+            const double requiredArea = requiredAreaWithFeedthroughForAnyBlock(design.blocks[i], illegalUsed);
+            summary.illegalFeedthroughDeltaArea += max(0.0, requiredArea - baseArea);
+            ++summary.illegalFeedthroughCount;
+        }
+
+        return summary;
     }
 
 } // namespace
 
-EvalReport Evaluator::evaluate(Design& design, double alpha) {
+EvalReport Evaluator::evaluate(Design& design, double alpha, double runtimeSec) {
     EvalReport rpt;
 
     // Important: recompute routing statistics from PATH geometry.  Do not trust
     // stale p.wireLength, ch.usedNets, ch.capacity, or b.ftUsed left by the router.
-    recomputeRoutingStatsFromPaths(design);
+    RoutingRecomputeSummary routingSummary = recomputeRoutingStatsFromPaths(design);
     rpt.formatFailed = checkInternalOutputFormatLike(design);
 
     rpt.outlineArea = design.outlineW * design.outlineH;
     rpt.totalWireLength = calcTotalWireLength(design);
-    rpt.cost = rpt.outlineArea + alpha * rpt.totalWireLength;
+    rpt.baseCost = rpt.outlineArea + alpha * rpt.totalWireLength;
 
     rpt.blockOverlap = checkBlockOverlap(design, rpt.overlapCount);
     rpt.outlineViolation = checkOutlineViolation(design, rpt.outlineViolationCount);
     rpt.routingOpen = checkRoutingOpen(design, rpt.openPathCount);
 
-    calcChannelOverflow(design, rpt.totalChannelOverflow, rpt.maxChannelOverflow);
+    calcChannelOverflow(design, rpt.totalChannelOverflow, rpt.maxChannelOverflow, rpt.totalChannelCapacity);
     calcFeedthroughOverflow(design, rpt.totalFeedthroughOverflow, rpt.maxFeedthroughOverflow);
+
+    rpt.illegalFeedthroughDeltaArea = routingSummary.illegalFeedthroughDeltaArea;
+    rpt.illegalFeedthroughCount = routingSummary.illegalFeedthroughCount;
+
+    for (const auto& b : design.blocks) {
+        const double offset = edgeBlockLocationOffset(b, design.outlineW, design.outlineH);
+        if (offset > 0.0) {
+            rpt.edgeLocationOffset += offset;
+            ++rpt.edgeLocationViolationCount;
+        }
+    }
+
+    rpt.channelOverflowRate = rpt.totalChannelCapacity > EPS
+        ? rpt.totalChannelOverflow / rpt.totalChannelCapacity
+        : 0.0;
+
+    if (rpt.channelOverflowRate <= CHECKER_OVERFLOW_THRESHOLD) {
+        rpt.overflowPenalty = CHECKER_BETA_LIN * rpt.channelOverflowRate * rpt.outlineArea;
+    }
+    else {
+        rpt.overflowPenalty =
+            CHECKER_BETA_LIN * CHECKER_OVERFLOW_THRESHOLD * rpt.outlineArea +
+            CHECKER_BETA_TAIL * sqrt(max(0.0, rpt.channelOverflowRate - CHECKER_OVERFLOW_THRESHOLD)) * rpt.outlineArea;
+    }
+    if (rpt.totalChannelOverflow <= EPS) rpt.overflowPenalty = 0.0;
+
+    rpt.feedthroughPenalty = CHECKER_BETA_FT * rpt.totalFeedthroughOverflow;
+    rpt.illegalFeedthroughPenalty = CHECKER_LAMBDA_FT * rpt.illegalFeedthroughDeltaArea;
+    rpt.edgeLocationPenalty = CHECKER_GAMMA_EDGE * rpt.edgeLocationOffset;
+    rpt.runtimePenalty = CHECKER_DELTA_RUNTIME * max(0.0, runtimeSec) * sqrt(max(0.0, rpt.outlineArea));
+    rpt.warningPenaltyCost =
+        rpt.overflowPenalty +
+        rpt.feedthroughPenalty +
+        rpt.illegalFeedthroughPenalty +
+        rpt.edgeLocationPenalty;
+    rpt.cost = rpt.baseCost + rpt.warningPenaltyCost + rpt.runtimePenalty;
 
     return rpt;
 }
@@ -1020,7 +1137,8 @@ bool Evaluator::checkOutlineViolation(const Design& design, int& violationCount)
     violationCount = 0;
 
     if (design.outlineW <= EPS || design.outlineH <= EPS) ++violationCount;
-    if (design.outlineW > design.maxOutlineW + EPS || design.outlineH > design.maxOutlineH + EPS) ++violationCount;
+    if (design.outlineW > design.maxOutlineW + CHECKER_GEOM_EPS ||
+        design.outlineH > design.maxOutlineH + CHECKER_GEOM_EPS) ++violationCount;
 
     for (const auto& b : design.blocks) {
         const Rect& r = b.rect;
@@ -1029,13 +1147,15 @@ bool Evaluator::checkOutlineViolation(const Design& design, int& violationCount)
             continue;
         }
 
-        if (r.x < -EPS || r.y < -EPS || rectRight(r) > design.outlineW + EPS || rectTop(r) > design.outlineH + EPS) {
+        if (r.x < -CHECKER_GEOM_EPS ||
+            r.y < -CHECKER_GEOM_EPS ||
+            rectRight(r) > design.outlineW + CHECKER_GEOM_EPS ||
+            rectTop(r) > design.outlineH + CHECKER_GEOM_EPS) {
             ++violationCount;
         }
 
-        // Treat block shape / edge-location violations as placement violations.
+        // EDGE location is a checker warning with penalty, not a hard fail.
         if (!blockShapeOK(b)) ++violationCount;
-        if (!edgeBlockLocationOK(b, design.outlineW, design.outlineH)) ++violationCount;
     }
     return violationCount > 0;
 }
@@ -1049,9 +1169,10 @@ bool Evaluator::checkRoutingOpen(const Design& design, int& openPathCount) const
     return openPathCount > 0;
 }
 
-void Evaluator::calcChannelOverflow(Design& design, double& totalOverflow, double& maxOverflow) const {
+void Evaluator::calcChannelOverflow(Design& design, double& totalOverflow, double& maxOverflow, double& totalCapacity) const {
     totalOverflow = 0.0;
     maxOverflow = 0.0;
+    totalCapacity = 0.0;
 
     // evaluate() already calls recomputeRoutingStatsFromPaths().  This function
     // only sums the channel overflow stored on each channel, so it remains cheap.
@@ -1059,6 +1180,7 @@ void Evaluator::calcChannelOverflow(Design& design, double& totalOverflow, doubl
         ch.overflow = max(0.0, ch.overflow);
         totalOverflow += ch.overflow;
         maxOverflow = max(maxOverflow, ch.overflow);
+        totalCapacity += channelLRCapacity(ch.rect) + channelTBCapacity(ch.rect);
     }
 }
 
@@ -1067,13 +1189,7 @@ double Evaluator::ftRateForNets(const BlockSpec& spec, double ftNets) const {
 }
 
 double Evaluator::estimateRequiredAreaWithFT(const BlockInst& b) const {
-    const double baseArea = max(1.0, b.spec.area);
-    if (b.spec.type != BlockType::SOFT || b.ftUsed <= EPS) return baseArea;
-
-    double rate = ftRateForNets(b.spec, b.ftUsed);
-    double delta = (b.ftUsed / CHANNEL_DENSITY) * rate / 2.0;
-    double side = sqrt(baseArea) + delta;
-    return side * side;
+    return requiredSoftAreaWithFeedthrough(b);
 }
 void Evaluator::calcFeedthroughOverflow(Design& design, double& totalOverflow, double& maxOverflow) const {
     totalOverflow = 0.0;

@@ -3,20 +3,2150 @@
 #include "Utility.hpp"
 
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <deque>
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <map>
 #include <numeric>
+#include <optional>
 #include <random>
 #include <queue>
+#include <set>
+#include <stdexcept>
 #include <string>
-#include <vector>
 #include <functional>
+#include <tuple>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 using namespace std;
 
 namespace {
+
+namespace phase1_warm_start {
+
+    constexpr double FP_EPS = 1.0e-9;
+    constexpr unsigned FINAL_FRAME_SEED = 5u;
+
+    // These are the defaults of fast_sa_floorplan_channel_spread_v1(2).py.
+    constexpr unsigned DEFAULT_SEED = 20260716u;
+    constexpr int DEFAULT_RESTARTS = 12;
+    constexpr int DEFAULT_SMALL_RESTARTS = 4;
+    constexpr int DEFAULT_MEDIUM_RESTARTS = 10;
+    constexpr int DEFAULT_TEMPERATURE_LEVELS = 125;
+    constexpr int DEFAULT_FIXED_MOVES_PER_LEVEL = 16;
+    constexpr int DEFAULT_WARMUP_MOVES_PER_BLOCK = 8;
+    constexpr int DEFAULT_NORMALIZATION_SAMPLES = 128;
+    constexpr int DEFAULT_ARCHIVE_LIMIT = 16;
+    constexpr int DEFAULT_FINAL_CANDIDATES = 4;
+    constexpr int DEFAULT_PORTFOLIO_FRAME_SEEDS = 3;
+    constexpr int DEFAULT_PORTFOLIO_PHASE2_CANDIDATES = 6;
+    constexpr int DEFAULT_MEDIUM_PORTFOLIO_KEEP = 24;
+    constexpr int DEFAULT_PORTFOLIO_KEEP = 12;
+    constexpr int DEFAULT_HPWL_FORCE_ROUNDS = 2;
+    constexpr int DEFAULT_SOFT_POLISH_ROUNDS = 6;
+    constexpr int DEFAULT_GREEDY_LEVELS = 7;
+    constexpr double DEFAULT_GREEDY_C = 100.0;
+    constexpr double DEFAULT_INITIAL_ACCEPT = 0.90;
+    constexpr double DEFAULT_SUBTREE_RATE = 0.20;
+    constexpr int DEFAULT_FRAME_ATTEMPTS = 8192;
+    constexpr double DEFAULT_TARGET_UTILIZATION = 0.95;
+    constexpr bool DEFAULT_ALLOW_MACRO_ROTATE = false;
+
+    // The Python command-line default is false.  Set to true here only when the
+    // project wants the same effect as passing --channel-spread.
+    constexpr bool ENABLE_CHANNEL_SPREAD_BY_DEFAULT = false;
+    constexpr double DEFAULT_CHANNEL_DENSITY = 25.0;
+    constexpr int DEFAULT_CHANNEL_MAX_ROUTES = 16;
+    constexpr double DEFAULT_CHANNEL_MIN_DEMAND = 1.0;
+    constexpr double DEFAULT_CHANNEL_MIN_WIDTH = 1.0;
+    constexpr double DEFAULT_CHANNEL_OUTLINE_GROWTH = 0.08;
+    constexpr double DEFAULT_CHANNEL_MARGIN = 1.0e-4;
+    constexpr int DEFAULT_CHANNEL_MAX_PUSHES = 256;
+    constexpr int DEFAULT_CHANNEL_MAX_CHAIN = 128;
+
+    constexpr bool ENABLE_DUMMY_ALIGNMENT = true;
+    constexpr int DEFAULT_DUMMY_LEVELS = 120;
+    constexpr int DEFAULT_DUMMY_MOVES = 16;
+    constexpr int DEFAULT_DUMMY_FEEDBACK_LEVELS = 240;
+    constexpr int DEFAULT_DUMMY_FEEDBACK_MOVES = 24;
+    constexpr double DEFAULT_DUMMY_THICKNESS = 2.0;
+    constexpr int DEFAULT_DUMMY_MAX_BLOCKS = 128;
+    constexpr double DEFAULT_DUMMY_TEMPERATURE = 0.25;
+    constexpr double DEFAULT_DUMMY_COOLING = 0.94;
+    constexpr double DEFAULT_DUMMY_ALIGNMENT_WEIGHT = 0.35;
+    constexpr double DEFAULT_DUMMY_MAIN_CHANNEL_WEIGHT = 1.25;
+    constexpr double DEFAULT_DUMMY_BUFFER_WEIGHT = 0.35;
+    constexpr double DEFAULT_DUMMY_DIRECT_GAP_WEIGHT = 0.40;
+    constexpr double DEFAULT_DUMMY_FRAGMENT_WEIGHT = 0.12;
+    constexpr double DEFAULT_DUMMY_HPWL_WEIGHT = 0.08;
+    constexpr double DEFAULT_DUMMY_DISPLACEMENT_WEIGHT = 0.12;
+    constexpr double DEFAULT_DUMMY_ROUTE_DENSITY = 25.0;
+    constexpr int DEFAULT_DUMMY_MAIN_CHANNEL_LIMIT = 3;
+    constexpr int DEFAULT_DUMMY_MAX_CUTS = 64;
+    constexpr int DEFAULT_DUMMY_MAX_ACTIVE_CUTS = 12;
+    constexpr int DEFAULT_DUMMY_TEMPERATURE_SAMPLES = 24;
+    constexpr double DEFAULT_DUMMY_INITIAL_ACCEPT = 0.82;
+    constexpr double DEFAULT_DUMMY_FEEDBACK_HEADROOM_BASE = 1.15;
+    constexpr double DEFAULT_DUMMY_FEEDBACK_HEADROOM_PER_HOT_COMPONENT = 0.02;
+    constexpr double DEFAULT_DUMMY_HOTSPOT_CAPACITY_MARGIN = 1.08;
+    constexpr double DEFAULT_DUMMY_HOTSPOT_TRACK_MARGIN = 1.0;
+    constexpr double DEFAULT_DUMMY_AREA_WEIGHT = 0.22;
+    constexpr double DEFAULT_DUMMY_WASTED_AREA_WEIGHT = 0.10;
+
+    static double clampD(double value, double low, double high) {
+        if (low > high) return 0.5 * (low + high);
+        return max(low, min(high, value));
+    }
+
+    static double rightOf(const Rect& r) { return r.x + r.w; }
+    static double topOf(const Rect& r) { return r.y + r.h; }
+    static pair<double, double> centerOf(const Rect& r) {
+        return { r.x + 0.5 * r.w, r.y + 0.5 * r.h };
+    }
+
+    static double overlapArea(const Rect& a, const Rect& b) {
+        const double ow = max(0.0, min(rightOf(a), rightOf(b)) - max(a.x, b.x));
+        const double oh = max(0.0, min(topOf(a), topOf(b)) - max(a.y, b.y));
+        return ow * oh;
+    }
+
+    static string upperAscii(string s) {
+        transform(s.begin(), s.end(), s.begin(), [](unsigned char c) {
+            return static_cast<char>(toupper(c));
+            });
+        return s;
+    }
+
+    static vector<string> splitLocationTokens(const vector<string>& raw) {
+        vector<string> out;
+        for (const string& cell : raw) {
+            string cur;
+            for (char c : cell) {
+                if (c == ',' || c == ';' || c == '/' || isspace(static_cast<unsigned char>(c))) {
+                    if (!cur.empty()) {
+                        string token = upperAscii(cur);
+                        if (find(out.begin(), out.end(), token) == out.end()) out.push_back(token);
+                        cur.clear();
+                    }
+                }
+                else {
+                    cur.push_back(c);
+                }
+            }
+            if (!cur.empty()) {
+                string token = upperAscii(cur);
+                if (find(out.begin(), out.end(), token) == out.end()) out.push_back(token);
+            }
+        }
+        return out;
+    }
+
+    enum class Side { NONE, LEFT, RIGHT, BOTTOM, TOP };
+
+    struct RegionInfo {
+        Side side = Side::NONE;
+        int segment = 0;
+    };
+
+    static optional<RegionInfo> locationRegion(const string& token) {
+        static const map<string, RegionInfo> table = {
+            {"BL", {Side::BOTTOM, 0}}, {"BM", {Side::BOTTOM, 1}}, {"BR", {Side::BOTTOM, 2}},
+            {"LB", {Side::LEFT, 0}},   {"LM", {Side::LEFT, 1}},   {"LT", {Side::LEFT, 2}},
+            {"RB", {Side::RIGHT, 0}}, {"RM", {Side::RIGHT, 1}},  {"RT", {Side::RIGHT, 2}},
+            {"TL", {Side::TOP, 0}},   {"TM", {Side::TOP, 1}},    {"TR", {Side::TOP, 2}},
+        };
+        auto it = table.find(upperAscii(token));
+        if (it == table.end()) return nullopt;
+        return it->second;
+    }
+
+    static const char* sideName(Side side) {
+        switch (side) {
+        case Side::LEFT: return "LEFT";
+        case Side::RIGHT: return "RIGHT";
+        case Side::BOTTOM: return "BOTTOM";
+        case Side::TOP: return "TOP";
+        default: return "NONE";
+        }
+    }
+
+    struct PBlock {
+        int index = -1;
+        string name;
+        double area = 0.0;
+        double baseW = 0.0;
+        double baseH = 0.0;
+        double arMin = 0.5;
+        double arMax = 2.0;
+        BlockType type = BlockType::HARD;
+        vector<string> tokens;
+        int portEdge = 0;
+
+        bool isSoft() const { return type == BlockType::SOFT; }
+        bool isEdge() const { return type == BlockType::EDGE; }
+        bool isMacro() const { return type == BlockType::HARD; }
+
+        Side boundarySide() const {
+            if (!isEdge()) return Side::NONE;
+            for (const string& token : tokens) {
+                auto info = locationRegion(token);
+                if (info) return info->side;
+            }
+            return Side::NONE;
+        }
+
+        vector<Side> boundarySides() const {
+            vector<Side> sides;
+            for (const string& token : tokens) {
+                auto info = locationRegion(token);
+                if (!info) continue;
+                if (find(sides.begin(), sides.end(), info->side) == sides.end()) sides.push_back(info->side);
+            }
+            return sides;
+        }
+
+        vector<int> annealSegments() const {
+            vector<int> segments;
+            const Side primary = boundarySide();
+            for (const string& token : tokens) {
+                auto info = locationRegion(token);
+                if (!info || info->side != primary) continue;
+                if (find(segments.begin(), segments.end(), info->segment) == segments.end()) {
+                    segments.push_back(info->segment);
+                }
+            }
+            sort(segments.begin(), segments.end());
+            return segments;
+        }
+
+        bool isCornerEdge() const {
+            const vector<Side> sides = boundarySides();
+            const bool horizontal = find(sides.begin(), sides.end(), Side::LEFT) != sides.end() ||
+                find(sides.begin(), sides.end(), Side::RIGHT) != sides.end();
+            const bool vertical = find(sides.begin(), sides.end(), Side::BOTTOM) != sides.end() ||
+                find(sides.begin(), sides.end(), Side::TOP) != sides.end();
+            return horizontal && vertical;
+        }
+    };
+
+    struct PConnection {
+        int source = -1;
+        int target = -1;
+        double weight = 0.0;
+    };
+
+    struct Problem {
+        vector<PBlock> blocks;
+        double maxW = 0.0;
+        double maxH = 0.0;
+        double alpha = 0.2;
+        vector<PConnection> connections;
+        vector<set<Side>> sideSets;
+        map<Side, vector<int>> boundaryIndices;
+        double totalArea = 0.0;
+        double boundaryMinW = 0.0;
+        double boundaryMinH = 0.0;
+    };
+
+    static Problem makeProblem(const Design& design) {
+        Problem p;
+        p.maxW = design.maxOutlineW;
+        p.maxH = design.maxOutlineH;
+        // The project Design does not expose a separate alpha field in the supplied
+        // interface.  Keep the Python default when no command-line/CSV alpha exists.
+        p.alpha = 0.2;
+        p.blocks.reserve(design.blockSpecs.size());
+        for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) {
+            const BlockSpec& s = design.blockSpecs[i];
+            PBlock b;
+            b.index = i;
+            b.name = s.name;
+            b.type = s.type;
+            const double floorplanArea = s.floorplanAreaOverride > FP_EPS ? max(s.area, s.floorplanAreaOverride) : s.area;
+            b.area = s.hasFixedSize ? s.fixedW * s.fixedH : floorplanArea;
+            b.arMin = max(1.0e-6, s.aspectMin);
+            b.arMax = max(b.arMin, s.aspectMax);
+            if (s.hasFixedSize) {
+                b.baseW = s.fixedW;
+                b.baseH = s.fixedH;
+            }
+            else {
+                const double ratio = clampD(1.0, b.arMin, b.arMax);
+                b.baseW = sqrt(max(b.area, FP_EPS) * ratio);
+                b.baseH = b.area / max(b.baseW, FP_EPS);
+            }
+            b.tokens = splitLocationTokens(s.locations);
+            b.portEdge = s.portEdges.empty() ? 0 : s.portEdges.front();
+            if (b.isEdge() && b.boundarySide() == Side::NONE) {
+                throw runtime_error(b.name + ": EDGE block requires a valid LOCATION token");
+            }
+            p.totalArea += b.area;
+            p.blocks.push_back(std::move(b));
+        }
+
+        if (!design.connections.empty()) {
+            for (const auto& c : design.connections) {
+                if (c.src < 0 || c.dst < 0 || c.src >= static_cast<int>(p.blocks.size()) ||
+                    c.dst >= static_cast<int>(p.blocks.size()) || c.netCount <= 0) continue;
+                p.connections.push_back({ c.src, c.dst, static_cast<double>(c.netCount) });
+            }
+        }
+        else {
+            for (int i = 0; i < static_cast<int>(design.connMatrix.size()); ++i) {
+                for (int j = 0; j < static_cast<int>(design.connMatrix[i].size()); ++j) {
+                    if (i == j || design.connMatrix[i][j] <= 0) continue;
+                    p.connections.push_back({ i, j, static_cast<double>(design.connMatrix[i][j]) });
+                }
+            }
+        }
+
+        p.sideSets.resize(p.blocks.size());
+        for (const PBlock& b : p.blocks) {
+            for (Side s : b.boundarySides()) {
+                p.sideSets[b.index].insert(s);
+                p.boundaryIndices[s].push_back(b.index);
+            }
+        }
+        double bottomW = 0.0, topW = 0.0, leftH = 0.0, rightH = 0.0;
+        for (int id : p.boundaryIndices[Side::BOTTOM]) bottomW += p.blocks[id].baseW;
+        for (int id : p.boundaryIndices[Side::TOP]) topW += p.blocks[id].baseW;
+        for (int id : p.boundaryIndices[Side::LEFT]) leftH += p.blocks[id].baseH;
+        for (int id : p.boundaryIndices[Side::RIGHT]) rightH += p.blocks[id].baseH;
+        p.boundaryMinW = max(bottomW, topW);
+        p.boundaryMinH = max(leftH, rightH);
+        return p;
+    }
+
+    struct State {
+        int root = -1;
+        vector<int> parent;
+        vector<int> left;
+        vector<int> right;
+        vector<int> moduleAt;
+        vector<char> rotated;
+        vector<double> softAr;
+    };
+
+    struct Placement {
+        vector<Rect> rects;
+        map<int, Rect> nodeRects;
+        double W = 0.0;
+        double H = 0.0;
+        double decodedW = 0.0;
+        double decodedH = 0.0;
+        int compactRounds = 0;
+        int horizontalMoves = 0;
+        int verticalMoves = 0;
+    };
+
+    struct ChannelReserve {
+        string name;
+        int source = -1;
+        int target = -1;
+        double demand = 0.0;
+        char orientation = 'H';
+        Rect rect;
+        int routeIndex = 0;
+        int segmentIndex = 0;
+    };
+
+    static pair<double, double> blockShape(const Problem& p, const State& st, int blockId) {
+        const PBlock& b = p.blocks[blockId];
+        if (b.isSoft()) {
+            const double ratio = clampD(st.softAr[blockId], b.arMin, b.arMax);
+            const double w = sqrt(max(b.area, FP_EPS) * ratio);
+            return { w, b.area / max(w, FP_EPS) };
+        }
+        double w = b.baseW, h = b.baseH;
+        if (st.rotated[blockId]) swap(w, h);
+        return { w, h };
+    }
+
+    static pair<double, double> portPoint(const PBlock& b, const Rect& r) {
+        switch (b.portEdge) {
+        case 1: return { r.x, r.y + 0.5 * r.h };
+        case 2: return { r.x + 0.5 * r.w, topOf(r) };
+        case 3: return { rightOf(r), r.y + 0.5 * r.h };
+        case 4: return { r.x + 0.5 * r.w, r.y };
+        default: return centerOf(r);
+        }
+    }
+
+    static double weightedPortHpwl(const Problem& p, const Placement& placement) {
+        double total = 0.0;
+        for (const PConnection& c : p.connections) {
+            const auto s = portPoint(p.blocks[c.source], placement.rects[c.source]);
+            const auto t = portPoint(p.blocks[c.target], placement.rects[c.target]);
+            total += c.weight * (fabs(s.first - t.first) + fabs(s.second - t.second));
+        }
+        return total;
+    }
+
+    static double weightedCenterHpwl(const Problem& p, const Placement& placement) {
+        double total = 0.0;
+        for (const PConnection& c : p.connections) {
+            const auto s = centerOf(placement.rects[c.source]);
+            const auto t = centerOf(placement.rects[c.target]);
+            total += c.weight * (fabs(s.first - t.first) + fabs(s.second - t.second));
+        }
+        return total;
+    }
+
+    class HorizontalContour {
+    public:
+        double query(double x1, double x2) const {
+            double result = 0.0;
+            for (const auto& s : segments_) {
+                if (get<0>(s) < x2 - FP_EPS && get<1>(s) > x1 + FP_EPS) {
+                    result = max(result, get<2>(s));
+                }
+            }
+            return result;
+        }
+
+        void update(double x1, double x2, double h) {
+            vector<tuple<double, double, double>> next;
+            for (const auto& s : segments_) {
+                const double l = get<0>(s), r = get<1>(s), oldH = get<2>(s);
+                if (r <= x1 + FP_EPS || l >= x2 - FP_EPS) {
+                    next.push_back(s);
+                    continue;
+                }
+                if (l < x1 - FP_EPS) next.emplace_back(l, x1, oldH);
+                if (r > x2 + FP_EPS) next.emplace_back(x2, r, oldH);
+            }
+            next.emplace_back(x1, x2, h);
+            sort(next.begin(), next.end(), [](const auto& a, const auto& b) {
+                return get<0>(a) < get<0>(b);
+                });
+            vector<tuple<double, double, double>> merged;
+            for (const auto& s : next) {
+                if (!merged.empty() && fabs(get<1>(merged.back()) - get<0>(s)) <= FP_EPS &&
+                    fabs(get<2>(merged.back()) - get<2>(s)) <= FP_EPS) {
+                    get<1>(merged.back()) = get<1>(s);
+                }
+                else {
+                    merged.push_back(s);
+                }
+            }
+            segments_.swap(merged);
+        }
+
+    private:
+        vector<tuple<double, double, double>> segments_;
+    };
+
+    static Placement contourPack(const Problem& p, const State& st) {
+        if (st.root < 0) throw runtime_error("Cannot pack an empty B*-tree");
+        Placement out;
+        out.rects.resize(p.blocks.size());
+        HorizontalContour contour;
+        vector<int> stack{ st.root };
+        vector<char> visited(st.moduleAt.size(), 0);
+        int visitedCount = 0;
+        while (!stack.empty()) {
+            const int node = stack.back();
+            stack.pop_back();
+            if (node < 0 || node >= static_cast<int>(st.moduleAt.size()) || visited[node]) {
+                throw runtime_error("Invalid B*-tree: cycle detected");
+            }
+            visited[node] = 1;
+            ++visitedCount;
+            const int blockId = st.moduleAt[node];
+            const auto [w, h] = blockShape(p, st, blockId);
+            double x = 0.0;
+            const int parent = st.parent[node];
+            if (parent != -1) {
+                const Rect& pr = out.nodeRects.at(parent);
+                if (st.left[parent] == node) x = rightOf(pr);
+                else if (st.right[parent] == node) x = pr.x;
+                else throw runtime_error("Invalid B*-tree parent/child relation");
+            }
+            const double y = contour.query(x, x + w);
+            Rect r;
+            r.x = x; r.y = y; r.w = w; r.h = h;
+            out.rects[blockId] = r;
+            out.nodeRects[node] = r;
+            contour.update(x, x + w, y + h);
+            if (st.right[node] != -1) stack.push_back(st.right[node]);
+            if (st.left[node] != -1) stack.push_back(st.left[node]);
+        }
+        if (visitedCount != static_cast<int>(st.moduleAt.size())) {
+            throw runtime_error("Invalid B*-tree: disconnected node detected");
+        }
+        for (const Rect& r : out.rects) {
+            out.W = max(out.W, rightOf(r));
+            out.H = max(out.H, topOf(r));
+        }
+        out.W = max(out.W, FP_EPS);
+        out.H = max(out.H, FP_EPS);
+        out.decodedW = out.W;
+        out.decodedH = out.H;
+        return out;
+    }
+
+    static bool hasSide(const Problem& p, int id, Side s) {
+        return p.sideSets[id].find(s) != p.sideSets[id].end();
+    }
+
+    static bool edgeLocationRegionsOk(const PBlock& block, const Rect& r,
+        double W, double H, bool includeCornerSide = true) {
+        if (!block.isEdge() || block.tokens.empty()) return true;
+        vector<Side> sides = includeCornerSide ? block.boundarySides() : vector<Side>{ block.boundarySide() };
+        for (Side side : sides) {
+            if (side == Side::NONE) continue;
+            vector<int> segments;
+            for (const string& token : block.tokens) {
+                auto info = locationRegion(token);
+                if (info && info->side == side) segments.push_back(info->segment);
+            }
+            const double scale = (side == Side::BOTTOM || side == Side::TOP) ? W : H;
+            const double low = (side == Side::BOTTOM || side == Side::TOP) ? r.x : r.y;
+            const double high = (side == Side::BOTTOM || side == Side::TOP) ? rightOf(r) : topOf(r);
+            sort(segments.begin(), segments.end());
+            segments.erase(unique(segments.begin(), segments.end()), segments.end());
+            bool ok = false;
+            for (int segment : segments) {
+                const double regionLow = segment * scale / 3.0;
+                const double regionHigh = (segment + 1) * scale / 3.0;
+                if (min(high, regionHigh) > max(low, regionLow) + 1.0e-7) {
+                    ok = true;
+                    break;
+                }
+            }
+            if (!ok) return false;
+        }
+        return true;
+    }
+
+    static optional<pair<double, double>> locationFractionRun(
+        const PBlock& block, char axis, const Rect& r, double extent) {
+        const bool horizontalAxis = axis == 'H';
+        vector<int> segments;
+        for (const string& token : block.tokens) {
+            auto info = locationRegion(token);
+            if (!info) continue;
+            const bool relevant = horizontalAxis
+                ? (info->side == Side::BOTTOM || info->side == Side::TOP)
+                : (info->side == Side::LEFT || info->side == Side::RIGHT);
+            if (relevant && find(segments.begin(), segments.end(), info->segment) == segments.end()) {
+                segments.push_back(info->segment);
+            }
+        }
+        if (segments.empty()) return nullopt;
+        sort(segments.begin(), segments.end());
+        vector<pair<int, int>> runs;
+        int start = segments.front(), prev = segments.front();
+        for (size_t i = 1; i < segments.size(); ++i) {
+            if (segments[i] == prev + 1) {
+                prev = segments[i];
+            }
+            else {
+                runs.emplace_back(start, prev);
+                start = prev = segments[i];
+            }
+        }
+        runs.emplace_back(start, prev);
+        const double projectionLow = horizontalAxis ? r.x : r.y;
+        const double projectionHigh = horizontalAxis ? rightOf(r) : topOf(r);
+        auto score = [&](const pair<int, int>& run) {
+            const double lo = run.first * extent / 3.0;
+            const double hi = (run.second + 1) * extent / 3.0;
+            const double overlap = max(0.0, min(projectionHigh, hi) - max(projectionLow, lo));
+            const double distance = max({ lo - projectionHigh, projectionLow - hi, 0.0 });
+            return make_pair(overlap, -distance);
+            };
+        auto selected = *max_element(runs.begin(), runs.end(), [&](const auto& a, const auto& b) {
+            return score(a) < score(b);
+            });
+        return pair<double, double>{selected.first / 3.0, (selected.second + 1) / 3.0};
+    }
+
+    static pair<vector<double>, double> solveSparseBoundaryAxis(
+        const Problem& p, const vector<Rect>& rects, char axis,
+        double currentExtent, bool towardLow) {
+        const int n = static_cast<int>(rects.size());
+        vector<double> physical(n), sizes(n), projLow(n), projHigh(n);
+        Side physicalLow, physicalHigh;
+        if (axis == 'H') {
+            physicalLow = Side::LEFT; physicalHigh = Side::RIGHT;
+            for (int i = 0; i < n; ++i) {
+                physical[i] = rects[i].x; sizes[i] = rects[i].w;
+                projLow[i] = rects[i].y; projHigh[i] = topOf(rects[i]);
+            }
+        }
+        else {
+            physicalLow = Side::BOTTOM; physicalHigh = Side::TOP;
+            for (int i = 0; i < n; ++i) {
+                physical[i] = rects[i].y; sizes[i] = rects[i].h;
+                projLow[i] = rects[i].x; projHigh[i] = rightOf(rects[i]);
+            }
+        }
+        vector<double> coord = physical;
+        if (!towardLow) {
+            for (int i = 0; i < n; ++i) coord[i] = currentExtent - physical[i] - sizes[i];
+        }
+        const Side lowSide = towardLow ? physicalLow : physicalHigh;
+        const Side highSide = towardLow ? physicalHigh : physicalLow;
+
+        vector<pair<int, int>> edges;
+        for (int a = 0; a < n; ++a) {
+            for (int b = a + 1; b < n; ++b) {
+                if (min(projHigh[a], projHigh[b]) <= max(projLow[a], projLow[b]) + FP_EPS) continue;
+                if (coord[a] + sizes[a] <= coord[b] + FP_EPS) edges.emplace_back(a, b);
+                else if (coord[b] + sizes[b] <= coord[a] + FP_EPS) edges.emplace_back(b, a);
+                else throw runtime_error("Exact boundary placement overlaps before sparse compaction");
+            }
+        }
+
+        vector<vector<int>> adj(n);
+        vector<int> indegree(n, 0);
+        for (auto [u, v] : edges) { adj[u].push_back(v); ++indegree[v]; }
+        priority_queue<int, vector<int>, greater<int>> q;
+        for (int i = 0; i < n; ++i) if (indegree[i] == 0) q.push(i);
+        vector<int> order;
+        while (!q.empty()) {
+            int u = q.top(); q.pop(); order.push_back(u);
+            for (int v : adj[u]) if (--indegree[v] == 0) q.push(v);
+        }
+        if (static_cast<int>(order.size()) != n) throw runtime_error("Sparse boundary graph contains a cycle");
+
+        const vector<int>& lowAnchors = p.boundaryIndices.count(lowSide) ? p.boundaryIndices.at(lowSide) : vector<int>{};
+        const vector<int>& highAnchors = p.boundaryIndices.count(highSide) ? p.boundaryIndices.at(highSide) : vector<int>{};
+        set<int> incoming;
+        for (auto [u, v] : edges) incoming.insert(v);
+        for (int id : lowAnchors) if (incoming.count(id)) throw runtime_error("Relation before low-side EDGE");
+        for (int id : highAnchors) if (!adj[id].empty()) throw runtime_error("Relation after high-side EDGE");
+
+        vector<optional<pair<double, double>>> fractions(n);
+        for (int i = 0; i < n; ++i) {
+            fractions[i] = locationFractionRun(p.blocks[i], axis, rects[i], max(currentExtent, FP_EPS));
+            if (fractions[i] && !towardLow) {
+                fractions[i] = pair<double, double>{ 1.0 - fractions[i]->second, 1.0 - fractions[i]->first };
+            }
+        }
+        set<int> lowSet(lowAnchors.begin(), lowAnchors.end());
+        vector<double> pos(n, 0.0);
+        for (int u : order) for (int v : adj[u]) pos[v] = max(pos[v], pos[u] + sizes[u]);
+        double extent = FP_EPS;
+        for (int i = 0; i < n; ++i) extent = max(extent, pos[i] + sizes[i]);
+
+        bool converged = false;
+        for (int iter = 0; iter < max(64, 8 * n); ++iter) {
+            fill(pos.begin(), pos.end(), 0.0);
+            const double margin = max(1.0e-5, extent * 1.0e-8);
+            for (int i = 0; i < n; ++i) {
+                if (!fractions[i] || lowSet.count(i)) continue;
+                pos[i] = max(0.0, fractions[i]->first * extent - sizes[i] + margin);
+            }
+            for (int u : order) for (int v : adj[u]) pos[v] = max(pos[v], pos[u] + sizes[u]);
+            double newExtent = FP_EPS;
+            for (int i = 0; i < n; ++i) newExtent = max(newExtent, pos[i] + sizes[i]);
+            for (int i = 0; i < n; ++i) {
+                if (!fractions[i]) continue;
+                const double highF = fractions[i]->second;
+                if (highF < 1.0 - FP_EPS) newExtent = max(newExtent, (pos[i] + margin) / highF);
+            }
+            if (fabs(newExtent - extent) <= 1.0e-12 * max(extent, 1.0)) {
+                extent = newExtent;
+                converged = true;
+                break;
+            }
+            extent = newExtent;
+        }
+        if (!converged) throw runtime_error("Sparse LOCATION fixed point did not converge");
+        for (int id : highAnchors) pos[id] = extent - sizes[id];
+        for (auto [u, v] : edges) {
+            if (pos[v] + 1.0e-7 < pos[u] + sizes[u]) throw runtime_error("Anchored separation failed");
+        }
+
+        const double tolerance = 1.0e-7 * max(currentExtent, 1.0);
+        if (extent > currentExtent + tolerance) return { physical, currentExtent };
+        for (int i = 0; i < n; ++i) if (pos[i] > coord[i] + tolerance) return { physical, currentExtent };
+        if (towardLow) return { pos, max(extent, FP_EPS) };
+        vector<double> reflected(n);
+        for (int i = 0; i < n; ++i) reflected[i] = extent - pos[i] - sizes[i];
+        return { reflected, max(extent, FP_EPS) };
+    }
+
+    static Placement iterativeDirectionalCompact(const Problem& p, const State& st,
+        const Placement& base,
+        bool horizontalTowardLow,
+        bool verticalTowardLow) {
+        Placement result = base;
+        vector<Rect> rects = base.rects;
+        double W = max(base.W, FP_EPS), H = max(base.H, FP_EPS);
+        const int n = static_cast<int>(rects.size());
+        const int maxRounds = max(4, n * n + 1);
+        int hMoves = 0, vMoves = 0, rounds = 0;
+        for (int round = 1; round <= maxRounds; ++round) {
+            vector<double> oldX(n), oldY(n);
+            for (int i = 0; i < n; ++i) { oldX[i] = rects[i].x; oldY[i] = rects[i].y; }
+            const double oldW = W, oldH = H;
+            auto xSolved = solveSparseBoundaryAxis(p, rects, 'H', W, horizontalTowardLow);
+            for (int i = 0; i < n; ++i) {
+                if (fabs(xSolved.first[i] - rects[i].x) > FP_EPS) ++hMoves;
+                rects[i].x = xSolved.first[i];
+            }
+            W = xSolved.second;
+            auto ySolved = solveSparseBoundaryAxis(p, rects, 'V', H, verticalTowardLow);
+            for (int i = 0; i < n; ++i) {
+                if (fabs(ySolved.first[i] - rects[i].y) > FP_EPS) ++vMoves;
+                rects[i].y = ySolved.first[i];
+            }
+            H = ySolved.second;
+            rounds = round;
+            double maxChange = max(fabs(W - oldW), fabs(H - oldH));
+            for (int i = 0; i < n; ++i) {
+                maxChange = max(maxChange, fabs(rects[i].x - oldX[i]));
+                maxChange = max(maxChange, fabs(rects[i].y - oldY[i]));
+            }
+            const double scale = max({ W, H, oldW, oldH, 1.0 });
+            const double areaChange = fabs(W * H - oldW * oldH);
+            if (maxChange <= 1.0e-9 * scale &&
+                areaChange <= 1.0e-9 * max({ W * H, oldW * oldH, 1.0 })) break;
+            if (round == maxRounds) throw runtime_error("Final constrained compaction did not converge");
+        }
+
+        for (int a = 0; a < n; ++a) for (int b = a + 1; b < n; ++b) {
+            if (overlapArea(rects[a], rects[b]) > 1.0e-5) throw runtime_error("Compaction created overlap");
+        }
+        for (int i = 0; i < n; ++i) {
+            const Rect& r = rects[i];
+            if (hasSide(p, i, Side::LEFT) && fabs(r.x) > 1.0e-7) throw runtime_error("LEFT EDGE lost boundary");
+            if (hasSide(p, i, Side::RIGHT) && fabs(rightOf(r) - W) > 1.0e-7) throw runtime_error("RIGHT EDGE lost boundary");
+            if (hasSide(p, i, Side::BOTTOM) && fabs(r.y) > 1.0e-7) throw runtime_error("BOTTOM EDGE lost boundary");
+            if (hasSide(p, i, Side::TOP) && fabs(topOf(r) - H) > 1.0e-7) throw runtime_error("TOP EDGE lost boundary");
+            if (!edgeLocationRegionsOk(p.blocks[i], r, W, H, true)) throw runtime_error("EDGE left LOCATION interval");
+        }
+        result.rects = std::move(rects);
+        result.W = result.decodedW = W;
+        result.H = result.decodedH = H;
+        result.compactRounds = rounds;
+        result.horizontalMoves = hMoves;
+        result.verticalMoves = vMoves;
+        result.nodeRects.clear();
+        for (int node = 0; node < static_cast<int>(st.moduleAt.size()); ++node) {
+            result.nodeRects[node] = result.rects[st.moduleAt[node]];
+        }
+        return result;
+    }
+
+    static Placement boundaryConstraintCompact(const Problem& p, const State& st, const Placement& base) {
+        const int n = static_cast<int>(p.blocks.size());
+        vector<pair<int, int>> horizontal, vertical;
+
+        auto candidateRelation = [&](int a, int b, char axis) -> optional<pair<int, int>> {
+            Side lowSide, highSide;
+            double ca, cb;
+            if (axis == 'H') {
+                lowSide = Side::LEFT; highSide = Side::RIGHT;
+                ca = centerOf(base.rects[a]).first; cb = centerOf(base.rects[b]).first;
+            }
+            else {
+                lowSide = Side::BOTTOM; highSide = Side::TOP;
+                ca = centerOf(base.rects[a]).second; cb = centerOf(base.rects[b]).second;
+            }
+            auto anchorSide = [&](int id) {
+                if (hasSide(p, id, lowSide)) return lowSide;
+                if (hasSide(p, id, highSide)) return highSide;
+                return Side::NONE;
+                };
+            const Side sa = anchorSide(a), sb = anchorSide(b);
+            if (sa == sb && (sa == lowSide || sa == highSide)) return nullopt;
+            auto key = [&](int id, Side s, double c) {
+                int rank = s == lowSide ? -1 : (s == highSide ? 1 : 0);
+                return tuple<int, double, int>{rank, c, id};
+                };
+            int source = a, target = b;
+            if (key(b, sb, cb) < key(a, sa, ca)) { source = b; target = a; }
+            const Side sourceSide = source == a ? sa : sb;
+            const Side targetSide = target == a ? sa : sb;
+            if (sourceSide == highSide || targetSide == lowSide) return nullopt;
+            return pair<int, int>{source, target};
+            };
+
+        for (int a = 0; a < n; ++a) {
+            for (int b = a + 1; b < n; ++b) {
+                optional<tuple<int, int, double>> hBase, vBase;
+                if (rightOf(base.rects[a]) <= base.rects[b].x + FP_EPS)
+                    hBase = tuple<int, int, double>{ a, b, max(0.0, base.rects[b].x - rightOf(base.rects[a])) };
+                else if (rightOf(base.rects[b]) <= base.rects[a].x + FP_EPS)
+                    hBase = tuple<int, int, double>{ b, a, max(0.0, base.rects[a].x - rightOf(base.rects[b])) };
+                if (topOf(base.rects[a]) <= base.rects[b].y + FP_EPS)
+                    vBase = tuple<int, int, double>{ a, b, max(0.0, base.rects[b].y - topOf(base.rects[a])) };
+                else if (topOf(base.rects[b]) <= base.rects[a].y + FP_EPS)
+                    vBase = tuple<int, int, double>{ b, a, max(0.0, base.rects[a].y - topOf(base.rects[b])) };
+                if (!hBase && !vBase) throw runtime_error("Contour placement overlaps before boundary compaction");
+
+                vector<tuple<double, char, pair<int, int>>> choices;
+                auto hc = candidateRelation(a, b, 'H');
+                auto vc = candidateRelation(a, b, 'V');
+                if (hc) {
+                    double score = 1.0;
+                    if (hBase && hc->first == get<0>(*hBase) && hc->second == get<1>(*hBase))
+                        score = get<2>(*hBase) / max(base.W, 1.0);
+                    choices.emplace_back(score, 'H', *hc);
+                }
+                if (vc) {
+                    double score = 1.0;
+                    if (vBase && vc->first == get<0>(*vBase) && vc->second == get<1>(*vBase))
+                        score = get<2>(*vBase) / max(base.H, 1.0);
+                    choices.emplace_back(score, 'V', *vc);
+                }
+                if (choices.empty()) throw runtime_error("No boundary-compatible separation direction");
+                const auto chosen = *min_element(choices.begin(), choices.end());
+                if (get<1>(chosen) == 'H') horizontal.push_back(get<2>(chosen));
+                else vertical.push_back(get<2>(chosen));
+            }
+        }
+
+        auto solveAxis = [&](char axis, const vector<pair<int, int>>& edges,
+            const vector<double>& sizes,
+            const vector<int>& lowAnchors,
+            const vector<int>& highAnchors) {
+                vector<vector<int>> adj(n);
+                vector<int> indegree(n, 0);
+                for (auto [u, v] : edges) { adj[u].push_back(v); ++indegree[v]; }
+                priority_queue<int, vector<int>, greater<int>> q;
+                for (int i = 0; i < n; ++i) if (indegree[i] == 0) q.push(i);
+                vector<int> order;
+                while (!q.empty()) {
+                    int u = q.top(); q.pop(); order.push_back(u);
+                    for (int v : adj[u]) if (--indegree[v] == 0) q.push(v);
+                }
+                if (static_cast<int>(order.size()) != n) throw runtime_error("Boundary separation graph cycle");
+                set<int> incoming;
+                for (auto [u, v] : edges) incoming.insert(v);
+                for (int id : lowAnchors) if (incoming.count(id)) throw runtime_error("Block before low-side EDGE");
+                for (int id : highAnchors) if (!adj[id].empty()) throw runtime_error("Block after high-side EDGE");
+
+                vector<optional<pair<double, double>>> fractions(n);
+                for (int i = 0; i < n; ++i) {
+                    vector<int> segments;
+                    for (const string& token : p.blocks[i].tokens) {
+                        auto info = locationRegion(token);
+                        if (!info) continue;
+                        bool relevant = axis == 'H'
+                            ? (info->side == Side::BOTTOM || info->side == Side::TOP)
+                            : (info->side == Side::LEFT || info->side == Side::RIGHT);
+                        if (relevant) segments.push_back(info->segment);
+                    }
+                    if (!segments.empty()) {
+                        fractions[i] = pair<double, double>{ *min_element(segments.begin(), segments.end()) / 3.0,
+                            (*max_element(segments.begin(), segments.end()) + 1) / 3.0 };
+                    }
+                }
+                vector<double> pos(n, 0.0);
+                for (int u : order) for (int v : adj[u]) pos[v] = max(pos[v], pos[u] + sizes[u]);
+                double extent = FP_EPS;
+                for (int i = 0; i < n; ++i) extent = max(extent, pos[i] + sizes[i]);
+                set<int> lowSet(lowAnchors.begin(), lowAnchors.end());
+                bool converged = false;
+                for (int iter = 0; iter < max(64, 8 * n); ++iter) {
+                    fill(pos.begin(), pos.end(), 0.0);
+                    const double margin = max(1.0e-5, extent * 1.0e-8);
+                    for (int i = 0; i < n; ++i) {
+                        if (!fractions[i] || lowSet.count(i)) continue;
+                        pos[i] = max(0.0, fractions[i]->first * extent - sizes[i] + margin);
+                    }
+                    for (int u : order) for (int v : adj[u]) pos[v] = max(pos[v], pos[u] + sizes[u]);
+                    double newExtent = FP_EPS;
+                    for (int i = 0; i < n; ++i) newExtent = max(newExtent, pos[i] + sizes[i]);
+                    for (int i = 0; i < n; ++i) if (fractions[i] && fractions[i]->second < 1.0 - FP_EPS)
+                        newExtent = max(newExtent, (pos[i] + margin) / fractions[i]->second);
+                    if (fabs(newExtent - extent) <= 1.0e-12 * max(extent, 1.0)) {
+                        extent = newExtent; converged = true; break;
+                    }
+                    extent = newExtent;
+                }
+                if (!converged) throw runtime_error("Fractional LOCATION bounds did not converge");
+                for (int id : highAnchors) pos[id] = extent - sizes[id];
+                for (auto [u, v] : edges) if (pos[v] + 1.0e-7 < pos[u] + sizes[u])
+                    throw runtime_error("Anchored separation failed");
+                return pair<vector<double>, double>{pos, max(extent, FP_EPS)};
+            };
+
+        vector<double> widths(n), heights(n);
+        for (int i = 0; i < n; ++i) { widths[i] = base.rects[i].w; heights[i] = base.rects[i].h; }
+        const vector<int> leftAnchors = p.boundaryIndices.count(Side::LEFT) ? p.boundaryIndices.at(Side::LEFT) : vector<int>{};
+        const vector<int> rightAnchors = p.boundaryIndices.count(Side::RIGHT) ? p.boundaryIndices.at(Side::RIGHT) : vector<int>{};
+        const vector<int> bottomAnchors = p.boundaryIndices.count(Side::BOTTOM) ? p.boundaryIndices.at(Side::BOTTOM) : vector<int>{};
+        const vector<int> topAnchors = p.boundaryIndices.count(Side::TOP) ? p.boundaryIndices.at(Side::TOP) : vector<int>{};
+        auto xs = solveAxis('H', horizontal, widths, leftAnchors, rightAnchors);
+        auto ys = solveAxis('V', vertical, heights, bottomAnchors, topAnchors);
+
+        Placement anchored = base;
+        anchored.W = anchored.decodedW = xs.second;
+        anchored.H = anchored.decodedH = ys.second;
+        for (int i = 0; i < n; ++i) {
+            anchored.rects[i].x = xs.first[i];
+            anchored.rects[i].y = ys.first[i];
+        }
+        for (int i = 0; i < n; ++i) {
+            const Rect& r = anchored.rects[i];
+            if (hasSide(p, i, Side::LEFT) && fabs(r.x) > 1.0e-7) throw runtime_error("LEFT legalization failed");
+            if (hasSide(p, i, Side::RIGHT) && fabs(rightOf(r) - anchored.W) > 1.0e-7) throw runtime_error("RIGHT legalization failed");
+            if (hasSide(p, i, Side::BOTTOM) && fabs(r.y) > 1.0e-7) throw runtime_error("BOTTOM legalization failed");
+            if (hasSide(p, i, Side::TOP) && fabs(topOf(r) - anchored.H) > 1.0e-7) throw runtime_error("TOP legalization failed");
+            if (!edgeLocationRegionsOk(p.blocks[i], r, anchored.W, anchored.H, true))
+                throw runtime_error("Final LOCATION legalization failed");
+        }
+        anchored.nodeRects.clear();
+        for (int node = 0; node < static_cast<int>(st.moduleAt.size()); ++node)
+            anchored.nodeRects[node] = anchored.rects[st.moduleAt[node]];
+        return iterativeDirectionalCompact(p, st, anchored, true, true);
+    }
+
+    static Placement exactPack(const Problem& p, const State& st) {
+        return boundaryConstraintCompact(p, st, contourPack(p, st));
+    }
+
+    static void replaceParentLink(State& st, int node, int replacement) {
+        const int parent = st.parent[node];
+        if (parent == -1) st.root = replacement;
+        else if (st.left[parent] == node) st.left[parent] = replacement;
+        else if (st.right[parent] == node) st.right[parent] = replacement;
+        else throw runtime_error("Invalid parent link while deleting B*-tree node");
+        if (replacement != -1) st.parent[replacement] = parent;
+    }
+
+    static void deleteBtreeNode(State& st, int node, mt19937* rng = nullptr) {
+        const int lc = st.left[node], rc = st.right[node];
+        vector<int> children;
+        if (lc != -1) children.push_back(lc);
+        if (rc != -1) children.push_back(rc);
+        if (children.empty()) {
+            replaceParentLink(st, node, -1);
+            st.parent[node] = st.left[node] = st.right[node] = -1;
+            return;
+        }
+        bool pullLeft;
+        if (children.size() == 1) pullLeft = lc != -1;
+        else pullLeft = rng ? uniform_int_distribution<int>(0, 1)(*rng) == 0 : true;
+        const int pulled = pullLeft ? lc : rc;
+        const int other = pullLeft ? rc : lc;
+        const int displaced = other != -1 ? (pullLeft ? st.right[pulled] : st.left[pulled]) : -1;
+        replaceParentLink(st, node, pulled);
+        if (other != -1) {
+            if (pullLeft) st.right[pulled] = other;
+            else st.left[pulled] = other;
+            st.parent[other] = pulled;
+        }
+        if (displaced != -1) {
+            int cursor = other;
+            while (st.left[cursor] != -1 && st.right[cursor] != -1) {
+                if (rng) cursor = uniform_int_distribution<int>(0, 1)(*rng) == 0 ? st.left[cursor] : st.right[cursor];
+                else cursor = st.left[cursor];
+            }
+            vector<char> empty;
+            if (st.left[cursor] == -1) empty.push_back('L');
+            if (st.right[cursor] == -1) empty.push_back('R');
+            const char side = rng ? empty[uniform_int_distribution<int>(0, static_cast<int>(empty.size()) - 1)(*rng)] : empty.front();
+            if (side == 'L') st.left[cursor] = displaced;
+            else st.right[cursor] = displaced;
+            st.parent[displaced] = cursor;
+        }
+        st.parent[node] = st.left[node] = st.right[node] = -1;
+    }
+
+    static void insertIsolatedAtLink(State& st, int node, int parent, char side) {
+        if (st.parent[node] != -1 || st.left[node] != -1 || st.right[node] != -1)
+            throw runtime_error("Only an isolated node can be inserted");
+        int oldChild = -1;
+        if (side == 'L') {
+            oldChild = st.left[parent];
+            st.left[parent] = node;
+            st.left[node] = oldChild;
+        }
+        else {
+            oldChild = st.right[parent];
+            st.right[parent] = node;
+            st.right[node] = oldChild;
+        }
+        st.parent[node] = parent;
+        if (oldChild != -1) st.parent[oldChild] = node;
+    }
+
+    static void insertIsolatedAsRoot(State& st, int node, char oldRootSide) {
+        const int oldRoot = st.root;
+        st.root = node;
+        st.parent[node] = -1;
+        if (oldRootSide == 'L') st.left[node] = oldRoot;
+        else st.right[node] = oldRoot;
+        if (oldRoot != -1) st.parent[oldRoot] = node;
+    }
+
+    static vector<int> leftmostBranch(const State& st) {
+        vector<int> branch;
+        for (int node = st.root; node != -1; node = st.left[node]) branch.push_back(node);
+        return branch;
+    }
+
+    static vector<int> rightmostBranch(const State& st) {
+        vector<int> branch;
+        for (int node = st.root; node != -1; node = st.right[node]) branch.push_back(node);
+        return branch;
+    }
+
+    static vector<int> bottomLeftBranch(const State& st) {
+        vector<int> base = leftmostBranch(st), branch;
+        if (base.empty()) return branch;
+        int node = base.back();
+        branch.push_back(node);
+        for (node = st.right[node]; node != -1; node = st.right[node]) branch.push_back(node);
+        return branch;
+    }
+
+    static vector<int> bottomRightBranch(const State& st) {
+        vector<int> base = rightmostBranch(st), branch;
+        if (base.empty()) return branch;
+        int node = base.back();
+        branch.push_back(node);
+        for (node = st.left[node]; node != -1; node = st.left[node]) branch.push_back(node);
+        return branch;
+    }
+
+    static vector<int> boundaryBranch(const State& st, Side side) {
+        if (side == Side::BOTTOM) return leftmostBranch(st);
+        if (side == Side::LEFT) return rightmostBranch(st);
+        if (side == Side::RIGHT) return bottomLeftBranch(st);
+        if (side == Side::TOP) return bottomRightBranch(st);
+        throw runtime_error("Unknown boundary side");
+    }
+
+    static vector<int> primaryBoundaryModules(const Problem& p, Side side) {
+        vector<int> out;
+        for (const PBlock& b : p.blocks) if (b.isEdge() && b.boundarySide() == side) out.push_back(b.index);
+        return out;
+    }
+
+    static int boundaryBranchSegment(int index, int length) {
+        if (length <= 1) return 0;
+        const double position = static_cast<double>(index) / (length - 1);
+        if (position < 1.0 / 3.0 - FP_EPS) return 0;
+        if (position <= 2.0 / 3.0 + FP_EPS) return 1;
+        return 2;
+    }
+
+    static vector<int> moduleToNodeMap(const State& st) {
+        vector<int> map(st.moduleAt.size(), -1);
+        for (int node = 0; node < static_cast<int>(st.moduleAt.size()); ++node) {
+            const int module = st.moduleAt[node];
+            if (module < 0 || module >= static_cast<int>(map.size()) || map[module] != -1)
+                throw runtime_error("Invalid or duplicate module in B*-tree");
+            map[module] = node;
+        }
+        if (find(map.begin(), map.end(), -1) != map.end()) throw runtime_error("Missing module in B*-tree");
+        return map;
+    }
+
+    static vector<string> boundaryTreeViolations(const Problem& p, const State& st) {
+        const vector<int> nodeFor = moduleToNodeMap(st);
+        vector<string> violations;
+        for (Side side : {Side::BOTTOM, Side::LEFT, Side::RIGHT, Side::TOP}) {
+            const vector<int> modules = primaryBoundaryModules(p, side);
+            if (modules.empty()) continue;
+            const vector<int> branch = boundaryBranch(st, side);
+            map<int, int> position;
+            for (int i = 0; i < static_cast<int>(branch.size()); ++i) position[branch[i]] = i;
+            for (int module : modules) {
+                const int node = nodeFor[module];
+                if (!position.count(node)) {
+                    violations.push_back(p.blocks[module].name + ":not-" + sideName(side) + "-branch");
+                    continue;
+                }
+                const vector<int> allowed = p.blocks[module].annealSegments();
+                const int segment = boundaryBranchSegment(position[node], static_cast<int>(branch.size()));
+                if (!allowed.empty() && find(allowed.begin(), allowed.end(), segment) == allowed.end())
+                    violations.push_back(p.blocks[module].name + ":wrong-segment");
+            }
+            if (side == Side::RIGHT) {
+                for (int node : branch) if (st.left[node] != -1) violations.push_back("node:" + to_string(node) + ":left-child");
+            }
+            else if (side == Side::TOP) {
+                for (int node : branch) if (st.right[node] != -1) violations.push_back("node:" + to_string(node) + ":right-child");
+            }
+        }
+        return violations;
+    }
+
+    static vector<pair<int, char>> offPathExternalSlots(const Problem& p, const State& st, int excluded = -1) {
+        const vector<int> left = leftmostBranch(st), right = rightmostBranch(st);
+        const vector<int> bottomLeft = primaryBoundaryModules(p, Side::RIGHT).empty() ? vector<int>{} : bottomLeftBranch(st);
+        const vector<int> bottomRight = primaryBoundaryModules(p, Side::TOP).empty() ? vector<int>{} : bottomRightBranch(st);
+        set<int> critical(left.begin(), left.end());
+        critical.insert(right.begin(), right.end());
+        critical.insert(bottomLeft.begin(), bottomLeft.end());
+        critical.insert(bottomRight.begin(), bottomRight.end());
+        vector<pair<int, char>> slots;
+        for (size_t i = 0; i + 1 < left.size(); ++i) {
+            int node = left[i];
+            if (node != excluded && st.right[node] == -1 && find(bottomRight.begin(), bottomRight.end(), node) == bottomRight.end())
+                slots.emplace_back(node, 'R');
+        }
+        for (size_t i = 0; i + 1 < right.size(); ++i) {
+            int node = right[i];
+            if (node != excluded && st.left[node] == -1 && find(bottomLeft.begin(), bottomLeft.end(), node) == bottomLeft.end())
+                slots.emplace_back(node, 'L');
+        }
+        for (int node = 0; node < static_cast<int>(st.moduleAt.size()); ++node) {
+            if (node == excluded || critical.count(node)) continue;
+            if (st.parent[node] == -1 && node != st.root) continue;
+            if (st.left[node] == -1) slots.emplace_back(node, 'L');
+            if (st.right[node] == -1) slots.emplace_back(node, 'R');
+        }
+        return slots;
+    }
+
+    static int randomChoice(const vector<int>& v, mt19937& rng) {
+        return v[uniform_int_distribution<int>(0, static_cast<int>(v.size()) - 1)(rng)];
+    }
+
+    template <class T>
+    static T randomChoiceT(const vector<T>& v, mt19937& rng) {
+        return v[uniform_int_distribution<int>(0, static_cast<int>(v.size()) - 1)(rng)];
+    }
+
+    static int rebuildBoundaryFeasibleTree(const Problem& p, State& st, mt19937& rng) {
+        const vector<int> nodeFor = moduleToNodeMap(st);
+        map<Side, vector<int>> bySide;
+        for (Side side : {Side::BOTTOM, Side::LEFT, Side::RIGHT, Side::TOP})
+            for (int module : primaryBoundaryModules(p, side)) bySide[side].push_back(nodeFor[module]);
+        set<int> boundaryNodes;
+        for (auto& kv : bySide) boundaryNodes.insert(kv.second.begin(), kv.second.end());
+        vector<int> freeNodes;
+        for (int node = 0; node < static_cast<int>(st.moduleAt.size()); ++node)
+            if (!boundaryNodes.count(node)) freeNodes.push_back(node);
+        shuffle(freeNodes.begin(), freeNodes.end(), rng);
+
+        auto allowedSegments = [&](int node) {
+            vector<int> allowed = p.blocks[st.moduleAt[node]].annealSegments();
+            if (allowed.empty()) allowed = { 0, 1, 2 };
+            return allowed;
+            };
+        auto isExactlyFront = [&](int node) {
+            const vector<int> a = allowedSegments(node);
+            return a.size() == 1 && a.front() == 0;
+            };
+
+        vector<int> rootCandidates;
+        for (Side side : {Side::BOTTOM, Side::LEFT}) for (int node : bySide[side])
+            if (isExactlyFront(node)) rootCandidates.push_back(node);
+        int root = -1;
+        if (!rootCandidates.empty()) {
+            root = randomChoice(rootCandidates, rng);
+            Side rs = p.blocks[st.moduleAt[root]].boundarySide();
+            auto& v = bySide[rs]; v.erase(find(v.begin(), v.end(), root));
+        }
+        else if (!freeNodes.empty()) {
+            root = freeNodes.back(); freeNodes.pop_back();
+        }
+        else {
+            vector<int> candidates;
+            for (Side side : {Side::BOTTOM, Side::LEFT}) for (int node : bySide[side]) {
+                vector<int> a = allowedSegments(node);
+                if (find(a.begin(), a.end(), 0) != a.end()) candidates.push_back(node);
+            }
+            if (candidates.empty()) throw runtime_error("12-region B*-tree needs a front BOTTOM/LEFT root");
+            root = randomChoice(candidates, rng);
+            Side rs = p.blocks[st.moduleAt[root]].boundarySide();
+            auto& v = bySide[rs]; v.erase(find(v.begin(), v.end(), root));
+        }
+
+        auto takeFrontAnchor = [&](Side side) -> optional<int> {
+            vector<int> candidates;
+            for (int node : bySide[side]) if (isExactlyFront(node)) candidates.push_back(node);
+            if (candidates.empty()) return nullopt;
+            int node = randomChoice(candidates, rng);
+            auto& v = bySide[side]; v.erase(find(v.begin(), v.end(), node));
+            return node;
+            };
+        optional<int> rightAnchor = takeFrontAnchor(Side::RIGHT);
+        optional<int> topAnchor = takeFrontAnchor(Side::TOP);
+
+        auto layoutTail = [&](Side side, int anchor, vector<int> constrained, optional<int> reservedTail) {
+            const PBlock& anchorBlock = p.blocks[st.moduleAt[anchor]];
+            if (anchorBlock.boundarySide() == side) {
+                vector<int> a = anchorBlock.annealSegments();
+                if (!a.empty() && find(a.begin(), a.end(), 0) == a.end())
+                    throw runtime_error(anchorBlock.name + " cannot anchor boundary front");
+            }
+            shuffle(constrained.begin(), constrained.end(), rng);
+            const int reserveCount = reservedTail ? 1 : 0;
+            for (int fillerCount = 0; fillerCount <= static_cast<int>(freeNodes.size()); ++fillerCount) {
+                const int length = 1 + static_cast<int>(constrained.size()) + fillerCount + reserveCount;
+                const int lastAssignable = length - reserveCount;
+                vector<int> slots;
+                for (int slot = 1; slot < lastAssignable; ++slot) slots.push_back(slot);
+                map<int, vector<int>> options;
+                bool impossible = false;
+                for (int node : constrained) {
+                    const vector<int> allowed = allowedSegments(node);
+                    for (int slot : slots) {
+                        int seg = boundaryBranchSegment(slot, length);
+                        if (find(allowed.begin(), allowed.end(), seg) != allowed.end()) options[node].push_back(slot);
+                    }
+                    if (options[node].empty()) impossible = true;
+                }
+                if (impossible) continue;
+                map<int, int> slotOwner;
+                function<bool(int, set<int>&)> assign = [&](int node, set<int>& seen) {
+                    vector<int> nodeSlots = options[node];
+                    shuffle(nodeSlots.begin(), nodeSlots.end(), rng);
+                    for (int slot : nodeSlots) {
+                        if (seen.count(slot)) continue;
+                        seen.insert(slot);
+                        auto it = slotOwner.find(slot);
+                        if (it == slotOwner.end()) { slotOwner[slot] = node; return true; }
+                        int old = it->second;
+                        if (assign(old, seen)) { slotOwner[slot] = node; return true; }
+                    }
+                    return false;
+                    };
+                vector<int> ordered = constrained;
+                sort(ordered.begin(), ordered.end(), [&](int a, int b) { return options[a].size() < options[b].size(); });
+                bool matched = true;
+                for (int node : ordered) { set<int> seen; if (!assign(node, seen)) { matched = false; break; } }
+                if (!matched) continue;
+                vector<int> tail;
+                int fillerIndex = 0;
+                for (int slot : slots) {
+                    if (slotOwner.count(slot)) tail.push_back(slotOwner[slot]);
+                    else {
+                        if (fillerIndex >= fillerCount) { matched = false; break; }
+                        tail.push_back(freeNodes[fillerIndex++]);
+                    }
+                }
+                if (!matched) continue;
+                freeNodes.erase(freeNodes.begin(), freeNodes.begin() + fillerCount);
+                if (reservedTail) tail.push_back(*reservedTail);
+                return tail;
+            }
+            throw runtime_error("Not enough filler nodes for 12-region path");
+            };
+
+        vector<int> bottomTail = layoutTail(Side::BOTTOM, root, bySide[Side::BOTTOM], rightAnchor);
+        vector<int> leftTail = layoutTail(Side::LEFT, root, bySide[Side::LEFT], topAnchor);
+        int bottomAnchorNode = bottomTail.empty() ? root : bottomTail.back();
+        int leftAnchorNode = leftTail.empty() ? root : leftTail.back();
+        vector<int> rightTailNodes = layoutTail(Side::RIGHT, bottomAnchorNode, bySide[Side::RIGHT], nullopt);
+        vector<int> topTailNodes = layoutTail(Side::TOP, leftAnchorNode, bySide[Side::TOP], nullopt);
+
+        int deleted = 0;
+        while (st.root != -1) { deleteBtreeNode(st, st.root, &rng); ++deleted; }
+        st.root = root; st.parent[root] = -1;
+        auto link = [&](int parent, int child, char side) { insertIsolatedAtLink(st, child, parent, side); };
+        int cursor = root;
+        for (int node : bottomTail) { link(cursor, node, 'L'); cursor = node; }
+        int bottomTailEnd = cursor;
+        cursor = root;
+        for (int node : leftTail) { link(cursor, node, 'R'); cursor = node; }
+        int leftTailEnd = cursor;
+        cursor = bottomTailEnd;
+        for (int node : rightTailNodes) { link(cursor, node, 'R'); cursor = node; }
+        cursor = leftTailEnd;
+        for (int node : topTailNodes) { link(cursor, node, 'L'); cursor = node; }
+
+        while (!freeNodes.empty()) {
+            int node = freeNodes.back();
+            freeNodes.pop_back();
+            vector<pair<int, char>> candidateSlots = offPathExternalSlots(p, st, node);
+            // If no purely off-path external link exists, try every internal or
+            // external link and retain only insertions that preserve all four
+            // boundary paths and their discrete thirds.
+            for (int parent = 0; parent < static_cast<int>(st.moduleAt.size()); ++parent) {
+                if (parent == node || (st.parent[parent] == -1 && parent != st.root)) continue;
+                candidateSlots.emplace_back(parent, 'L');
+                candidateSlots.emplace_back(parent, 'R');
+            }
+            shuffle(candidateSlots.begin(), candidateSlots.end(), rng);
+            bool inserted = false;
+            for (auto slot : candidateSlots) {
+                State trial = st;
+                try {
+                    insertIsolatedAtLink(trial, node, slot.first, slot.second);
+                    if (boundaryTreeViolations(p, trial).empty()) {
+                        st = std::move(trial);
+                        inserted = true;
+                        break;
+                    }
+                }
+                catch (const exception&) {}
+            }
+            if (!inserted) throw runtime_error("No boundary-safe slot for free B*-tree node");
+        }
+        vector<string> violations = boundaryTreeViolations(p, st);
+        if (!violations.empty()) throw runtime_error("Strict boundary-frame rebuild failed");
+        return deleted;
+    }
+
+    static int repairBoundaryConstraints(const Problem& p, State& st, mt19937& rng) {
+        if (none_of(p.blocks.begin(), p.blocks.end(), [](const PBlock& b) { return b.isEdge(); })) return 0;
+        if (boundaryTreeViolations(p, st).empty()) return 0;
+        return rebuildBoundaryFeasibleTree(p, st, rng);
+    }
+
+    static State buildInitialState(const Problem& p, mt19937& rng) {
+        const int n = static_cast<int>(p.blocks.size());
+        State st;
+        st.parent.assign(n, -1);
+        st.left.assign(n, -1);
+        st.right.assign(n, -1);
+        st.moduleAt.resize(n);
+        iota(st.moduleAt.begin(), st.moduleAt.end(), 0);
+        sort(st.moduleAt.begin(), st.moduleAt.end(), [&](int a, int b) { return p.blocks[a].area > p.blocks[b].area; });
+        st.rotated.assign(n, 0);
+        st.softAr.assign(n, 1.0);
+        for (const PBlock& b : p.blocks) if (b.isSoft()) st.softAr[b.index] = clampD(1.0, b.arMin, b.arMax);
+        st.root = n ? 0 : -1;
+        for (int node = 0; node < n; ++node) {
+            int lc = 2 * node + 1, rc = 2 * node + 2;
+            if (lc < n) { st.left[node] = lc; st.parent[lc] = node; }
+            if (rc < n) { st.right[node] = rc; st.parent[rc] = node; }
+        }
+        repairBoundaryConstraints(p, st, rng);
+        return st;
+    }
+
+    static bool moveSingleNode(State& st, mt19937& rng, const vector<int>* candidates = nullptr) {
+        vector<int> movable;
+        if (candidates) movable = *candidates;
+        else { movable.resize(st.moduleAt.size()); iota(movable.begin(), movable.end(), 0); }
+        if (movable.empty()) return false;
+        const int node = randomChoice(movable, rng);
+        const int oldParent = st.parent[node];
+        const char oldSide = oldParent == -1 ? 'O' : (st.left[oldParent] == node ? 'L' : 'R');
+        deleteBtreeNode(st, node, &rng);
+        vector<pair<int, char>> slots;
+        for (int parent = 0; parent < static_cast<int>(st.moduleAt.size()); ++parent) {
+            if (parent == node) continue;
+            slots.emplace_back(parent, 'L');
+            slots.emplace_back(parent, 'R');
+        }
+        if (oldParent != -1 && slots.size() > 1) {
+            slots.erase(remove(slots.begin(), slots.end(), pair<int, char>{oldParent, oldSide}), slots.end());
+        }
+        if (!slots.empty()) {
+            auto slot = randomChoiceT(slots, rng);
+            insertIsolatedAtLink(st, node, slot.first, slot.second);
+        }
+        else {
+            insertIsolatedAsRoot(st, node, uniform_int_distribution<int>(0, 1)(rng) ? 'L' : 'R');
+        }
+        return true;
+    }
+
+    static string paperRandomMutation(const Problem& p, State& st, mt19937& rng, bool allowMacroRotate) {
+        vector<pair<string, double>> ops;
+        if (st.moduleAt.size() >= 2) ops.push_back({ "swap", 0.35 });
+        if (!st.moduleAt.empty()) ops.push_back({ "move", 0.45 });
+        vector<int> macros;
+        for (const PBlock& b : p.blocks) if (b.isMacro()) macros.push_back(b.index);
+        if (allowMacroRotate && !macros.empty()) ops.push_back({ "rotate", 0.08 });
+        if (ops.empty()) return "none";
+        double total = 0.0; for (auto& op : ops) total += op.second;
+        double pick = uniform_real_distribution<double>(0.0, total)(rng);
+        string selected = ops.back().first;
+        for (auto& op : ops) { pick -= op.second; if (pick <= 0.0) { selected = op.first; break; } }
+        if (selected == "swap") {
+            uniform_int_distribution<int> dist(0, static_cast<int>(st.moduleAt.size()) - 1);
+            int a = dist(rng), b = dist(rng); while (b == a) b = dist(rng);
+            swap(st.moduleAt[a], st.moduleAt[b]);
+        }
+        else if (selected == "move") {
+            moveSingleNode(st, rng);
+        }
+        else if (selected == "rotate") {
+            int id = randomChoice(macros, rng);
+            st.rotated[id] = !st.rotated[id];
+        }
+        return selected;
+    }
+
+    static vector<int> subtreeNodes(const State& st, int root) {
+        if (root < 0 || root >= static_cast<int>(st.moduleAt.size())) return {};
+        vector<int> nodes, stack{ root };
+        set<int> seen;
+        while (!stack.empty()) {
+            int u = stack.back(); stack.pop_back();
+            if (seen.count(u)) throw runtime_error("B*-tree cycle in subtree");
+            seen.insert(u); nodes.push_back(u);
+            if (st.right[u] != -1) stack.push_back(st.right[u]);
+            if (st.left[u] != -1) stack.push_back(st.left[u]);
+        }
+        return nodes;
+    }
+
+    static set<int> boundaryProtectedNodes(const Problem& p, const State& st) {
+        set<int> protectedNodes;
+        for (int node = 0; node < static_cast<int>(st.moduleAt.size()); ++node)
+            if (p.blocks[st.moduleAt[node]].isEdge()) protectedNodes.insert(node);
+        for (Side side : {Side::BOTTOM, Side::LEFT, Side::RIGHT, Side::TOP})
+            if (!primaryBoundaryModules(p, side).empty()) {
+                vector<int> branch = boundaryBranch(st, side);
+                protectedNodes.insert(branch.begin(), branch.end());
+            }
+        return protectedNodes;
+    }
+
+    static bool moveWholeSubtree(const Problem& p, State& st, int root, mt19937& rng) {
+        if (root == st.root || st.parent[root] == -1) return false;
+        set<int> members;
+        for (int n : subtreeNodes(st, root)) members.insert(n);
+        int oldParent = st.parent[root];
+        char oldSide = st.left[oldParent] == root ? 'L' : 'R';
+        if (oldSide == 'L') st.left[oldParent] = -1; else st.right[oldParent] = -1;
+        st.parent[root] = -1;
+        vector<pair<int, char>> slots;
+        for (auto slot : offPathExternalSlots(p, st, root)) {
+            if (!members.count(slot.first) && slot != pair<int, char>{oldParent, oldSide}) slots.push_back(slot);
+        }
+        if (slots.empty()) {
+            if (oldSide == 'L') st.left[oldParent] = root; else st.right[oldParent] = root;
+            st.parent[root] = oldParent;
+            return false;
+        }
+        auto slot = randomChoiceT(slots, rng);
+        if (slot.second == 'L') st.left[slot.first] = root; else st.right[slot.first] = root;
+        st.parent[root] = slot.first;
+        return true;
+    }
+
+    static bool swapWholeSubtrees(const Problem& p, State& st, int a, int b) {
+        if (a == b || a == st.root || b == st.root) return false;
+        vector<int> aNodes = subtreeNodes(st, a), bNodes = subtreeNodes(st, b);
+        if (find(aNodes.begin(), aNodes.end(), b) != aNodes.end() ||
+            find(bNodes.begin(), bNodes.end(), a) != bNodes.end()) return false;
+        int pa = st.parent[a], pb = st.parent[b];
+        char sa = st.left[pa] == a ? 'L' : 'R';
+        char sb = st.left[pb] == b ? 'L' : 'R';
+        if (sa == 'L') st.left[pa] = b; else st.right[pa] = b;
+        if (sb == 'L') st.left[pb] = a; else st.right[pb] = a;
+        st.parent[a] = pb; st.parent[b] = pa;
+        (void)p;
+        return true;
+    }
+
+    static pair<vector<double>, vector<double>> placementAxisSlacks(const Placement& placement) {
+        const int n = static_cast<int>(placement.rects.size());
+        auto oneAxis = [&](char axis) {
+            vector<double> starts(n), sizes(n), orthLow(n), orthHigh(n);
+            const double extent = axis == 'x' ? placement.W : placement.H;
+            for (int i = 0; i < n; ++i) {
+                if (axis == 'x') {
+                    starts[i] = placement.rects[i].x; sizes[i] = placement.rects[i].w;
+                    orthLow[i] = placement.rects[i].y; orthHigh[i] = topOf(placement.rects[i]);
+                }
+                else {
+                    starts[i] = placement.rects[i].y; sizes[i] = placement.rects[i].h;
+                    orthLow[i] = placement.rects[i].x; orthHigh[i] = rightOf(placement.rects[i]);
+                }
+            }
+            vector<vector<int>> adj(n);
+            for (int a = 0; a < n; ++a) for (int b = a + 1; b < n; ++b) {
+                if (min(orthHigh[a], orthHigh[b]) <= max(orthLow[a], orthLow[b]) + FP_EPS) continue;
+                if (starts[a] + sizes[a] <= starts[b] + 1.0e-7) adj[a].push_back(b);
+                else if (starts[b] + sizes[b] <= starts[a] + 1.0e-7) adj[b].push_back(a);
+            }
+            vector<int> order(n); iota(order.begin(), order.end(), 0);
+            sort(order.begin(), order.end(), [&](int a, int b) { return tie(starts[a], a) < tie(starts[b], b); });
+            vector<double> forward(n, 0.0), backward(n, 0.0);
+            for (int u : order) for (int v : adj[u]) forward[v] = max(forward[v], forward[u] + sizes[u]);
+            for (auto it = order.rbegin(); it != order.rend(); ++it) for (int v : adj[*it])
+                backward[*it] = max(backward[*it], sizes[v] + backward[v]);
+            double critical = extent;
+            for (int i = 0; i < n; ++i) critical = max(critical, forward[i] + sizes[i] + backward[i]);
+            vector<double> slack(n);
+            for (int i = 0; i < n; ++i) slack[i] = max(0.0, critical - forward[i] - sizes[i] - backward[i]);
+            return slack;
+            };
+        return { oneAxis('x'), oneAxis('y') };
+    }
+
+    static bool relocateBtreeNode(State& st, int node, int target, bool leftChild, mt19937& rng) {
+        if (node == target || node < 0 || target < 0 || node >= static_cast<int>(st.moduleAt.size()) ||
+            target >= static_cast<int>(st.moduleAt.size())) return false;
+        deleteBtreeNode(st, node, &rng);
+        insertIsolatedAtLink(st, node, target, leftChild ? 'L' : 'R');
+        return true;
+    }
+
+    struct Metrics {
+        double cost = numeric_limits<double>::infinity();
+        double quality = numeric_limits<double>::infinity();
+        bool feasible = false;
+        double overflow = 0.0;
+        double overflowSq = 0.0;
+        double boundaryViolation = 0.0;
+        double boundarySpanExcess = 0.0;
+        double actualArea = numeric_limits<double>::infinity();
+        double areaNorm = 0.0;
+        double hpwl = numeric_limits<double>::infinity();
+        double hpwlNorm = 0.0;
+        double centerHpwl = 0.0;
+        double utilization = 0.0;
+    };
+
+    class Evaluator {
+    public:
+        Evaluator(const Problem& problem, double wireWeight)
+            : p_(problem), wireWeight_(clampD(wireWeight, 0.0, 1.0)) {
+            double totalWeight = 0.0;
+            for (const auto& c : p_.connections) totalWeight += c.weight;
+            areaNorm_ = max(p_.maxW * p_.maxH, 1.0);
+            wireNorm_ = max(totalWeight * (p_.maxW + p_.maxH) * 0.5, 1.0);
+        }
+
+        void setNormalizers(double area, double wire, int samples) {
+            areaNorm_ = max(area, 1.0); wireNorm_ = max(wire, 1.0); samples_ = max(0, samples);
+        }
+        double wireWeight() const { return wireWeight_; }
+        double areaNormalizer() const { return areaNorm_; }
+        double wireNormalizer() const { return wireNorm_; }
+
+        Metrics evaluate(const Placement& placement, double areaWeight) const {
+            Metrics m;
+            double minX = 0.0, minY = 0.0;
+            if (!placement.rects.empty()) {
+                minX = placement.rects.front().x; minY = placement.rects.front().y;
+                for (const Rect& r : placement.rects) { minX = min(minX, r.x); minY = min(minY, r.y); }
+            }
+            const double dxR = max(0.0, placement.W - p_.maxW) / max(p_.maxW, 1.0);
+            const double dyT = max(0.0, placement.H - p_.maxH) / max(p_.maxH, 1.0);
+            const double dxL = max(0.0, -minX) / max(p_.maxW, 1.0);
+            const double dyB = max(0.0, -minY) / max(p_.maxH, 1.0);
+            m.overflow = dxR + dyT + dxL + dyB;
+            m.overflowSq = dxR * dxR + dyT * dyT + dxL * dxL + dyB * dyB;
+            m.actualArea = placement.W * placement.H;
+            m.areaNorm = m.actualArea / areaNorm_;
+            const double widthExcess = p_.boundaryMinW > FP_EPS ? max(0.0, placement.W - p_.boundaryMinW) / p_.boundaryMinW : 0.0;
+            const double heightExcess = p_.boundaryMinH > FP_EPS ? max(0.0, placement.H - p_.boundaryMinH) / p_.boundaryMinH : 0.0;
+            m.boundarySpanExcess = widthExcess + heightExcess;
+            m.hpwl = weightedPortHpwl(p_, placement);
+            m.centerHpwl = weightedCenterHpwl(p_, placement);
+            m.hpwlNorm = m.hpwl / wireNorm_;
+            for (const PBlock& b : p_.blocks) {
+                if (!b.isEdge()) continue;
+                const Rect& r = placement.rects[b.index];
+                for (Side s : b.boundarySides()) {
+                    if (s == Side::LEFT) m.boundaryViolation += fabs(r.x) / max(placement.W, 1.0);
+                    else if (s == Side::RIGHT) m.boundaryViolation += fabs(placement.W - rightOf(r)) / max(placement.W, 1.0);
+                    else if (s == Side::BOTTOM) m.boundaryViolation += fabs(r.y) / max(placement.H, 1.0);
+                    else if (s == Side::TOP) m.boundaryViolation += fabs(placement.H - topOf(r)) / max(placement.H, 1.0);
+                }
+                if (!edgeLocationRegionsOk(b, r, placement.W, placement.H, true)) m.boundaryViolation += 1.0;
+            }
+            const double compactWeight = max(0.02, areaWeight);
+            m.quality = m.areaNorm;
+            m.cost = 2000.0 * m.overflowSq + 120.0 * m.overflow +
+                5000.0 * m.boundaryViolation + 2.0 * m.boundarySpanExcess +
+                compactWeight * m.areaNorm + wireWeight_ * m.hpwlNorm;
+            m.feasible = m.overflow <= 1.0e-8 && m.boundaryViolation <= 1.0e-8;
+            m.utilization = p_.totalArea / max(m.actualArea, 1.0);
+            return m;
+        }
+
+        double normalizedObjective(const Metrics& m, double areaWeight) const {
+            return max(0.02, areaWeight) * m.areaNorm + wireWeight_ * m.hpwlNorm + 2.0 * m.boundarySpanExcess;
+        }
+
+    private:
+        const Problem& p_;
+        double wireWeight_ = 0.2;
+        double areaNorm_ = 1.0;
+        double wireNorm_ = 1.0;
+        int samples_ = 0;
+    };
+
+    using Rank = tuple<int, double, double, double, double>;
+    static Rank metricRank(const Metrics& m) {
+        const double violation = m.overflow + m.boundaryViolation;
+        return { m.feasible ? 0 : 1, violation, m.actualArea, m.hpwl, m.cost };
+    }
+
+    static string stateSignature(const State& st) {
+        string s;
+        auto addInts = [&](const vector<int>& v) { for (int x : v) { s += to_string(x); s.push_back(','); } s.push_back('|'); };
+        addInts(st.parent); addInts(st.left); addInts(st.right); addInts(st.moduleAt);
+        for (char c : st.rotated) { s.push_back(c ? '1' : '0'); }
+        s.push_back('|');
+        for (double x : st.softAr) { long long q = llround(x * 1.0e9); s += to_string(q); s.push_back(','); }
+        return s;
+    }
+
+    static vector<pair<string, Placement>> fourCornerPackings(const Problem& p, const State& st, const Placement& base) {
+        vector<pair<string, Placement>> out;
+        for (auto item : vector<tuple<string, bool, bool>>{ {"BL", true, true}, {"BR", false, true}, {"TL", true, false}, {"TR", false, false} }) {
+            try {
+                out.emplace_back(get<0>(item), iterativeDirectionalCompact(p, st, base, get<1>(item), get<2>(item)));
+            }
+            catch (const exception&) {}
+        }
+        return out;
+    }
+
+    class FastSolver {
+    public:
+        FastSolver(const Problem& p, unsigned seed, optional<tuple<double, double, int>> shared = nullopt)
+            : p_(p), rng_(seed), seed_(seed), evaluator_(p, p.alpha), shared_(shared) {
+            for (const PBlock& b : p.blocks) if (b.isSoft()) softModules_.push_back(b.index);
+            if (shared_) evaluator_.setNormalizers(get<0>(*shared_), get<1>(*shared_), get<2>(*shared_));
+        }
+
+        struct Result {
+            State state;
+            Placement placement;
+            Metrics metrics;
+            unsigned seed = 0;
+            string direction = "BL";
+            int evaluations = 0;
+        };
+
+        tuple<double, double, int> normalizers() const {
+            return { evaluator_.areaNormalizer(), evaluator_.wireNormalizer(), DEFAULT_NORMALIZATION_SAMPLES };
+        }
+
+        Result solve() {
+            State initial = buildInitialState(p_, rng_);
+            Placement initialPlacement = exactPack(p_, initial);
+            int evaluations = 1;
+            if (!shared_) evaluations += normalize(initial, initialPlacement);
+            auto warm = warmup(initial, initialPlacement);
+            State current = get<0>(warm);
+            Placement currentPlacement = get<1>(warm);
+            Metrics currentMetrics = get<2>(warm);
+            double temperature = get<3>(warm);
+            evaluations += get<4>(warm);
+            State bestState = current;
+            Placement bestPlacement = currentPlacement;
+            Metrics bestMetrics = currentMetrics;
+            Rank bestRank = metricRank(bestMetrics);
+
+            struct ArchiveItem { Rank rank; string sig; State state; Placement placement; };
+            vector<ArchiveItem> archive;
+            set<string> archiveSigs;
+            auto remember = [&](const State& st, const Placement& pl, const Metrics& m) {
+                if (!m.feasible) return;
+                string sig = stateSignature(st);
+                if (archiveSigs.count(sig)) return;
+                archive.push_back({ metricRank(m), sig, st, pl }); archiveSigs.insert(sig);
+                sort(archive.begin(), archive.end(), [](const auto& a, const auto& b) { return a.rank < b.rank; });
+                while (static_cast<int>(archive.size()) > DEFAULT_ARCHIVE_LIMIT) {
+                    archiveSigs.erase(archive.back().sig); archive.pop_back();
+                }
+                };
+            remember(bestState, bestPlacement, bestMetrics);
+
+            deque<bool> recent;
+            double avgDelta = 0.1;
+            for (int level = 1; level <= DEFAULT_TEMPERATURE_LEVELS; ++level) {
+                string stage;
+                if (level == 1) stage = "random";
+                else if (level <= DEFAULT_GREEDY_LEVELS) stage = "pseudo-greedy";
+                else stage = "hill-climbing";
+                const double feasibleRate = recent.empty() ? 0.0 : accumulate(recent.begin(), recent.end(), 0.0) / recent.size();
+                const double areaWeight = max(0.05, 1.0 - evaluator_.wireWeight()) * (1.0 + 2.0 * (1.0 - feasibleRate));
+                if (level == 1) {
+                    // keep warm-up temperature
+                }
+                else if (level <= DEFAULT_GREEDY_LEVELS) {
+                    temperature = max(1.0e-8, temperature * avgDelta / (level * DEFAULT_GREEDY_C));
+                }
+                else {
+                    temperature *= level < (DEFAULT_TEMPERATURE_LEVELS * 3 / 4) ? 0.96 : 0.98;
+                }
+                vector<double> deltas;
+                for (int move = 0; move < DEFAULT_FIXED_MOVES_PER_LEVEL; ++move) {
+                    auto proposal = propose(current, currentPlacement, areaWeight, stage);
+                    State cand = std::move(get<0>(proposal));
+                    Placement candPlacement = std::move(get<1>(proposal));
+                    Metrics candMetrics = get<2>(proposal);
+                    evaluations += get<3>(proposal);
+                    const double delta = candMetrics.cost - currentMetrics.cost;
+                    const double nd = evaluator_.normalizedObjective(candMetrics, areaWeight) - evaluator_.normalizedObjective(currentMetrics, areaWeight);
+                    if (isfinite(nd)) deltas.push_back(fabs(nd));
+                    recent.push_back(candMetrics.feasible); if (recent.size() > 64) recent.pop_front();
+                    bool accept = delta <= 0.0;
+                    if (!accept && temperature > FP_EPS) {
+                        const double probability = exp(-min(delta / temperature, 700.0));
+                        accept = uniform_real_distribution<double>(0.0, 1.0)(rng_) < probability;
+                    }
+                    remember(cand, candPlacement, candMetrics);
+                    if (metricRank(candMetrics) < bestRank) {
+                        bestRank = metricRank(candMetrics); bestState = cand; bestPlacement = candPlacement; bestMetrics = candMetrics;
+                    }
+                    if (accept) {
+                        current = std::move(cand); currentPlacement = std::move(candPlacement); currentMetrics = candMetrics;
+                    }
+                }
+                if (!deltas.empty()) avgDelta = min(1.0, accumulate(deltas.begin(), deltas.end(), 0.0) / deltas.size());
+            }
+
+            if (!archiveSigs.count(stateSignature(bestState))) archive.push_back({ bestRank, stateSignature(bestState), bestState, bestPlacement });
+            sort(archive.begin(), archive.end(), [](const auto& a, const auto& b) { return a.rank < b.rank; });
+            Result selected{ bestState, bestPlacement, bestMetrics, seed_, "BL", evaluations };
+            const int finalists = min(DEFAULT_FINAL_CANDIDATES, static_cast<int>(archive.size()));
+            for (int i = 0; i < finalists; ++i) {
+                auto polished = deterministicSoftPolish(archive[i].state, archive[i].placement);
+                evaluations += get<3>(polished);
+                for (auto& variant : fourCornerPackings(p_, get<0>(polished), get<1>(polished))) {
+                    Metrics m = evaluator_.evaluate(variant.second, max(0.05, 1.0 - evaluator_.wireWeight()));
+                    ++evaluations;
+                    if (metricRank(m) < metricRank(selected.metrics)) {
+                        selected.state = get<0>(polished); selected.placement = variant.second;
+                        selected.metrics = m; selected.direction = variant.first;
+                    }
+                }
+            }
+            selected.evaluations = evaluations;
+            return selected;
+        }
+
+        const Evaluator& evaluator() const { return evaluator_; }
+
+    private:
+        const Problem& p_;
+        mt19937 rng_;
+        unsigned seed_;
+        Evaluator evaluator_;
+        optional<tuple<double, double, int>> shared_;
+        vector<int> softModules_;
+
+        int normalize(const State& initial, const Placement& placement) {
+            State probe = initial;
+            Placement pp = placement;
+            vector<double> areas, wires;
+            const double areaWeight = max(0.05, 1.0 - evaluator_.wireWeight());
+            int evals = 0;
+            for (int i = 0; i < DEFAULT_NORMALIZATION_SAMPLES; ++i) {
+                auto q = propose(probe, pp, areaWeight, "random");
+                probe = get<0>(q); pp = get<1>(q); Metrics m = get<2>(q); evals += get<3>(q);
+                areas.push_back(pp.W * pp.H); wires.push_back(m.hpwl);
+            }
+            if (areas.empty()) { areas.push_back(placement.W * placement.H); wires.push_back(weightedPortHpwl(p_, placement)); }
+            evaluator_.setNormalizers(accumulate(areas.begin(), areas.end(), 0.0) / areas.size(),
+                accumulate(wires.begin(), wires.end(), 0.0) / wires.size(),
+                static_cast<int>(areas.size()));
+            return evals;
+        }
+
+        tuple<State, Placement, Metrics, double, int> warmup(const State& initial, const Placement& placement) {
+            State probe = initial;
+            Placement pp = placement;
+            const double areaWeight = max(0.05, 1.0 - evaluator_.wireWeight());
+            Metrics pm = evaluator_.evaluate(pp, areaWeight);
+            State best = probe; Placement bp = pp; Metrics bm = pm; Rank br = metricRank(bm);
+            vector<double> positive;
+            int evals = 1;
+            const int samples = DEFAULT_WARMUP_MOVES_PER_BLOCK * max(1, static_cast<int>(p_.blocks.size()));
+            for (int i = 0; i < samples; ++i) {
+                auto q = propose(probe, pp, areaWeight, "random");
+                State cand = get<0>(q); Placement cp = get<1>(q); Metrics cm = get<2>(q); evals += get<3>(q);
+                double d = evaluator_.normalizedObjective(cm, areaWeight) - evaluator_.normalizedObjective(pm, areaWeight);
+                if (d > FP_EPS && isfinite(d)) positive.push_back(d);
+                probe = std::move(cand); pp = std::move(cp); pm = cm;
+                if (metricRank(cm) < br) { br = metricRank(cm); best = probe; bp = pp; bm = cm; }
+            }
+            double avg = positive.empty() ? 0.1 : accumulate(positive.begin(), positive.end(), 0.0) / positive.size();
+            double temp = max(1.0e-5, -avg / log(DEFAULT_INITIAL_ACCEPT));
+            return { best, bp, bm, temp, evals };
+        }
+
+        bool parquetSlackMove(State& st, const Placement& placement) {
+            auto slacks = placementAxisSlacks(placement);
+            const double characteristic = sqrt(max(p_.totalArea, 1.0));
+            const double wp = placement.W / max(max(p_.boundaryMinW, characteristic), 1.0);
+            const double hp = placement.H / max(max(p_.boundaryMinH, characteristic), 1.0);
+            bool horizontal = fabs(wp - hp) > 1.0e-6 ? wp > hp : uniform_int_distribution<int>(0, 1)(rng_);
+            const vector<double>& values = horizontal ? slacks.first : slacks.second;
+            vector<int> movable;
+            for (int node = 0; node < static_cast<int>(st.moduleAt.size()); ++node)
+                if (!p_.blocks[st.moduleAt[node]].isEdge()) movable.push_back(node);
+            if (movable.empty()) return false;
+            sort(movable.begin(), movable.end(), [&](int a, int b) { return tie(values[st.moduleAt[a]], a) < tie(values[st.moduleAt[b]], b); });
+            int operandRange = max(1, static_cast<int>(ceil(movable.size() / 5.0)));
+            int operand = movable[uniform_int_distribution<int>(0, operandRange - 1)(rng_)];
+            vector<int> targets;
+            for (int n = 0; n < static_cast<int>(st.moduleAt.size()); ++n) if (n != operand) targets.push_back(n);
+            sort(targets.begin(), targets.end(), [&](int a, int b) { return tie(values[st.moduleAt[a]], a) < tie(values[st.moduleAt[b]], b); });
+            int targetRange = max(1, static_cast<int>(ceil(targets.size() / 5.0)));
+            int target = targets[targets.size() - 1 - uniform_int_distribution<int>(0, targetRange - 1)(rng_)];
+            return relocateBtreeNode(st, operand, target, horizontal, rng_);
+        }
+
+        bool parquetHpwlMove(State& st, const Placement& placement) {
+            vector<int> nodeFor = moduleToNodeMap(st);
+            vector<vector<pair<int, double>>> incident(p_.blocks.size());
+            for (const auto& c : p_.connections) {
+                if (c.source == c.target || c.weight <= 0.0) continue;
+                incident[c.source].push_back({ c.target, c.weight });
+                incident[c.target].push_back({ c.source, c.weight });
+            }
+            vector<int> candidates; vector<double> weights;
+            for (int module = 0; module < static_cast<int>(p_.blocks.size()); ++module) {
+                if (p_.blocks[module].isEdge() || incident[module].empty()) continue;
+                auto point = portPoint(p_.blocks[module], placement.rects[module]);
+                double contribution = 0.0;
+                for (auto [other, w] : incident[module]) {
+                    auto op = portPoint(p_.blocks[other], placement.rects[other]);
+                    contribution += w * (fabs(point.first - op.first) + fabs(point.second - op.second));
+                }
+                if (contribution > FP_EPS) { candidates.push_back(module); weights.push_back(contribution); }
+            }
+            if (candidates.empty()) return false;
+            discrete_distribution<int> choose(weights.begin(), weights.end());
+            int module = candidates[choose(rng_)];
+            double cx = 0.0, cy = 0.0, total = 0.0;
+            for (auto [other, w] : incident[module]) {
+                auto op = portPoint(p_.blocks[other], placement.rects[other]);
+                cx += w * op.first; cy += w * op.second; total += w;
+            }
+            cx /= max(total, FP_EPS); cy /= max(total, FP_EPS);
+            int target = -1; double best = numeric_limits<double>::infinity();
+            for (int node = 0; node < static_cast<int>(st.moduleAt.size()); ++node) {
+                if (node == nodeFor[module]) continue;
+                auto c = centerOf(placement.rects[st.moduleAt[node]]);
+                double d = fabs(c.first - cx) + fabs(c.second - cy);
+                if (d < best) { best = d; target = node; }
+            }
+            if (target < 0) return false;
+            const Rect& tr = placement.rects[st.moduleAt[target]];
+            bool leftChild = cx >= centerOf(tr).first;
+            return relocateBtreeNode(st, nodeFor[module], target, leftChild, rng_);
+        }
+
+        vector<double> fastShapeRatios(const State& st, const Placement& placement, int blockId, bool includeRandom) {
+            const PBlock& b = p_.blocks[blockId];
+            const Rect& r = placement.rects[blockId];
+            set<double> ratios{ b.arMin, b.arMax, st.softAr[blockId] };
+            vector<double> rightEdges, topEdges;
+            for (const Rect& o : placement.rects) { rightEdges.push_back(rightOf(o)); topEdges.push_back(topOf(o)); }
+            vector<double> greaterX, smallerX, greaterY, smallerY;
+            for (double x : rightEdges) { if (x > rightOf(r) + FP_EPS) greaterX.push_back(x); if (x < rightOf(r) - FP_EPS) smallerX.push_back(x); }
+            for (double y : topEdges) { if (y > topOf(r) + FP_EPS) greaterY.push_back(y); if (y < topOf(r) - FP_EPS) smallerY.push_back(y); }
+            vector<double> widths, heights;
+            if (!greaterX.empty()) widths.push_back(*min_element(greaterX.begin(), greaterX.end()) - r.x);
+            if (!smallerX.empty()) widths.push_back(*max_element(smallerX.begin(), smallerX.end()) - r.x);
+            if (!greaterY.empty()) heights.push_back(*min_element(greaterY.begin(), greaterY.end()) - r.y);
+            if (!smallerY.empty()) heights.push_back(*max_element(smallerY.begin(), smallerY.end()) - r.y);
+            for (double w : widths) if (w > FP_EPS) ratios.insert(clampD(w * w / b.area, b.arMin, b.arMax));
+            for (double h : heights) if (h > FP_EPS) ratios.insert(clampD(b.area / (h * h), b.arMin, b.arMax));
+            if (includeRandom && b.arMax > b.arMin + FP_EPS) {
+                double lr = uniform_real_distribution<double>(log(b.arMin), log(b.arMax))(rng_);
+                ratios.insert(exp(lr));
+            }
+            return vector<double>(ratios.begin(), ratios.end());
+        }
+
+        bool parquetSoftSlackResize(State& st, const Placement& placement) {
+            if (softModules_.empty()) return false;
+            auto slacks = placementAxisSlacks(placement);
+            vector<double> weights;
+            for (int id : softModules_) weights.push_back(1.0 / max(1.0e-6, min(slacks.first[id], slacks.second[id]) + 1.0e-6));
+            discrete_distribution<int> choose(weights.begin(), weights.end());
+            int id = softModules_[choose(rng_)];
+            const PBlock& b = p_.blocks[id];
+            const Rect& r = placement.rects[id];
+            double ratio;
+            if (slacks.first[id] > slacks.second[id]) {
+                double w = min(sqrt(b.area * b.arMax), r.w + slacks.first[id]);
+                ratio = w * w / b.area;
+            }
+            else {
+                double h = min(sqrt(b.area / b.arMin), r.h + slacks.second[id]);
+                ratio = b.area / max(h * h, FP_EPS);
+            }
+            ratio = clampD(ratio, b.arMin, b.arMax);
+            if (fabs(ratio - st.softAr[id]) <= 1.0e-10) return false;
+            st.softAr[id] = ratio;
+            return true;
+        }
+
+        tuple<State, Placement, Metrics, int, string> propose(const State& state, const Placement& placement,
+            double areaWeight, const string& stage) {
+            const bool softExists = !softModules_.empty();
+            double choice = uniform_real_distribution<double>(0.0, 1.0)(rng_);
+            if (choice < DEFAULT_SUBTREE_RATE) {
+                State cand = state;
+                set<int> protectedNodes = boundaryProtectedNodes(p_, cand);
+                vector<int> roots;
+                int limit = stage == "random" ? max(2, min(64, static_cast<int>(p_.blocks.size() / 2))) :
+                    (stage == "pseudo-greedy" ? max(2, static_cast<int>(ceil(sqrt(p_.blocks.size())))) : 3);
+                for (int node = 0; node < static_cast<int>(cand.moduleAt.size()); ++node) {
+                    vector<int> members = subtreeNodes(cand, node);
+                    bool protectedHit = any_of(members.begin(), members.end(), [&](int x) { return protectedNodes.count(x); });
+                    if (node != cand.root && members.size() >= 2 && static_cast<int>(members.size()) <= limit && !protectedHit) roots.push_back(node);
+                }
+                bool changed = false;
+                if (!roots.empty()) {
+                    int a = randomChoice(roots, rng_);
+                    if (uniform_int_distribution<int>(0, 1)(rng_) == 0) changed = moveWholeSubtree(p_, cand, a, rng_);
+                    else {
+                        vector<int> others;
+                        for (int b : roots) if (b != a) others.push_back(b);
+                        if (!others.empty()) changed = swapWholeSubtrees(p_, cand, a, randomChoice(others, rng_));
+                    }
+                }
+                if (changed) {
+                    try {
+                        repairBoundaryConstraints(p_, cand, rng_);
+                        Placement cp = exactPack(p_, cand);
+                        return { cand, cp, evaluator_.evaluate(cp, areaWeight), 1, "subtree" };
+                    }
+                    catch (const exception&) {}
+                }
+                choice = DEFAULT_SUBTREE_RATE + (1.0 - DEFAULT_SUBTREE_RATE) * uniform_real_distribution<double>(0.0, 1.0)(rng_);
+            }
+            const double relative = (choice - DEFAULT_SUBTREE_RATE) / max(1.0 - DEFAULT_SUBTREE_RATE, FP_EPS);
+            double slackRate = 0.0, hpwlRate = 0.0, softSlackRate = 0.0, softOpRate = 0.0;
+            if (stage == "random") { hpwlRate = evaluator_.wireWeight() > FP_EPS ? 0.08 : 0.0; softOpRate = softExists ? 0.06 : 0.0; }
+            else if (stage == "pseudo-greedy") { slackRate = 0.18; hpwlRate = evaluator_.wireWeight() > FP_EPS ? 0.12 : 0.0; softSlackRate = softExists ? 0.08 : 0.0; softOpRate = softExists ? 0.14 : 0.0; }
+            else { slackRate = 0.26; hpwlRate = evaluator_.wireWeight() > FP_EPS ? 0.14 : 0.0; softSlackRate = softExists ? 0.12 : 0.0; softOpRate = softExists ? 0.18 : 0.0; }
+            double threshold = slackRate;
+            auto finish = [&](State cand, bool changed, const string& name) -> optional<tuple<State, Placement, Metrics, int, string>> {
+                if (!changed) return nullopt;
+                try { repairBoundaryConstraints(p_, cand, rng_); Placement cp = exactPack(p_, cand); return tuple<State, Placement, Metrics, int, string>{cand, cp, evaluator_.evaluate(cp, areaWeight), 1, name}; }
+                catch (const exception&) { return nullopt; }
+                };
+            if (relative < threshold) { State c = state; auto r = finish(c, parquetSlackMove(c, placement), "parquet-slack"); if (r) return *r; }
+            threshold += hpwlRate;
+            if (relative < threshold) { State c = state; auto r = finish(c, parquetHpwlMove(c, placement), "parquet-hpwl"); if (r) return *r; }
+            threshold += softSlackRate;
+            if (relative < threshold) { State c = state; auto r = finish(c, parquetSoftSlackResize(c, placement), "parquet-soft"); if (r) return *r; }
+            threshold += softOpRate;
+            if (softExists && relative < threshold) {
+                State c = state;
+                int id = randomChoice(softModules_, rng_);
+                vector<double> ratios = fastShapeRatios(c, placement, id, true);
+                ratios.erase(remove_if(ratios.begin(), ratios.end(), [&](double x) { return fabs(x - c.softAr[id]) <= FP_EPS; }), ratios.end());
+                if (!ratios.empty()) c.softAr[id] = randomChoiceT(ratios, rng_);
+                try { Placement cp = exactPack(p_, c); return { c, cp, evaluator_.evaluate(cp, areaWeight), 1, "soft-op4" }; }
+                catch (const exception&) { return { state, placement, evaluator_.evaluate(placement, areaWeight), 1, "soft-reject" }; }
+            }
+            State c = state;
+            try {
+                string op = paperRandomMutation(p_, c, rng_, DEFAULT_ALLOW_MACRO_ROTATE);
+                repairBoundaryConstraints(p_, c, rng_);
+                Placement cp = exactPack(p_, c);
+                return { c, cp, evaluator_.evaluate(cp, areaWeight), 1, op };
+            }
+            catch (const exception&) {
+                return { state, placement, evaluator_.evaluate(placement, areaWeight), 1, "mutation-reject" };
+            }
+        }
+
+        tuple<State, Placement, Metrics, int> deterministicSoftPolish(State state, Placement placement) {
+            const double areaWeight = max(0.05, 1.0 - evaluator_.wireWeight());
+            Metrics metrics = evaluator_.evaluate(placement, areaWeight);
+            int evals = 1;
+            for (int round = 1; round <= DEFAULT_SOFT_POLISH_ROUNDS; ++round) {
+                bool improved = false;
+                auto slacks = placementAxisSlacks(placement);
+                vector<int> order = softModules_;
+                sort(order.begin(), order.end(), [&](int a, int b) {
+                    const vector<double>& primary = round % 2 ? slacks.first : slacks.second;
+                    const vector<double>& secondary = round % 2 ? slacks.second : slacks.first;
+                    return tie(primary[a], secondary[a], a) < tie(primary[b], secondary[b], b);
+                    });
+                for (int id : order) {
+                    const PBlock& b = p_.blocks[id];
+                    set<double> ratios;
+                    for (double x : fastShapeRatios(state, placement, id, false)) ratios.insert(x);
+                    double w = min(sqrt(b.area * b.arMax), placement.rects[id].w + max(0.0, slacks.first[id]));
+                    double h = min(sqrt(b.area / b.arMin), placement.rects[id].h + max(0.0, slacks.second[id]));
+                    ratios.insert(clampD(w * w / b.area, b.arMin, b.arMax));
+                    ratios.insert(clampD(b.area / max(h * h, FP_EPS), b.arMin, b.arMax));
+                    State localState = state; Placement localPlacement = placement; Metrics localMetrics = metrics;
+                    for (double ratio : ratios) {
+                        if (fabs(ratio - state.softAr[id]) <= 1.0e-10) continue;
+                        State cand = state; cand.softAr[id] = ratio;
+                        try {
+                            Placement cp = exactPack(p_, cand); Metrics cm = evaluator_.evaluate(cp, areaWeight); ++evals;
+                            if (metricRank(cm) < metricRank(localMetrics)) { localState = cand; localPlacement = cp; localMetrics = cm; }
+                        }
+                        catch (const exception&) {}
+                    }
+                    if (stateSignature(localState) != stateSignature(state)) {
+                        state = std::move(localState); placement = std::move(localPlacement); metrics = localMetrics; improved = true;
+                        slacks = placementAxisSlacks(placement);
+                    }
+                }
+                if (!improved) break;
+            }
+            return { state, placement, metrics, evals };
+        }
+    };
+    static bool placementGeometryLegal(const Problem& p, const Placement& pl) {
+        for (const Rect& r : pl.rects) if (r.x < -1.0e-7 || r.y < -1.0e-7 || rightOf(r) > pl.W + 1.0e-7 || topOf(r) > pl.H + 1.0e-7) return false;
+        for (int a = 0; a < static_cast<int>(pl.rects.size()); ++a) for (int b = a + 1; b < static_cast<int>(pl.rects.size()); ++b)
+            if (overlapArea(pl.rects[a], pl.rects[b]) > 1.0e-5) return false;
+        for (const PBlock& b : p.blocks) if (b.isEdge()) {
+            const Rect& r = pl.rects[b.index];
+            for (Side s : b.boundarySides()) {
+                if (s == Side::LEFT && fabs(r.x) > 1.0e-7) return false;
+                if (s == Side::RIGHT && fabs(rightOf(r) - pl.W) > 1.0e-7) return false;
+                if (s == Side::BOTTOM && fabs(r.y) > 1.0e-7) return false;
+                if (s == Side::TOP && fabs(topOf(r) - pl.H) > 1.0e-7) return false;
+            }
+            if (!edgeLocationRegionsOk(b, r, pl.W, pl.H, true)) return false;
+        }
+        return true;
+    }
+
+    static optional<Placement> integerizePlacementCoordinates(
+        const Problem& p, const Placement& input) {
+        const int n = static_cast<int>(input.rects.size());
+        if (n != static_cast<int>(p.blocks.size()) ||
+            !placementGeometryLegal(p, input)) return nullopt;
+
+        vector<pair<int, int>> horizontalConstraints;
+        vector<pair<int, int>> verticalConstraints;
+        for (int i = 0; i < n; ++i) {
+            for (int j = i + 1; j < n; ++j) {
+                const Rect& a = input.rects[i];
+                const Rect& b = input.rects[j];
+                const bool iLeft = rightOf(a) <= b.x + 1.0e-6;
+                const bool jLeft = rightOf(b) <= a.x + 1.0e-6;
+                const bool iBelow = topOf(a) <= b.y + 1.0e-6;
+                const bool jBelow = topOf(b) <= a.y + 1.0e-6;
+
+                if ((iLeft || jLeft) && (iBelow || jBelow)) {
+                    const double horizontalGap = iLeft ?
+                        b.x - rightOf(a) : a.x - rightOf(b);
+                    const double verticalGap = iBelow ?
+                        b.y - topOf(a) : a.y - topOf(b);
+                    if (horizontalGap <= verticalGap) {
+                        horizontalConstraints.push_back(
+                            iLeft ? pair<int, int>{i, j} :
+                            pair<int, int>{j, i});
+                    }
+                    else {
+                        verticalConstraints.push_back(
+                            iBelow ? pair<int, int>{i, j} :
+                            pair<int, int>{j, i});
+                    }
+                }
+                else if (iLeft) horizontalConstraints.push_back({ i, j });
+                else if (jLeft) horizontalConstraints.push_back({ j, i });
+                else if (iBelow) verticalConstraints.push_back({ i, j });
+                else if (jBelow) verticalConstraints.push_back({ j, i });
+                else return nullopt;
+            }
+        }
+
+        auto ceilGrid = [](double value) {
+            const double lower = floor(value + 1.0e-7);
+            return fabs(value - lower) <= 1.0e-6 ?
+                lower : ceil(value - 1.0e-7);
+            };
+        auto floorGrid = [](double value) {
+            return fabs(value) <= 1.0e-7 ? 0.0 :
+                floor(value + 1.0e-7);
+            };
+        auto onIntegerGrid = [](double value) {
+            return fabs(value - round(value)) <= 1.0e-7;
+            };
+        const vector<double> outlineSlack = {
+            0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0
+        };
+
+        for (double extraH : outlineSlack) {
+            for (double extraW : outlineSlack) {
+                Placement candidate = input;
+                candidate.W = candidate.decodedW =
+                    ceilGrid(input.W) + extraW;
+                candidate.H = candidate.decodedH =
+                    ceilGrid(input.H) + extraH;
+                if (candidate.W > p.maxW + FP_EPS ||
+                    candidate.H > p.maxH + FP_EPS) continue;
+
+                auto solveAxis = [&](bool horizontal,
+                    const vector<pair<int, int>>& constraints,
+                    double extent) {
+                    vector<double> positions(n, 0.0);
+                    vector<double> sizes(n, 0.0);
+                    vector<char> lowFixed(n, 0);
+                    vector<char> highFixed(n, 0);
+                    const Side lowSide =
+                        horizontal ? Side::LEFT : Side::BOTTOM;
+                    const Side highSide =
+                        horizontal ? Side::RIGHT : Side::TOP;
+
+                    for (int id = 0; id < n; ++id) {
+                        const Rect& rect = candidate.rects[id];
+                        positions[id] = round(horizontal ? rect.x : rect.y);
+                        sizes[id] = horizontal ? rect.w : rect.h;
+                        lowFixed[id] = hasSide(p, id, lowSide);
+                        highFixed[id] = hasSide(p, id, highSide);
+                        if (lowFixed[id]) positions[id] = 0.0;
+                        if (highFixed[id]) positions[id] = extent - sizes[id];
+                        if (!onIntegerGrid(positions[id])) return false;
+                    }
+
+                    const int iterationLimit = max(8, 4 * n * n);
+                    for (int iteration = 0;
+                        iteration < iterationLimit; ++iteration) {
+                        bool changed = false;
+                        for (const auto& constraint : constraints) {
+                            const int before = constraint.first;
+                            const int after = constraint.second;
+                            const double requiredAfter =
+                                ceilGrid(positions[before] + sizes[before]);
+                            if (positions[after] + FP_EPS >= requiredAfter)
+                                continue;
+
+                            if (!highFixed[after]) {
+                                positions[after] = requiredAfter;
+                                changed = true;
+                            }
+                            else if (!lowFixed[before]) {
+                                const double requiredBefore =
+                                    floorGrid(positions[after] - sizes[before]);
+                                if (requiredBefore + FP_EPS >=
+                                    positions[before]) return false;
+                                positions[before] = requiredBefore;
+                                changed = true;
+                            }
+                            else return false;
+                        }
+                        if (changed) continue;
+
+                        for (int id = 0; id < n; ++id) {
+                            if (!onIntegerGrid(positions[id]) ||
+                                positions[id] < -FP_EPS ||
+                                positions[id] + sizes[id] >
+                                    extent + FP_EPS) return false;
+                            if (horizontal)
+                                candidate.rects[id].x = positions[id];
+                            else candidate.rects[id].y = positions[id];
+                        }
+                        return true;
+                    }
+                    return false;
+                    };
+
+                if (!solveAxis(true, horizontalConstraints, candidate.W) ||
+                    !solveAxis(false, verticalConstraints, candidate.H))
+                    continue;
+                if (!placementGeometryLegal(p, candidate)) continue;
+                candidate.nodeRects.clear();
+                return candidate;
+            }
+        }
+        return nullopt;
+    }
+
+
+} // namespace phase1_warm_start
 
     // ============================================================================
     //  Fast routing-gap-aware source-code floorplanner adapter
@@ -120,6 +2250,10 @@ namespace {
     //    2) packing: B*-tree child spacing and obstacle avoidance use required gap.
     // ============================================================================
     static constexpr bool ENABLE_BSTAR_AREA_SA = true;
+    static constexpr bool ENABLE_PHASE1_WARM_START = true;
+    static constexpr int PHASE1_WARM_RESTARTS_SMALL = 2;
+    static constexpr int PHASE1_WARM_RESTARTS_MEDIUM = 4;
+    static constexpr int PHASE1_WARM_RESTARTS_LARGE = 6;
     static constexpr int BSTAR_INIT_TRIAL_CAP = 900;
     static constexpr int BSTAR_SA_INNER_FACTOR = 14;
     static constexpr int BSTAR_SA_MIN_INNER = 48;
@@ -138,6 +2272,22 @@ namespace {
     static constexpr int BSTAR_ARCHIVE_LIMIT = 24;
     static constexpr int BSTAR_ARCHIVE_SAMPLE_PERIOD = 31;
     static constexpr double BSTAR_ARCHIVE_AREA_WINDOW = 0.14;
+    static constexpr bool ENABLE_BSTAR_SECOND_PROXY_SA = true;
+    static constexpr int BSTAR_SECOND_ARCHIVE_LIMIT = 8;
+    static constexpr int BSTAR_SECOND_SA_MAX_MOVES_CAP = 3200;
+    static constexpr double BSTAR_SECOND_ROUTE_PROXY_CAP = 0.060;
+    static constexpr double BSTAR_SECOND_STRIP_PROXY_CAP = 0.045;
+    static constexpr double BSTAR_SECOND_GROW_PROB = 0.105;
+    static constexpr bool ENABLE_BSTAR_WIRE_SA = true;
+    static constexpr int BSTAR_WIRE_ARCHIVE_LIMIT = 6;
+    static constexpr int BSTAR_SPREAD_ARCHIVE_LIMIT = 5;
+    static constexpr int BSTAR_COMPACT_SPREAD_KEEP = 4;
+    static constexpr int BSTAR_WIRE_SEED_LIMIT = 7;
+    static constexpr int BSTAR_WIRE_SA_MAX_MOVES_CAP = 2600;
+    static constexpr int BSTAR_SPREAD_SA_MAX_MOVES_CAP = 2200;
+    static constexpr double BSTAR_WIRE_ROUTE_PROXY_CAP = 0.035;
+    static constexpr double BSTAR_WIRE_STRIP_PROXY_CAP = 0.025;
+    static constexpr double BSTAR_SPREAD_AREA_WEIGHT = 0.64;
     static constexpr double STRIP_PROXY_FREE_UTIL = 0.72;
     static constexpr double STRIP_PROXY_TARGET_UTIL = 0.94;
     static constexpr double STRIP_PROXY_OVERFLOW_WEIGHT = 18000.0;
@@ -155,9 +2305,29 @@ namespace {
     static constexpr double FORCE_REPULSE_WEIGHT = 0.85;
     static constexpr double FORCE_CHANNEL_WEIGHT = 0.90;
     static constexpr double FORCE_HOT_PAIR_FRAC = 0.20;
+    static constexpr bool ENABLE_ALIGNMENT_ARCHIVE_REFINEMENT = true;
+    static constexpr int ALIGNMENT_SEED_LIMIT = 8;
+    static constexpr int ALIGNMENT_KEEP_LIMIT = 6;
+    static constexpr int ALIGNMENT_MAX_GUIDES_PER_AXIS = 7;
+    static constexpr int ALIGNMENT_MAX_ACCEPTED_MOVES = 18;
+    static constexpr double ALIGNMENT_EXACT_EPS = 0.55;
+    static constexpr double ALIGNMENT_HPWL_GUARD_RATIO = 1.035;
+    static constexpr double ALIGNMENT_ROUTE_GUARD_RATIO = 1.080;
+    static constexpr double ALIGNMENT_PROXY_GUARD_RATIO = 1.120;
     static constexpr bool ENABLE_DENSITY_AWARE_PACK = false;
     static constexpr double PACK_TOP_PRESSURE_RATIO = 0.0;
     static constexpr double PACK_RIGHT_PRESSURE_RATIO = 0.0;
+    static int g_bstarPackMode = 0; // 0=compact route-aware, 1=wire-first, 2=spread-wire
+
+    struct ScopedBStarPackMode {
+        int old = 0;
+        explicit ScopedBStarPackMode(int mode) : old(g_bstarPackMode) {
+            g_bstarPackMode = mode;
+        }
+        ~ScopedBStarPackMode() {
+            g_bstarPackMode = old;
+        }
+    };
 
 
     static double sqr(double x) { return x * x; }
@@ -1000,6 +3170,19 @@ namespace {
     };
 
     static bool betterKey(const PlaceKey& a, const PlaceKey& b) {
+        if (g_bstarPackMode != 0) {
+            if (fabs(a.topPressure - b.topPressure) > 1e-6) return a.topPressure < b.topPressure;
+            if (g_bstarPackMode == 1 && fabs(a.route - b.route) > 1e-6) return a.route < b.route;
+            if (fabs(a.balance - b.balance) > 1e-8) return a.balance < b.balance;
+            if (fabs(a.wire - b.wire) > 1e-6) return a.wire < b.wire;
+            if (g_bstarPackMode == 2 && fabs(a.route - b.route) > 1e-6) return a.route < b.route;
+            if (fabs(a.rightPressure - b.rightPressure) > 1e-6) return a.rightPressure < b.rightPressure;
+            if (fabs(a.center - b.center) > 1e-6) return a.center < b.center;
+            if (fabs(a.right - b.right) > 1e-6) return a.right < b.right;
+            if (fabs(a.top - b.top) > 1e-6) return a.top < b.top;
+            if (fabs(a.y - b.y) > 1e-6) return a.y < b.y;
+            return a.x < b.x;
+        }
         if (fabs(a.topPressure - b.topPressure) > 1e-6) return a.topPressure < b.topPressure;
         // Same-height candidates prefer satisfying direct channel / port-window needs.
         if (fabs(a.route - b.route) > 1e-6) return a.route < b.route;
@@ -1458,6 +3641,11 @@ namespace {
             + STRIP_PROXY_PEAK_WEIGHT * peak * peak * max(1.0, r.area);
     }
 
+    static double bstarCheckerProxyCost(const Design& design, const LayoutResult& r);
+    static bool bstarCheckerProxyBetter(const Design& design, const LayoutResult& a, const LayoutResult& b);
+    static double bstarWireProxyCost(const Design& design, const LayoutResult& r, bool spreadMode);
+    static bool bstarWireProxyBetter(const Design& design, const LayoutResult& a, const LayoutResult& b, bool spreadMode);
+
     static bool betterArchiveLayout(const LayoutResult& a, const LayoutResult& b) {
         if (a.legal != b.legal) return a.legal;
         if (a.strictEdgeLegal != b.strictEdgeLegal) return a.strictEdgeLegal;
@@ -1487,6 +3675,50 @@ namespace {
         archive.push_back(std::move(item));
         sort(archive.begin(), archive.end(), betterArchiveLayout);
         if (static_cast<int>(archive.size()) > BSTAR_ARCHIVE_LIMIT) archive.resize(BSTAR_ARCHIVE_LIMIT);
+    }
+
+    static void addToBStarSecondArchive(const Design& design, vector<LayoutResult>& archive, const LayoutResult& cand) {
+        if (!cand.legal || !cand.strictEdgeLegal) return;
+        LayoutResult item = cand;
+        annotateStripProxy(design, item);
+        for (const auto& old : archive) {
+            const double areaTol = max(1.0, 0.0005 * min(old.area, item.area));
+            if (fabs(old.area - item.area) <= areaTol &&
+                fabs(old.W - item.W) <= 1.0 &&
+                fabs(old.H - item.H) <= 1.0 &&
+                fabs(old.stripPeakUtilProxy - item.stripPeakUtilProxy) <= 0.01) {
+                return;
+            }
+        }
+        archive.push_back(std::move(item));
+        sort(archive.begin(), archive.end(), [&](const LayoutResult& a, const LayoutResult& b) {
+            return bstarCheckerProxyBetter(design, a, b);
+            });
+        if (static_cast<int>(archive.size()) > BSTAR_SECOND_ARCHIVE_LIMIT) {
+            archive.resize(BSTAR_SECOND_ARCHIVE_LIMIT);
+        }
+    }
+
+    static void addToBStarWireArchive(const Design& design, vector<LayoutResult>& archive, const LayoutResult& cand, bool spreadMode) {
+        if (!cand.legal || !cand.strictEdgeLegal) return;
+        if (cand.routeViolPairs > (spreadMode ? 1 : 0)) return;
+        LayoutResult item = cand;
+        annotateStripProxy(design, item);
+        for (const auto& old : archive) {
+            const double areaTol = max(1.0, 0.0005 * min(old.area, item.area));
+            if (fabs(old.area - item.area) <= areaTol &&
+                fabs(old.W - item.W) <= 1.0 &&
+                fabs(old.H - item.H) <= 1.0 &&
+                fabs(old.hpwl - item.hpwl) <= max(1.0, 0.0007 * min(old.hpwl, item.hpwl))) {
+                return;
+            }
+        }
+        archive.push_back(std::move(item));
+        sort(archive.begin(), archive.end(), [&](const LayoutResult& a, const LayoutResult& b) {
+            return bstarWireProxyBetter(design, a, b, spreadMode);
+            });
+        const int limit = spreadMode ? BSTAR_SPREAD_ARCHIVE_LIMIT : BSTAR_WIRE_ARCHIVE_LIMIT;
+        if (static_cast<int>(archive.size()) > limit) archive.resize(limit);
     }
 
     static vector<int> legalPortEdgesForForce(const BlockSpec& spec) {
@@ -2903,6 +5135,9 @@ namespace {
         bool strictEdge = true;
     };
 
+    static vector<int> bstarPreorder(const BStarState& bs);
+    static bool bstarTreeLegal(const BStarState& bs);
+
     static vector<int> movableIdsOf(const Design& design) {
         vector<int> ids;
         ids.reserve(design.blockSpecs.size());
@@ -2956,6 +5191,115 @@ namespace {
             bs.node[i].right = (2 * i + 2 < m) ? 2 * i + 2 : -1;
         }
         return bs;
+    }
+
+    static ShapeState shapeStateFromLayout(const Design& design, const LayoutResult& layout) {
+        ShapeState st;
+        st.ratio.assign(design.blockSpecs.size(), 1.0);
+        for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) {
+            const BlockSpec& sp = design.blockSpecs[i];
+            double r = aspectMid(sp);
+            if (i < static_cast<int>(layout.rects.size()) && layout.rects[i].h > EPS) {
+                r = layout.rects[i].w / layout.rects[i].h;
+            }
+            const double amin = max(0.05, sp.aspectMin);
+            const double amax = max(amin, sp.aspectMax);
+            st.ratio[i] = clampD(r, amin, amax);
+        }
+        return st;
+    }
+
+    static vector<int> geometryOrderFromLayout(const Design& design, const LayoutResult& layout, int mode) {
+        vector<int> ids = movableIdsOf(design);
+        auto rectOf = [&](int id) -> Rect {
+            if (id >= 0 && id < static_cast<int>(layout.rects.size())) return layout.rects[id];
+            return makePackingShape(design, id, aspectMid(design.blockSpecs[id]));
+            };
+        sort(ids.begin(), ids.end(), [&](int a, int b) {
+            const Rect ra = rectOf(a);
+            const Rect rb = rectOf(b);
+            const double ax = rectCx(ra), ay = rectCy(ra);
+            const double bx = rectCx(rb), by = rectCy(rb);
+            if (mode == 0) {
+                if (fabs(ax - bx) > 1.0e-6) return ax < bx;
+                if (fabs(ay - by) > 1.0e-6) return ay < by;
+            }
+            else if (mode == 1) {
+                if (fabs(ay - by) > 1.0e-6) return ay < by;
+                if (fabs(ax - bx) > 1.0e-6) return ax < bx;
+            }
+            else if (mode == 2) {
+                if (fabs(ax + ay - bx - by) > 1.0e-6) return ax + ay < bx + by;
+                if (fabs(ax - bx) > 1.0e-6) return ax < bx;
+            }
+            else {
+                const double ac = fabs(ax - 0.5 * layout.W) + fabs(ay - 0.5 * layout.H);
+                const double bc = fabs(bx - 0.5 * layout.W) + fabs(by - 0.5 * layout.H);
+                if (fabs(ac - bc) > 1.0e-6) return ac < bc;
+            }
+            return a < b;
+            });
+        return ids;
+    }
+
+    static void pushUniqueBStarSeed(vector<BStarState>& seeds, const BStarState& seed) {
+        if (!bstarTreeLegal(seed)) return;
+        vector<int> order;
+        for (int u : bstarPreorder(seed)) {
+            if (u >= 0 && u < static_cast<int>(seed.node.size())) order.push_back(seed.node[u].block);
+        }
+        for (const BStarState& old : seeds) {
+            if (fabs(old.W - seed.W) > 4.0 || fabs(old.H - seed.H) > 4.0) continue;
+            vector<int> oldOrder;
+            for (int u : bstarPreorder(old)) {
+                if (u >= 0 && u < static_cast<int>(old.node.size())) oldOrder.push_back(old.node[u].block);
+            }
+            if (oldOrder == order) return;
+        }
+        seeds.push_back(seed);
+    }
+
+    static vector<BStarState> makeWireBStarSeeds(
+        const Design& design,
+        const BStarState& anchorState,
+        const vector<LayoutResult>& layouts,
+        bool spreadMode
+    ) {
+        vector<BStarState> seeds;
+        pushUniqueBStarSeed(seeds, anchorState);
+        const int layoutLimit = min(5, static_cast<int>(layouts.size()));
+        for (int li = 0; li < layoutLimit && static_cast<int>(seeds.size()) < BSTAR_WIRE_SEED_LIMIT; ++li) {
+            const LayoutResult& layout = layouts[li];
+            if (!layout.legal || layout.rects.empty()) continue;
+            ShapeState st = shapeStateFromLayout(design, layout);
+            const double scale = spreadMode ? 1.035 : 1.000;
+            const double W = clampD(layout.W * scale, minWidthBound(design, st), design.maxOutlineW);
+            const double H = clampD(layout.H * scale, minHeightBound(design, st), design.maxOutlineH);
+            for (int mode = 0; mode < 4 && static_cast<int>(seeds.size()) < BSTAR_WIRE_SEED_LIMIT; ++mode) {
+                pushUniqueBStarSeed(seeds, makeBStarStateFromOrder(
+                    design, geometryOrderFromLayout(design, layout, mode), st, W, H, true));
+            }
+        }
+
+        vector<vector<int>> orders = makeOrders(design);
+        vector<ShapeState> states = makeShapeStates(design);
+        const int orderLimit = min(4, static_cast<int>(orders.size()));
+        const int shapeLimit = min(3, static_cast<int>(states.size()));
+        const double packArea = max(1.0, totalPackingArea(design));
+        for (int si = 0; si < shapeLimit && static_cast<int>(seeds.size()) < BSTAR_WIRE_SEED_LIMIT; ++si) {
+            const ShapeState& st = states[si];
+            double aspect = design.maxOutlineH > EPS ? design.maxOutlineW / design.maxOutlineH : 1.0;
+            aspect = clampD(aspect, 0.45, 2.20);
+            double targetArea = packArea * (spreadMode ? 1.32 : 1.14);
+            double W = sqrt(targetArea * aspect);
+            double H = targetArea / max(1.0, W);
+            W = clampD(W, minWidthBound(design, st), design.maxOutlineW);
+            H = clampD(H, minHeightBound(design, st), design.maxOutlineH);
+            for (int oi = 0; oi < orderLimit && static_cast<int>(seeds.size()) < BSTAR_WIRE_SEED_LIMIT; ++oi) {
+                pushUniqueBStarSeed(seeds, makeBStarStateFromOrder(design, orders[oi], st, W, H, true));
+            }
+        }
+        return seeds;
     }
 
     static void bstarPreorderDfs(const vector<BStarNode>& node, int u, vector<int>& out) {
@@ -3271,6 +5615,26 @@ namespace {
             + BSTAR_ROUTE_COST_WEIGHT * r.routePenalty;
     }
 
+    static double bstarCheckerProxyCost(const Design& design, const LayoutResult& r) {
+        if (!r.legal || !r.strictEdgeLegal ||
+            !std::isfinite(r.area) || r.area >= INF * 0.5) {
+            return INF * 0.5;
+        }
+
+        const double area = max(1.0, r.area);
+        const double alpha = design.alpha > 0.0 ? design.alpha : 0.1;
+        const double routeTerm = min(
+            BSTAR_SECOND_ROUTE_PROXY_CAP * area,
+            BSTAR_ROUTE_COST_WEIGHT * max(0.0, r.routePenalty));
+        const double peak = max(0.0, r.stripPeakUtilProxy - STRIP_PROXY_TARGET_UTIL);
+        const double rawStripTerm =
+            STRIP_PROXY_OVERFLOW_WEIGHT * max(0.0, r.stripOverflowProxy) +
+            STRIP_PROXY_RISK_WEIGHT * max(0.0, r.stripRiskProxy) +
+            STRIP_PROXY_PEAK_WEIGHT * peak * peak * area;
+        const double stripTerm = min(BSTAR_SECOND_STRIP_PROXY_CAP * area, rawStripTerm);
+        return area + alpha * max(0.0, r.hpwl) + routeTerm + stripTerm;
+    }
+
     static bool bstarAreaBetter(const LayoutResult& a, const LayoutResult& b) {
         if (a.legal != b.legal) return a.legal;
         if (a.strictEdgeLegal != b.strictEdgeLegal) return a.strictEdgeLegal;
@@ -3282,7 +5646,226 @@ namespace {
         return a.hpwl < b.hpwl;
     }
 
-    static bool makeInitialBStarLegalState(const Design& design, BStarState& bestState, LayoutResult& bestLayout) {
+    static bool bstarCheckerProxyBetter(const Design& design, const LayoutResult& a, const LayoutResult& b) {
+        if (a.legal != b.legal) return a.legal;
+        if (a.strictEdgeLegal != b.strictEdgeLegal) return a.strictEdgeLegal;
+        if (!std::isfinite(b.area) || b.area >= INF * 0.5) return true;
+        const double ac = bstarCheckerProxyCost(design, a);
+        const double bc = bstarCheckerProxyCost(design, b);
+        if (fabs(ac - bc) > max(1.0, 1.0e-6 * min(ac, bc))) return ac < bc;
+        if (fabs(a.area - b.area) > max(1.0, 1.0e-6 * min(a.area, b.area))) return a.area < b.area;
+        if (fabs(a.stripPeakUtilProxy - b.stripPeakUtilProxy) > 0.01) return a.stripPeakUtilProxy < b.stripPeakUtilProxy;
+        return a.hpwl < b.hpwl;
+    }
+
+    static double bstarWireProxyCost(const Design& design, const LayoutResult& r, bool spreadMode) {
+        if (!r.legal || !r.strictEdgeLegal ||
+            !std::isfinite(r.area) || r.area >= INF * 0.5) {
+            return INF * 0.5;
+        }
+
+        const double area = max(1.0, r.area);
+        const double alpha = design.alpha > 0.0 ? design.alpha : 0.1;
+        const double wl = max(0.0, portAwareHpwl(design, r.rects));
+        const double routeTerm = min(
+            BSTAR_WIRE_ROUTE_PROXY_CAP * area,
+            0.010 * max(0.0, r.routePenalty));
+        const double peak = max(0.0, r.stripPeakUtilProxy - STRIP_PROXY_TARGET_UTIL);
+        const double rawStripTerm =
+            STRIP_PROXY_OVERFLOW_WEIGHT * max(0.0, r.stripOverflowProxy) +
+            STRIP_PROXY_RISK_WEIGHT * max(0.0, r.stripRiskProxy) +
+            STRIP_PROXY_PEAK_WEIGHT * peak * peak * area;
+        const double stripTerm = min(BSTAR_WIRE_STRIP_PROXY_CAP * area, rawStripTerm);
+        const double violTerm = static_cast<double>(max(0, r.routeViolPairs)) * 0.18 * area;
+        const double areaWeight = spreadMode ? BSTAR_SPREAD_AREA_WEIGHT : 1.0;
+        return areaWeight * area + alpha * wl + routeTerm + stripTerm + violTerm;
+    }
+
+    static bool bstarWireProxyBetter(const Design& design, const LayoutResult& a, const LayoutResult& b, bool spreadMode) {
+        if (a.legal != b.legal) return a.legal;
+        if (a.strictEdgeLegal != b.strictEdgeLegal) return a.strictEdgeLegal;
+        if (!std::isfinite(b.area) || b.area >= INF * 0.5) return true;
+        const double ac = bstarWireProxyCost(design, a, spreadMode);
+        const double bc = bstarWireProxyCost(design, b, spreadMode);
+        if (fabs(ac - bc) > max(1.0, 1.0e-6 * min(ac, bc))) return ac < bc;
+        if (fabs(a.hpwl - b.hpwl) > max(1.0, 1.0e-6 * min(a.hpwl, b.hpwl))) return a.hpwl < b.hpwl;
+        return a.area < b.area;
+    }
+
+    static bool warmStateToMovableBStar(
+        const Design& design,
+        const phase1_warm_start::FastSolver::Result& warm,
+        BStarState& out
+    ) {
+        phase1_warm_start::State projected = warm.state;
+        const int nodeCount = static_cast<int>(projected.moduleAt.size());
+        if (nodeCount != static_cast<int>(design.blockSpecs.size())) return false;
+
+        vector<pair<int, int>> edgeNodes;
+        vector<pair<int, int>> stack;
+        if (projected.root >= 0) stack.push_back({ projected.root, 0 });
+        while (!stack.empty()) {
+            const auto [node, depth] = stack.back();
+            stack.pop_back();
+            if (node < 0 || node >= nodeCount) return false;
+            const int block = projected.moduleAt[node];
+            if (block < 0 || block >= nodeCount) return false;
+            if (design.blockSpecs[block].type == BlockType::EDGE)
+                edgeNodes.push_back({ depth, node });
+            if (projected.left[node] >= 0)
+                stack.push_back({ projected.left[node], depth + 1 });
+            if (projected.right[node] >= 0)
+                stack.push_back({ projected.right[node], depth + 1 });
+        }
+        sort(edgeNodes.rbegin(), edgeNodes.rend());
+        try {
+            for (const auto& item : edgeNodes)
+                phase1_warm_start::deleteBtreeNode(
+                    projected, item.second, nullptr);
+        }
+        catch (const exception&) {
+            return false;
+        }
+
+        vector<int> active;
+        vector<int> visit;
+        if (projected.root >= 0) visit.push_back(projected.root);
+        vector<char> seen(nodeCount, 0);
+        while (!visit.empty()) {
+            const int node = visit.back();
+            visit.pop_back();
+            if (node < 0 || node >= nodeCount || seen[node]) return false;
+            seen[node] = 1;
+            const int block = projected.moduleAt[node];
+            if (block < 0 || block >= nodeCount ||
+                !isMovableBlock(design.blockSpecs[block])) return false;
+            active.push_back(node);
+            if (projected.right[node] >= 0)
+                visit.push_back(projected.right[node]);
+            if (projected.left[node] >= 0)
+                visit.push_back(projected.left[node]);
+        }
+        if (active.size() != movableIdsOf(design).size()) return false;
+
+        vector<int> remap(nodeCount, -1);
+        for (int i = 0; i < static_cast<int>(active.size()); ++i)
+            remap[active[i]] = i;
+
+        out = BStarState{};
+        out.root = active.empty() ? -1 : remap[projected.root];
+        out.node.assign(active.size(), BStarNode{});
+        for (int i = 0; i < static_cast<int>(active.size()); ++i) {
+            const int old = active[i];
+            BStarNode& node = out.node[i];
+            node.block = projected.moduleAt[old];
+            node.parent = projected.parent[old] < 0 ?
+                -1 : remap[projected.parent[old]];
+            node.left = projected.left[old] < 0 ?
+                -1 : remap[projected.left[old]];
+            node.right = projected.right[old] < 0 ?
+                -1 : remap[projected.right[old]];
+            if ((projected.parent[old] >= 0 && node.parent < 0) ||
+                (projected.left[old] >= 0 && node.left < 0) ||
+                (projected.right[old] >= 0 && node.right < 0))
+                return false;
+        }
+
+        out.shape.ratio.assign(design.blockSpecs.size(), 1.0);
+        for (int id = 0; id < static_cast<int>(design.blockSpecs.size()); ++id) {
+            if (design.blockSpecs[id].type == BlockType::SOFT &&
+                id < static_cast<int>(projected.softAr.size()))
+                out.shape.ratio[id] = clampD(projected.softAr[id],
+                    max(0.05, design.blockSpecs[id].aspectMin),
+                    max(max(0.05, design.blockSpecs[id].aspectMin),
+                        design.blockSpecs[id].aspectMax));
+            else
+                out.shape.ratio[id] = aspectMid(design.blockSpecs[id]);
+        }
+        out.W = clampD(warm.placement.W, 1.0, design.maxOutlineW);
+        out.H = clampD(warm.placement.H, 1.0, design.maxOutlineH);
+        out.strictEdge = true;
+        return bstarTreeLegal(out);
+    }
+
+    static vector<BStarState> makePhase1WarmBStarSeeds(const Design& design) {
+        vector<BStarState> seeds;
+        if (!ENABLE_PHASE1_WARM_START) return seeds;
+
+        const int n = static_cast<int>(design.blockSpecs.size());
+        const int restartCount = n <= 8 ? PHASE1_WARM_RESTARTS_SMALL :
+            (n <= 18 ? PHASE1_WARM_RESTARTS_MEDIUM :
+                PHASE1_WARM_RESTARTS_LARGE);
+        try {
+            phase1_warm_start::Problem problem =
+                phase1_warm_start::makeProblem(design);
+            optional<tuple<double, double, int>> sharedNormalizers;
+            for (int restart = 0; restart < restartCount; ++restart) {
+                const unsigned seed =
+                    phase1_warm_start::DEFAULT_SEED +
+                    1000003u * static_cast<unsigned>(restart);
+                phase1_warm_start::FastSolver solver(
+                    problem, seed, sharedNormalizers);
+                auto result = solver.solve();
+                if (!sharedNormalizers)
+                    sharedNormalizers = solver.normalizers();
+                BStarState converted;
+                if (warmStateToMovableBStar(design, result, converted)) {
+                    vector<int> preorderBlocks;
+                    vector<int> stack;
+                    if (result.state.root >= 0)
+                        stack.push_back(result.state.root);
+                    while (!stack.empty()) {
+                        const int node = stack.back();
+                        stack.pop_back();
+                        const int block = result.state.moduleAt[node];
+                        if (isMovableBlock(design.blockSpecs[block]))
+                            preorderBlocks.push_back(block);
+                        if (result.state.right[node] >= 0)
+                            stack.push_back(result.state.right[node]);
+                        if (result.state.left[node] >= 0)
+                            stack.push_back(result.state.left[node]);
+                    }
+                    if (!preorderBlocks.empty()) {
+                        seeds.push_back(makeBStarStateFromOrder(
+                            design, preorderBlocks, converted.shape,
+                            converted.W, converted.H, true));
+                    }
+
+                    vector<int> geometricOrder = preorderBlocks;
+                    sort(geometricOrder.begin(), geometricOrder.end(),
+                        [&](int lhs, int rhs) {
+                            const Rect& a = result.placement.rects[lhs];
+                            const Rect& b = result.placement.rects[rhs];
+                            const double ay = rectCy(a);
+                            const double by = rectCy(b);
+                            if (fabs(ay - by) > 1.0e-6) return ay < by;
+                            const double ax = rectCx(a);
+                            const double bx = rectCx(b);
+                            if (fabs(ax - bx) > 1.0e-6) return ax < bx;
+                            return lhs < rhs;
+                        });
+                    if (!geometricOrder.empty()) {
+                        seeds.push_back(makeBStarStateFromOrder(
+                            design, geometricOrder, converted.shape,
+                            converted.W, converted.H, true));
+                    }
+                }
+            }
+        }
+        catch (const exception& ex) {
+            if (FAST_VERBOSE_LOG)
+                cerr << "[Phase1WarmStart] disabled after exception: "
+                    << ex.what() << "\n";
+        }
+        return seeds;
+    }
+
+    static bool makeInitialBStarLegalState(
+        const Design& design,
+        BStarState& bestState,
+        LayoutResult& bestLayout,
+        vector<LayoutResult>* warmArchiveOut = nullptr
+    ) {
         vector<vector<int>> orders = makeOrders(design);
         vector<ShapeState> states = makeShapeStates(design);
         if (states.empty()) {
@@ -3291,8 +5874,94 @@ namespace {
             for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) st.ratio[i] = aspectMid(design.blockSpecs[i]);
             states.push_back(st);
         }
-        bool have = false;
+        bool warmHave = false;
+        BStarState warmBestState;
+        LayoutResult warmBestLayout;
         int tried = 0;
+
+        const auto warmSolverStart = chrono::steady_clock::now();
+        vector<BStarState> warmSeeds = makePhase1WarmBStarSeeds(design);
+        const auto warmPackingStart = chrono::steady_clock::now();
+        int warmPacked = 0;
+        int warmTried = 0;
+        for (const BStarState& seed : warmSeeds) {
+            vector<double> warmWidths = makeWidthTrials(design, seed.shape);
+            warmWidths.push_back(seed.W);
+            warmWidths.push_back(design.maxOutlineW);
+            sort(warmWidths.begin(), warmWidths.end());
+            warmWidths.erase(unique(warmWidths.begin(), warmWidths.end(),
+                [](double a, double b) { return fabs(a - b) < 1.0e-5; }),
+                warmWidths.end());
+            vector<pair<double, double>> outlineTrials;
+            for (double width : warmWidths) {
+                vector<double> warmHeights =
+                    makeHeightTrials(design, seed.shape, width);
+                warmHeights.push_back(seed.H);
+                warmHeights.push_back(design.maxOutlineH);
+                sort(warmHeights.begin(), warmHeights.end());
+                warmHeights.erase(unique(warmHeights.begin(), warmHeights.end(),
+                    [](double a, double b) { return fabs(a - b) < 1.0e-5; }),
+                    warmHeights.end());
+                for (double height : warmHeights) {
+                    outlineTrials.push_back({
+                        clampD(width, minWidthBound(design, seed.shape),
+                            design.maxOutlineW),
+                        clampD(height, minHeightBound(design, seed.shape),
+                            design.maxOutlineH)
+                        });
+                }
+            }
+            sort(outlineTrials.begin(), outlineTrials.end(),
+                [](const auto& lhs, const auto& rhs) {
+                    const double lhsArea = lhs.first * lhs.second;
+                    const double rhsArea = rhs.first * rhs.second;
+                    if (fabs(lhsArea - rhsArea) > 1.0e-6)
+                        return lhsArea < rhsArea;
+                    return lhs < rhs;
+                });
+            outlineTrials.erase(unique(outlineTrials.begin(),
+                outlineTrials.end(), [](const auto& lhs, const auto& rhs) {
+                    return fabs(lhs.first - rhs.first) < 1.0e-5 &&
+                        fabs(lhs.second - rhs.second) < 1.0e-5;
+                    }), outlineTrials.end());
+            for (const auto& outline : outlineTrials) {
+                ++warmTried;
+                BStarState bs = seed;
+                bs.W = outline.first;
+                bs.H = outline.second;
+                LayoutResult cur;
+                if (!packBStarState(design, bs, cur)) continue;
+                ++warmPacked;
+                if (warmArchiveOut)
+                    addToBStarArchive(design, *warmArchiveOut, cur);
+                if (!warmHave || bstarAreaBetter(cur, warmBestLayout)) {
+                    warmHave = true;
+                    warmBestState = std::move(bs);
+                    warmBestLayout = std::move(cur);
+                }
+                break;
+            }
+        }
+        const auto warmEnd = chrono::steady_clock::now();
+        if (FAST_VERBOSE_LOG) {
+            cerr << fixed << setprecision(3)
+                << "[Phase1WarmStart] generated=" << warmSeeds.size()
+                << " tried=" << warmTried
+                << " repacked=" << warmPacked
+                << " solverMs=" <<
+                    chrono::duration_cast<chrono::milliseconds>(
+                        warmPackingStart - warmSolverStart).count()
+                << " repackMs=" <<
+                    chrono::duration_cast<chrono::milliseconds>(
+                        warmEnd - warmPackingStart).count();
+            if (warmHave)
+                cerr << " bestArea=" << warmBestLayout.area
+                    << " bestHpwl=" << warmBestLayout.hpwl
+                    << " bestRouteGap=" << warmBestLayout.routePenalty;
+            cerr << "\n";
+        }
+
+        bool have = false;
         for (const ShapeState& st : states) {
             vector<double> widths = makeWidthTrials(design, st);
             // Prefer smaller outlines first, but include the full outline as recovery.
@@ -3325,6 +5994,11 @@ namespace {
                 bestLayout = std::move(cur);
                 have = true;
             }
+        }
+        if (!have && warmHave) {
+            bestState = std::move(warmBestState);
+            bestLayout = std::move(warmBestLayout);
+            have = true;
         }
         return have;
     }
@@ -3438,12 +6112,14 @@ namespace {
         return true;
     }
 
-    static void bstarResizeOutline(const Design& design, BStarState& bs, const LayoutResult& curLayout, mt19937& rng) {
+    static void bstarResizeOutline(const Design& design, BStarState& bs, const LayoutResult& curLayout, mt19937& rng, bool secondPass = false) {
         const double dead = bstarDeadspace(design, curLayout);
-        const double shrinkBias = BSTAR_OUTLINE_SHRINK_BIAS - 0.020 * clampD(dead / 0.25, 0.0, 1.0);
+        double shrinkBias = BSTAR_OUTLINE_SHRINK_BIAS - 0.020 * clampD(dead / 0.25, 0.0, 1.0);
+        if (secondPass) shrinkBias -= 0.014;
         normal_distribution<double> shrinkND(shrinkBias, BSTAR_OUTLINE_LOG_SIGMA);
         normal_distribution<double> growND(0.020, BSTAR_OUTLINE_GROW_SIGMA);
-        const bool grow = uniform_real_distribution<double>(0.0, 1.0)(rng) < 0.22;
+        const double growProb = secondPass ? BSTAR_SECOND_GROW_PROB : 0.22;
+        const bool grow = uniform_real_distribution<double>(0.0, 1.0)(rng) < growProb;
         double fx = exp(grow ? growND(rng) : shrinkND(rng));
         double fy = exp(grow ? growND(rng) : shrinkND(rng));
         // Sometimes change aspect instead of pure area to escape bad B*-tree shapes.
@@ -3456,7 +6132,7 @@ namespace {
         bs.H = clampD(bs.H * fy, minHeightBound(design, bs.shape), design.maxOutlineH);
     }
 
-    static void bstarPerturb(const Design& design, BStarState& bs, const LayoutResult& curLayout, mt19937& rng) {
+    static void bstarPerturb(const Design& design, BStarState& bs, const LayoutResult& curLayout, mt19937& rng, bool secondPass = false) {
         const int m = static_cast<int>(bs.node.size());
         if (m <= 0) return;
         const double routeBad = clampD(curLayout.routePenalty / max(1.0, totalPackingArea(design)), 0.0, 3.0);
@@ -3466,15 +6142,21 @@ namespace {
         // Routing/congestion does not enter cost; it only biases what kind of
         // neighbor we sample.  Bad route proxy => more topology/soft moves.  High
         // deadspace => more outline shrinking.
-        double pOutline = clampD(0.22 + 0.45 * dead, 0.18, 0.58);
-        double pShape = clampD(0.14 + 0.10 * routeBad, 0.12, 0.28);
-        double pMove = clampD(0.22 + 0.10 * routeBad, 0.18, 0.35);
-        double pSwap = 0.24;
+        double pOutline = secondPass ?
+            clampD(0.36 + 0.42 * dead, 0.32, 0.62) :
+            clampD(0.22 + 0.45 * dead, 0.18, 0.58);
+        double pShape = secondPass ?
+            clampD(0.16 + 0.08 * routeBad, 0.14, 0.26) :
+            clampD(0.14 + 0.10 * routeBad, 0.12, 0.28);
+        double pMove = secondPass ?
+            clampD(0.18 + 0.08 * routeBad, 0.16, 0.30) :
+            clampD(0.22 + 0.10 * routeBad, 0.18, 0.35);
+        double pSwap = secondPass ? 0.18 : 0.24;
         double pFlip = 1.0 - (pOutline + pShape + pMove + pSwap);
         if (pFlip < 0.08) { pFlip = 0.08; pOutline = max(0.10, pOutline - 0.05); }
 
         if (r < pOutline) {
-            bstarResizeOutline(design, bs, curLayout, rng);
+            bstarResizeOutline(design, bs, curLayout, rng, secondPass);
         }
         else if (r < pOutline + pShape) {
             (void)bstarResizeSoft(design, bs, rng);
@@ -3495,29 +6177,97 @@ namespace {
         }
     }
 
-    static double estimateBStarInitialTemp(const Design& design, const BStarState& init, const LayoutResult& initLayout, mt19937& rng) {
-        double base = bstarAreaCost(initLayout);
+    static void bstarPerturbWire(const Design& design, BStarState& bs, const LayoutResult& curLayout, mt19937& rng, bool spreadMode) {
+        const int m = static_cast<int>(bs.node.size());
+        if (m <= 0) return;
+        const double routeBad = clampD(curLayout.routePenalty / max(1.0, totalPackingArea(design)), 0.0, 3.0);
+        const double dead = bstarDeadspace(design, curLayout);
+        const double r = uniform_real_distribution<double>(0.0, 1.0)(rng);
+
+        double pOutline = spreadMode ? clampD(0.12 + 0.18 * dead, 0.10, 0.26)
+            : clampD(0.18 + 0.22 * dead, 0.14, 0.34);
+        double pShape = clampD(0.20 + 0.08 * routeBad, 0.18, 0.30);
+        double pMove = clampD(0.30 + 0.08 * routeBad, 0.26, 0.40);
+        double pSwap = 0.24;
+        double pFlip = 1.0 - (pOutline + pShape + pMove + pSwap);
+        if (pFlip < 0.06) { pFlip = 0.06; pOutline = max(0.08, pOutline - 0.04); }
+
+        if (r < pOutline) {
+            bstarResizeOutline(design, bs, curLayout, rng, !spreadMode);
+        }
+        else if (r < pOutline + pShape) {
+            (void)bstarResizeSoft(design, bs, rng);
+        }
+        else if (r < pOutline + pShape + pMove) {
+            BStarState old = bs;
+            if (!bstarMoveLeaf(bs, rng)) bs = std::move(old);
+        }
+        else if (r < pOutline + pShape + pMove + pSwap) {
+            int a = pickHotMovableNode(design, bs, rng);
+            int b = pickHotMovableNode(design, bs, rng);
+            if (a == b) b = (b + 1) % m;
+            bstarSwapBlocks(bs, a, b);
+        }
+        else {
+            int u = pickHotMovableNode(design, bs, rng);
+            bstarFlipChildren(bs, u);
+        }
+    }
+
+    static double bstarCostForMode(const Design& design, const LayoutResult& r, bool checkerProxy) {
+        return checkerProxy ? bstarCheckerProxyCost(design, r) : bstarAreaCost(r);
+    }
+
+    static double estimateBStarInitialTemp(const Design& design, const BStarState& init, const LayoutResult& initLayout, mt19937& rng, bool checkerProxy = false) {
+        LayoutResult baseLayout = initLayout;
+        if (checkerProxy) annotateStripProxy(design, baseLayout);
+        double base = bstarCostForMode(design, baseLayout, checkerProxy);
         double sumUp = 0.0;
         int cntUp = 0;
         const int samples = max(30, min(240, BSTAR_SA_INNER_FACTOR * max(1, static_cast<int>(init.node.size()))));
         for (int i = 0; i < samples; ++i) {
             BStarState trial = init;
-            bstarPerturb(design, trial, initLayout, rng);
+            bstarPerturb(design, trial, initLayout, rng, checkerProxy);
             LayoutResult cur;
             if (!packBStarState(design, trial, cur)) continue;
-            double d = bstarAreaCost(cur) - base;
+            if (checkerProxy) annotateStripProxy(design, cur);
+            double d = bstarCostForMode(design, cur, checkerProxy) - base;
             if (d > 1.0) { sumUp += d; ++cntUp; }
         }
         double avg = (cntUp > 0) ? (sumUp / cntUp) : max(1.0, 0.015 * base);
         return max(1.0, avg / max(1e-9, log(1.0 / BSTAR_SA_INIT_ACCEPT_P)));
     }
 
-    static LayoutResult runBStarAreaSA(const Design& design, int& triedOut, int& packedOut, int& legalOut, vector<LayoutResult>* archiveOut = nullptr) {
+    static double estimateBStarWireInitialTemp(const Design& design, const BStarState& init, const LayoutResult& initLayout, mt19937& rng, bool spreadMode) {
+        LayoutResult baseLayout = initLayout;
+        annotateStripProxy(design, baseLayout);
+        const double base = bstarWireProxyCost(design, baseLayout, spreadMode);
+        double sumUp = 0.0;
+        int cntUp = 0;
+        const int samples = max(24, min(160, BSTAR_SA_INNER_FACTOR * max(1, static_cast<int>(init.node.size()))));
+        for (int i = 0; i < samples; ++i) {
+            BStarState trial = init;
+            bstarPerturbWire(design, trial, initLayout, rng, spreadMode);
+            LayoutResult cur;
+            if (!packBStarState(design, trial, cur)) continue;
+            annotateStripProxy(design, cur);
+            const double d = bstarWireProxyCost(design, cur, spreadMode) - base;
+            if (d > 1.0) { sumUp += d; ++cntUp; }
+        }
+        const double avg = (cntUp > 0) ? (sumUp / cntUp) : max(1.0, 0.018 * base);
+        return max(1.0, avg / max(1e-9, log(1.0 / BSTAR_SA_INIT_ACCEPT_P)));
+    }
+
+
+    static LayoutResult runBStarAreaSA(const Design& design, int& triedOut, int& packedOut, int& legalOut, vector<LayoutResult>* archiveOut = nullptr, BStarState* bestStateOut = nullptr) {
         triedOut = packedOut = legalOut = 0;
         LayoutResult empty;
         BStarState curState;
         LayoutResult curLayout;
-        if (!makeInitialBStarLegalState(design, curState, curLayout)) {
+        vector<LayoutResult> warmArchive;
+        vector<LayoutResult> archive;
+        if (!makeInitialBStarLegalState(
+            design, curState, curLayout, &warmArchive)) {
             if (FAST_VERBOSE_LOG) cerr << "[BStarSA] init failed, fallback required\n";
             return empty;
         }
@@ -3526,7 +6276,6 @@ namespace {
 
         BStarState bestState = curState;
         LayoutResult bestLayout = curLayout;
-        vector<LayoutResult> archive;
         addToBStarArchive(design, archive, curLayout);
         mt19937 rng(FAST_SEED ^ 0xB57A5A11u ^ static_cast<unsigned>(design.blockSpecs.size() * 131u));
         double T = estimateBStarInitialTemp(design, curState, curLayout, rng);
@@ -3618,7 +6367,11 @@ namespace {
         if (!archive.empty()) {
             bestLayout = archive.front();
         }
-        if (archiveOut) *archiveOut = archive;
+        if (archiveOut) {
+            *archiveOut = archive;
+            archiveOut->insert(archiveOut->end(),
+                warmArchive.begin(), warmArchive.end());
+        }
 
         if (FAST_VERBOSE_LOG) {
             cerr << fixed << setprecision(3)
@@ -3639,14 +6392,320 @@ namespace {
                 << " uphill=" << uphill
                 << " rejected=" << rejected
                 << " archive=" << archive.size()
+                << " warmArchive=" << warmArchive.size()
                 << " stripPeak=" << bestLayout.stripPeakUtilProxy
                 << " stripOvProxy=" << bestLayout.stripOverflowProxy
                 << " stripHot=" << bestLayout.stripHotComponents
                 << " cost=outlineAreaOnly"
                 << "\n";
         }
+        if (bestStateOut) *bestStateOut = bestState;
         (void)bestState;
         return bestLayout;
+    }
+
+    static vector<LayoutResult> runBStarSecondProxySA(
+        const Design& design,
+        const BStarState& seedState,
+        int& triedOut,
+        int& packedOut,
+        int& legalOut
+    ) {
+        triedOut = packedOut = legalOut = 0;
+        vector<LayoutResult> archive;
+        if (!ENABLE_BSTAR_SECOND_PROXY_SA || seedState.node.empty()) return archive;
+
+        BStarState curState = seedState;
+        LayoutResult curLayout;
+        if (!packBStarState(design, curState, curLayout)) return archive;
+        annotateStripProxy(design, curLayout);
+        ++packedOut;
+        if (curLayout.legal && curLayout.strictEdgeLegal) ++legalOut;
+
+        BStarState bestState = curState;
+        LayoutResult bestLayout = curLayout;
+        addToBStarSecondArchive(design, archive, curLayout);
+
+        mt19937 rng(FAST_SEED ^ 0x5EC0A11u ^ static_cast<unsigned>(design.blockSpecs.size() * 977u));
+        double T = estimateBStarInitialTemp(design, curState, curLayout, rng, true);
+        const int m = static_cast<int>(curState.node.size());
+        const int inner = max(BSTAR_SA_MIN_INNER, BSTAR_SA_INNER_FACTOR * max(1, m));
+        int moveCap = min(BSTAR_SECOND_SA_MAX_MOVES_CAP, max(900, inner * max(12, min(36, m + 8))));
+        if (smallOfficialLikeCase(design)) moveCap = max(moveCap, min(5200, BSTAR_SECOND_SA_MAX_MOVES_CAP + 1800));
+        const int outerLimit = min(BSTAR_SA_MAX_OUTER, 90);
+
+        int accepted = 0, uphill = 0, rejected = 0, bestUpdates = 0, outer = 0;
+        double curCost = bstarCheckerProxyCost(design, curLayout);
+        const double startCost = curCost;
+        const double startArea = curLayout.area;
+
+        while (outer++ < outerLimit && triedOut < moveCap && T > BSTAR_SA_MIN_TEMP) {
+            int roundAccepted = 0;
+            int roundRejected = 0;
+            int roundPacked = 0;
+            for (int mt = 0; mt < inner && triedOut < moveCap; ++mt) {
+                ++triedOut;
+                BStarState trial = curState;
+                bstarPerturb(design, trial, curLayout, rng, true);
+                LayoutResult cand;
+                if (!packBStarState(design, trial, cand)) {
+                    ++roundRejected;
+                    ++rejected;
+                    continue;
+                }
+                annotateStripProxy(design, cand);
+                ++packedOut;
+                ++roundPacked;
+                if (cand.legal && cand.strictEdgeLegal) {
+                    ++legalOut;
+                    addToBStarSecondArchive(design, archive, cand);
+                }
+
+                const double candCost = bstarCheckerProxyCost(design, cand);
+                const double d = candCost - curCost;
+                bool accept = false;
+                if (d <= 0.0) accept = true;
+                else {
+                    const double prob = exp(-d / max(1.0e-12, T));
+                    accept = uniform_real_distribution<double>(0.0, 1.0)(rng) < prob;
+                }
+
+                if (accept) {
+                    curState = std::move(trial);
+                    curLayout = std::move(cand);
+                    curCost = candCost;
+                    ++accepted;
+                    ++roundAccepted;
+                    if (d > 0.0) ++uphill;
+                    if (curLayout.legal && curLayout.strictEdgeLegal &&
+                        bstarCheckerProxyBetter(design, curLayout, bestLayout)) {
+                        bestLayout = curLayout;
+                        bestState = curState;
+                        addToBStarSecondArchive(design, archive, curLayout);
+                        ++bestUpdates;
+                    }
+                }
+                else {
+                    ++rejected;
+                    ++roundRejected;
+                }
+            }
+
+            const double rejectRate = static_cast<double>(roundRejected) / max(1, roundRejected + roundAccepted);
+            if (FAST_VERBOSE_LOG && (outer <= 4 || outer % 10 == 0 || bestUpdates > 0)) {
+                cerr << fixed << setprecision(3)
+                    << "[BStarSecondSA/Round] outer=" << outer
+                    << " T=" << T
+                    << " packedDelta=" << roundPacked
+                    << " acceptDelta=" << roundAccepted
+                    << " rejectRate=" << rejectRate
+                    << " curCost=" << curCost
+                    << " bestCost=" << bstarCheckerProxyCost(design, bestLayout)
+                    << " bestArea=" << bestLayout.area
+                    << " bestW/H=" << bestLayout.W << "x" << bestLayout.H
+                    << " bestRouteGap=" << bestLayout.routePenalty
+                    << " stripPeak=" << bestLayout.stripPeakUtilProxy
+                    << "\n";
+                bestUpdates = 0;
+            }
+            if (roundPacked == 0 && T < 0.02 * max(1.0, startCost)) break;
+            if (rejectRate > 0.992 && outer > 10) break;
+            T *= BSTAR_SA_COOL;
+        }
+
+        if (!archive.empty()) {
+            sort(archive.begin(), archive.end(), [&](const LayoutResult& a, const LayoutResult& b) {
+                return bstarCheckerProxyBetter(design, a, b);
+                });
+            if (static_cast<int>(archive.size()) > BSTAR_SECOND_ARCHIVE_LIMIT) {
+                archive.resize(BSTAR_SECOND_ARCHIVE_LIMIT);
+            }
+        }
+
+        if (FAST_VERBOSE_LOG) {
+            cerr << fixed << setprecision(3)
+                << "[BStarSecondSA/Selected]"
+                << " startArea=" << startArea
+                << " startCost=" << startCost
+                << " bestArea=" << bestLayout.area
+                << " bestCost=" << bstarCheckerProxyCost(design, bestLayout)
+                << " W/H=" << bestLayout.W << "x" << bestLayout.H
+                << " hpwl=" << bestLayout.hpwl
+                << " routeGap=" << bestLayout.routePenalty
+                << " stripPeak=" << bestLayout.stripPeakUtilProxy
+                << " stripOvProxy=" << bestLayout.stripOverflowProxy
+                << " tried=" << triedOut
+                << " packed=" << packedOut
+                << " legal=" << legalOut
+                << " accepted=" << accepted
+                << " uphill=" << uphill
+                << " rejected=" << rejected
+                << " archive=" << archive.size()
+                << " cost=checkerProxy"
+                << "\n";
+        }
+
+        (void)bestState;
+        return archive;
+    }
+
+    static vector<LayoutResult> runBStarWireProxySA(
+        const Design& design,
+        const vector<BStarState>& seeds,
+        bool spreadMode,
+        int& triedOut,
+        int& packedOut,
+        int& legalOut
+    ) {
+        triedOut = packedOut = legalOut = 0;
+        vector<LayoutResult> archive;
+        if (!ENABLE_BSTAR_WIRE_SA || seeds.empty()) return archive;
+
+        ScopedBStarPackMode packMode(spreadMode ? 2 : 1);
+        const int seedCount = min(BSTAR_WIRE_SEED_LIMIT, static_cast<int>(seeds.size()));
+        const int totalMoveCap = spreadMode ? BSTAR_SPREAD_SA_MAX_MOVES_CAP : BSTAR_WIRE_SA_MAX_MOVES_CAP;
+        const int perSeedCap = max(360, totalMoveCap / max(1, seedCount));
+        const int outerLimit = spreadMode ? 56 : 64;
+
+        for (int si = 0; si < seedCount; ++si) {
+            BStarState curState = seeds[si];
+            LayoutResult curLayout;
+            if (!packBStarState(design, curState, curLayout)) continue;
+            annotateStripProxy(design, curLayout);
+            ++packedOut;
+            if (curLayout.legal && curLayout.strictEdgeLegal) ++legalOut;
+            addToBStarWireArchive(design, archive, curLayout, spreadMode);
+
+            LayoutResult bestLayout = curLayout;
+            BStarState bestState = curState;
+            mt19937 rng(FAST_SEED ^
+                (spreadMode ? 0x5A9EADu : 0x51EEDu) ^
+                static_cast<unsigned>(design.blockSpecs.size() * 4099u + si * 131u));
+            double T = estimateBStarWireInitialTemp(design, curState, curLayout, rng, spreadMode);
+            const int m = static_cast<int>(curState.node.size());
+            const int inner = max(24, min(BSTAR_SA_MIN_INNER, 4 * max(1, m)));
+            int accepted = 0, uphill = 0, rejected = 0, bestUpdates = 0, localTried = 0, outer = 0;
+            double curCost = bstarWireProxyCost(design, curLayout, spreadMode);
+            const double startCost = curCost;
+            const double startArea = curLayout.area;
+
+            while (outer++ < outerLimit && localTried < perSeedCap && T > BSTAR_SA_MIN_TEMP) {
+                int roundAccepted = 0;
+                int roundRejected = 0;
+                int roundPacked = 0;
+                for (int mt = 0; mt < inner && localTried < perSeedCap; ++mt) {
+                    ++triedOut;
+                    ++localTried;
+                    BStarState trial = curState;
+                    bstarPerturbWire(design, trial, curLayout, rng, spreadMode);
+                    LayoutResult cand;
+                    if (!packBStarState(design, trial, cand)) {
+                        ++roundRejected;
+                        ++rejected;
+                        continue;
+                    }
+                    annotateStripProxy(design, cand);
+                    ++packedOut;
+                    ++roundPacked;
+                    if (cand.legal && cand.strictEdgeLegal) {
+                        ++legalOut;
+                        addToBStarWireArchive(design, archive, cand, spreadMode);
+                    }
+
+                    const double candCost = bstarWireProxyCost(design, cand, spreadMode);
+                    const double d = candCost - curCost;
+                    bool accept = false;
+                    if (d <= 0.0) accept = true;
+                    else {
+                        const double prob = exp(-d / max(1.0e-12, T));
+                        accept = uniform_real_distribution<double>(0.0, 1.0)(rng) < prob;
+                    }
+
+                    if (accept) {
+                        curState = std::move(trial);
+                        curLayout = std::move(cand);
+                        curCost = candCost;
+                        ++accepted;
+                        ++roundAccepted;
+                        if (d > 0.0) ++uphill;
+                        if (curLayout.legal && curLayout.strictEdgeLegal &&
+                            bstarWireProxyBetter(design, curLayout, bestLayout, spreadMode)) {
+                            bestLayout = curLayout;
+                            bestState = curState;
+                            addToBStarWireArchive(design, archive, curLayout, spreadMode);
+                            ++bestUpdates;
+                        }
+                    }
+                    else {
+                        ++rejected;
+                        ++roundRejected;
+                    }
+                }
+
+                const double rejectRate = static_cast<double>(roundRejected) / max(1, roundRejected + roundAccepted);
+                if (FAST_VERBOSE_LOG && si < 2 && (outer <= 3 || outer % 12 == 0 || bestUpdates > 0)) {
+                    cerr << fixed << setprecision(3)
+                        << (spreadMode ? "[BStarSpreadWireSA/Round]" : "[BStarWireSA/Round]")
+                        << " seed=" << si
+                        << " outer=" << outer
+                        << " T=" << T
+                        << " packedDelta=" << roundPacked
+                        << " acceptDelta=" << roundAccepted
+                        << " rejectRate=" << rejectRate
+                        << " curCost=" << curCost
+                        << " bestCost=" << bstarWireProxyCost(design, bestLayout, spreadMode)
+                        << " bestArea=" << bestLayout.area
+                        << " bestHpwl=" << bestLayout.hpwl
+                        << " bestRouteGap=" << bestLayout.routePenalty
+                        << "\n";
+                    bestUpdates = 0;
+                }
+                if (roundPacked == 0 && T < 0.02 * max(1.0, startCost)) break;
+                if (rejectRate > 0.993 && outer > 10) break;
+                T *= BSTAR_SA_COOL;
+            }
+
+            if (FAST_VERBOSE_LOG) {
+                cerr << fixed << setprecision(3)
+                    << (spreadMode ? "[BStarSpreadWireSA/Seed]" : "[BStarWireSA/Seed]")
+                    << " seed=" << si
+                    << " startArea=" << startArea
+                    << " startCost=" << startCost
+                    << " bestArea=" << bestLayout.area
+                    << " bestCost=" << bstarWireProxyCost(design, bestLayout, spreadMode)
+                    << " hpwl=" << bestLayout.hpwl
+                    << " routeGap=" << bestLayout.routePenalty
+                    << " tried=" << localTried
+                    << " accepted=" << accepted
+                    << " uphill=" << uphill
+                    << " rejected=" << rejected
+                    << "\n";
+            }
+            (void)bestState;
+        }
+
+        sort(archive.begin(), archive.end(), [&](const LayoutResult& a, const LayoutResult& b) {
+            return bstarWireProxyBetter(design, a, b, spreadMode);
+            });
+        const int limit = spreadMode ? BSTAR_SPREAD_ARCHIVE_LIMIT : BSTAR_WIRE_ARCHIVE_LIMIT;
+        if (static_cast<int>(archive.size()) > limit) archive.resize(limit);
+        if (FAST_VERBOSE_LOG) {
+            cerr << fixed << setprecision(3)
+                << (spreadMode ? "[BStarSpreadWireSA/Selected]" : "[BStarWireSA/Selected]")
+                << " seeds=" << seedCount
+                << " tried=" << triedOut
+                << " packed=" << packedOut
+                << " legal=" << legalOut
+                << " archive=" << archive.size();
+            if (!archive.empty()) {
+                cerr << " bestArea=" << archive.front().area
+                    << " bestCost=" << bstarWireProxyCost(design, archive.front(), spreadMode)
+                    << " bestHpwl=" << archive.front().hpwl
+                    << " bestRouteGap=" << archive.front().routePenalty;
+            }
+            cerr << "\n";
+        }
+        return archive;
     }
 
     static double compactColumnOrderScore(const Design& design, int id, const Rect& sh, int mode) {
@@ -4423,6 +7482,561 @@ namespace {
         }
     }
 
+    struct AlignmentGuide {
+        bool xAxis = true;
+        double coordinate = 0.0;
+        double rank = 0.0;
+        int support = 0;
+    };
+
+    struct AlignmentQuality {
+        double score = 0.0;
+        int sharedLines = 0;
+        int alignedEdges = 0;
+        int alignedBlocks = 0;
+    };
+
+    struct AlignmentProposal {
+        int id = -1;
+        bool xAxis = true;
+        bool highEdge = false;
+        bool reshapeSoft = false;
+        double coordinate = 0.0;
+        double priority = 0.0;
+    };
+
+    struct AlignmentRefineConfig {
+        double snapFraction = 0.0;
+        int maxGuidesPerAxis = 0;
+        int passes = 1;
+        bool reshapeSoft = false;
+    };
+
+    static double alignmentBlockWeight(
+        const Design& design,
+        int id,
+        double maxDemand
+    ) {
+        if (id < 0 || id >= static_cast<int>(design.blockSpecs.size())) return 1.0;
+        const double demand = endpointDemand(design, id);
+        double weight = 1.0 + 0.75 * sqrt(clampD(demand / max(1.0, maxDemand), 0.0, 1.0));
+        if (design.blockSpecs[id].type == BlockType::EDGE) weight += 0.40;
+        return weight;
+    }
+
+    static double alignmentEdgeCoordinate(
+        const Rect& rect,
+        bool xAxis,
+        bool highEdge
+    ) {
+        if (xAxis) return highEdge ? rectRight(rect) : rect.x;
+        return highEdge ? rectTop(rect) : rect.y;
+    }
+
+    static vector<AlignmentGuide> collectAlignmentGuides(
+        const Design& design,
+        const LayoutResult& base,
+        bool xAxis,
+        double radius,
+        int guideLimit
+    ) {
+        struct EdgeSample {
+            double coordinate = 0.0;
+            int id = -1;
+        };
+
+        vector<EdgeSample> samples;
+        samples.reserve(base.rects.size() * 2);
+        for (int id = 0; id < static_cast<int>(base.rects.size()); ++id) {
+            samples.push_back({ alignmentEdgeCoordinate(base.rects[id], xAxis, false), id });
+            samples.push_back({ alignmentEdgeCoordinate(base.rects[id], xAxis, true), id });
+        }
+
+        const double extent = xAxis ? base.W : base.H;
+        const double maxDemand = maxEndpointDemand(design);
+        vector<AlignmentGuide> candidates;
+        candidates.reserve(samples.size());
+        for (const EdgeSample& sample : samples) {
+            const double coordinate = round(sample.coordinate);
+            if (coordinate <= 0.5 || coordinate >= extent - 0.5) continue;
+
+            vector<char> nearSeen(base.rects.size(), 0);
+            vector<char> exactSeen(base.rects.size(), 0);
+            int support = 0;
+            int movableSupport = 0;
+            int fixedSupport = 0;
+            int exactSupport = 0;
+            double weightedSupport = 0.0;
+            double spanLo = INF;
+            double spanHi = -INF;
+            for (int id = 0; id < static_cast<int>(base.rects.size()); ++id) {
+                const Rect& rect = base.rects[id];
+                const double low = alignmentEdgeCoordinate(rect, xAxis, false);
+                const double high = alignmentEdgeCoordinate(rect, xAxis, true);
+                const double distance = min(fabs(low - coordinate), fabs(high - coordinate));
+                if (distance <= radius + EPS && !nearSeen[id]) {
+                    nearSeen[id] = 1;
+                    ++support;
+                    weightedSupport += alignmentBlockWeight(design, id, maxDemand);
+                    if (isMovableBlock(design.blockSpecs[id])) ++movableSupport;
+                    else ++fixedSupport;
+                    spanLo = min(spanLo, xAxis ? rect.y : rect.x);
+                    spanHi = max(spanHi, xAxis ? rectTop(rect) : rectRight(rect));
+                }
+                if (distance <= ALIGNMENT_EXACT_EPS && !exactSeen[id]) {
+                    exactSeen[id] = 1;
+                    ++exactSupport;
+                }
+            }
+
+            if (movableSupport < 1 || (movableSupport < 2 && fixedSupport < 1)) continue;
+            if (support < 2) continue;
+
+            const double span = max(0.0, spanHi - spanLo);
+            const double exactBonus = 4.0 * max(0, exactSupport - 1);
+            const double fixedBonus = 0.80 * fixedSupport;
+            const double continuityBonus =
+                0.90 * static_cast<double>(support) * span / max(1.0, xAxis ? base.H : base.W);
+            const double rank =
+                exactBonus + weightedSupport + 0.60 * static_cast<double>(support - 1) +
+                fixedBonus + continuityBonus;
+            candidates.push_back({ xAxis, coordinate, rank, support });
+        }
+
+        sort(candidates.begin(), candidates.end(), [](const AlignmentGuide& a, const AlignmentGuide& b) {
+            if (fabs(a.rank - b.rank) > 1.0e-9) return a.rank > b.rank;
+            if (a.support != b.support) return a.support > b.support;
+            return a.coordinate < b.coordinate;
+            });
+
+        vector<AlignmentGuide> guides;
+        const double minSeparation = max(2.0, min(8.0, 0.08 * radius));
+        for (const AlignmentGuide& candidate : candidates) {
+            bool duplicate = false;
+            for (const AlignmentGuide& old : guides) {
+                if (fabs(old.coordinate - candidate.coordinate) < minSeparation) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            guides.push_back(candidate);
+            if (static_cast<int>(guides.size()) >= guideLimit) break;
+        }
+        return guides;
+    }
+
+    static AlignmentQuality measureAlignment(
+        const Design& design,
+        const vector<Rect>& rects,
+        const vector<AlignmentGuide>& guides
+    ) {
+        AlignmentQuality quality;
+        vector<char> alignedBlock(rects.size(), 0);
+        const double maxDemand = maxEndpointDemand(design);
+        for (const AlignmentGuide& guide : guides) {
+            int support = 0;
+            int movableSupport = 0;
+            double weightedSupport = 0.0;
+            for (int id = 0; id < static_cast<int>(rects.size()); ++id) {
+                const double low = alignmentEdgeCoordinate(rects[id], guide.xAxis, false);
+                const double high = alignmentEdgeCoordinate(rects[id], guide.xAxis, true);
+                if (min(fabs(low - guide.coordinate), fabs(high - guide.coordinate)) >
+                    ALIGNMENT_EXACT_EPS) continue;
+                ++support;
+                weightedSupport += alignmentBlockWeight(design, id, maxDemand);
+                if (isMovableBlock(design.blockSpecs[id])) {
+                    ++movableSupport;
+                    alignedBlock[id] = 1;
+                }
+            }
+            if (support < 2 || movableSupport < 1) continue;
+
+            const double concentration =
+                static_cast<double>(support - 1) * max(1.0, weightedSupport - 1.0);
+            quality.score += concentration;
+            ++quality.sharedLines;
+            quality.alignedEdges += support;
+        }
+        quality.score -= 0.12 * static_cast<double>(quality.sharedLines);
+        for (char aligned : alignedBlock) {
+            if (aligned) ++quality.alignedBlocks;
+        }
+        return quality;
+    }
+
+    static bool alignmentMoveSafe(
+        const LayoutResult& candidate,
+        const LayoutResult& base
+    ) {
+        if (!candidate.legal || candidate.overlap > EPS || candidate.outlineViol > EPS) return false;
+        if (base.strictEdgeLegal && !candidate.strictEdgeLegal) return false;
+        if (candidate.routeViolPairs > base.routeViolPairs) return false;
+        if (candidate.hpwl >
+            base.hpwl * ALIGNMENT_HPWL_GUARD_RATIO + 1500.0) return false;
+        if (candidate.routePenalty >
+            base.routePenalty * ALIGNMENT_ROUTE_GUARD_RATIO + 2500.0) return false;
+        if (candidate.routeGapPenaltyPart >
+            base.routeGapPenaltyPart * ALIGNMENT_ROUTE_GUARD_RATIO + 2500.0) return false;
+        if (candidate.routePortPenaltyPart >
+            base.routePortPenaltyPart * ALIGNMENT_ROUTE_GUARD_RATIO + 1500.0) return false;
+        if (candidate.routeMaxGapMiss > base.routeMaxGapMiss + 1.0) return false;
+        if (candidate.routeMaxPortMiss > base.routeMaxPortMiss + 1.0) return false;
+        return true;
+    }
+
+    static vector<vector<Rect>> makeAlignmentRectVariants(
+        const Design& design,
+        const vector<Rect>& current,
+        const AlignmentProposal& proposal
+    ) {
+        vector<vector<Rect>> variants;
+        if (proposal.id < 0 || proposal.id >= static_cast<int>(current.size())) return variants;
+
+        const int id = proposal.id;
+        const Rect& old = current[id];
+        if (!proposal.reshapeSoft) {
+            Rect moved = old;
+            if (proposal.xAxis) {
+                moved.x = proposal.highEdge ?
+                    proposal.coordinate - moved.w : proposal.coordinate;
+            }
+            else {
+                moved.y = proposal.highEdge ?
+                    proposal.coordinate - moved.h : proposal.coordinate;
+            }
+            vector<Rect> candidate = current;
+            candidate[id] = moved;
+            variants.push_back(std::move(candidate));
+            return variants;
+        }
+
+        const BlockSpec& spec = design.blockSpecs[id];
+        if (spec.type != BlockType::SOFT || spec.hasFixedSize) return variants;
+
+        const double reserve = softFtSideReserve(design, id);
+        const double area = blockNominalArea(spec);
+        double targetDimension = 0.0;
+        double ratio = 0.0;
+        if (proposal.xAxis) {
+            targetDimension = proposal.highEdge ?
+                proposal.coordinate - old.x : rectRight(old) - proposal.coordinate;
+            const double coreWidth = targetDimension - reserve;
+            if (coreWidth <= EPS) return variants;
+            ratio = coreWidth * coreWidth / max(1.0, area);
+        }
+        else {
+            targetDimension = proposal.highEdge ?
+                proposal.coordinate - old.y : rectTop(old) - proposal.coordinate;
+            const double coreHeight = targetDimension - reserve;
+            if (coreHeight <= EPS) return variants;
+            ratio = area / max(1.0, coreHeight * coreHeight);
+        }
+
+        const double amin = max(0.05, spec.aspectMin);
+        const double amax = max(amin, spec.aspectMax);
+        if (ratio < amin - 1.0e-8 || ratio > amax + 1.0e-8) return variants;
+
+        Rect shaped = makePackingShape(design, id, ratio);
+        const double oldDimension = proposal.xAxis ? old.w : old.h;
+        const double newDimension = proposal.xAxis ? shaped.w : shaped.h;
+        if (newDimension < 0.82 * oldDimension || newDimension > 1.18 * oldDimension) return variants;
+
+        if (proposal.xAxis) {
+            shaped.x = proposal.highEdge ?
+                proposal.coordinate - shaped.w : proposal.coordinate;
+            const array<double, 3> orthogonal = {
+                old.y,
+                rectCy(old) - 0.5 * shaped.h,
+                rectTop(old) - shaped.h
+            };
+            for (double y : orthogonal) {
+                Rect placed = shaped;
+                placed.y = y;
+                vector<Rect> candidate = current;
+                candidate[id] = placed;
+                variants.push_back(std::move(candidate));
+            }
+        }
+        else {
+            shaped.y = proposal.highEdge ?
+                proposal.coordinate - shaped.h : proposal.coordinate;
+            const array<double, 3> orthogonal = {
+                old.x,
+                rectCx(old) - 0.5 * shaped.w,
+                rectRight(old) - shaped.w
+            };
+            for (double x : orthogonal) {
+                Rect placed = shaped;
+                placed.x = x;
+                vector<Rect> candidate = current;
+                candidate[id] = placed;
+                variants.push_back(std::move(candidate));
+            }
+        }
+        return variants;
+    }
+
+    static bool refineLayoutAlignment(
+        const Design& design,
+        const LayoutResult& base,
+        const AlignmentRefineConfig& config,
+        LayoutResult& out,
+        AlignmentQuality& beforeQuality,
+        AlignmentQuality& afterQuality,
+        int& acceptedMoves,
+        int& guideCount
+    ) {
+        acceptedMoves = 0;
+        guideCount = 0;
+        if (!ENABLE_ALIGNMENT_ARCHIVE_REFINEMENT ||
+            !base.legal || !base.strictEdgeLegal ||
+            base.rects.size() != design.blockSpecs.size()) return false;
+
+        const double xRadius = clampD(config.snapFraction * base.W, 3.0, 180.0);
+        const double yRadius = clampD(config.snapFraction * base.H, 3.0, 180.0);
+        vector<AlignmentGuide> guides =
+            collectAlignmentGuides(design, base, true, xRadius, config.maxGuidesPerAxis);
+        vector<AlignmentGuide> yGuides =
+            collectAlignmentGuides(design, base, false, yRadius, config.maxGuidesPerAxis);
+        guides.insert(guides.end(), yGuides.begin(), yGuides.end());
+        guideCount = static_cast<int>(guides.size());
+        if (guides.empty()) return false;
+
+        LayoutResult current = base;
+        beforeQuality = measureAlignment(design, current.rects, guides);
+        AlignmentQuality currentQuality = beforeQuality;
+        const double maxDemand = maxEndpointDemand(design);
+
+        for (int pass = 0; pass < config.passes; ++pass) {
+            vector<AlignmentProposal> proposals;
+            proposals.reserve(current.rects.size() * guides.size() * 4);
+            for (int id = 0; id < static_cast<int>(current.rects.size()); ++id) {
+                if (!isMovableBlock(design.blockSpecs[id])) continue;
+                const double blockWeight = alignmentBlockWeight(design, id, maxDemand);
+                for (const AlignmentGuide& guide : guides) {
+                    const double maxSnap = guide.xAxis ? xRadius : yRadius;
+                    for (int high = 0; high <= 1; ++high) {
+                        const double edge = alignmentEdgeCoordinate(
+                            current.rects[id], guide.xAxis, high != 0);
+                        const double distance = fabs(edge - guide.coordinate);
+                        if (distance <= ALIGNMENT_EXACT_EPS || distance > maxSnap + EPS) continue;
+                        const double closeness = 1.0 - distance / max(1.0, maxSnap);
+                        const double priority =
+                            guide.rank * blockWeight * (0.55 + 0.45 * closeness);
+                        proposals.push_back({
+                            id, guide.xAxis, high != 0, false,
+                            guide.coordinate, priority
+                            });
+                        if (config.reshapeSoft &&
+                            design.blockSpecs[id].type == BlockType::SOFT &&
+                            !design.blockSpecs[id].hasFixedSize) {
+                            proposals.push_back({
+                                id, guide.xAxis, high != 0, true,
+                                guide.coordinate, 0.96 * priority
+                                });
+                        }
+                    }
+                }
+            }
+
+            sort(proposals.begin(), proposals.end(), [](const AlignmentProposal& a, const AlignmentProposal& b) {
+                if (fabs(a.priority - b.priority) > 1.0e-9) return a.priority > b.priority;
+                if (a.reshapeSoft != b.reshapeSoft) return !a.reshapeSoft;
+                if (a.id != b.id) return a.id < b.id;
+                if (a.xAxis != b.xAxis) return a.xAxis;
+                if (a.highEdge != b.highEdge) return !a.highEdge;
+                return a.coordinate < b.coordinate;
+                });
+
+            vector<char> movedAxis(current.rects.size() * 2, 0);
+            bool improvedThisPass = false;
+            for (const AlignmentProposal& proposal : proposals) {
+                if (acceptedMoves >= ALIGNMENT_MAX_ACCEPTED_MOVES) break;
+                const int axisIndex = 2 * proposal.id + (proposal.xAxis ? 0 : 1);
+                if (movedAxis[axisIndex]) continue;
+
+                const double edge = alignmentEdgeCoordinate(
+                    current.rects[proposal.id], proposal.xAxis, proposal.highEdge);
+                const double maxSnap = proposal.xAxis ? xRadius : yRadius;
+                const double distance = fabs(edge - proposal.coordinate);
+                if (distance <= ALIGNMENT_EXACT_EPS || distance > maxSnap + EPS) continue;
+
+                LayoutResult bestMove;
+                AlignmentQuality bestMoveQuality = currentQuality;
+                bool haveMove = false;
+                vector<vector<Rect>> variants =
+                    makeAlignmentRectVariants(design, current.rects, proposal);
+                for (vector<Rect>& rects : variants) {
+                    LayoutResult candidate =
+                        scoreLayout(design, base.W, base.H, std::move(rects));
+                    if (!alignmentMoveSafe(candidate, base)) continue;
+                    AlignmentQuality quality =
+                        measureAlignment(design, candidate.rects, guides);
+                    const bool alignmentBetter =
+                        quality.score > bestMoveQuality.score + 0.20 ||
+                        (fabs(quality.score - bestMoveQuality.score) <= 0.20 &&
+                            quality.alignedEdges > bestMoveQuality.alignedEdges);
+                    if (!alignmentBetter) continue;
+                    if (!haveMove ||
+                        quality.score > bestMoveQuality.score + 1.0e-9 ||
+                        (fabs(quality.score - bestMoveQuality.score) <= 1.0e-9 &&
+                            candidate.score < bestMove.score)) {
+                        bestMove = std::move(candidate);
+                        bestMoveQuality = quality;
+                        haveMove = true;
+                    }
+                }
+                if (!haveMove) continue;
+
+                current = std::move(bestMove);
+                currentQuality = bestMoveQuality;
+                movedAxis[axisIndex] = 1;
+                improvedThisPass = true;
+                ++acceptedMoves;
+            }
+            if (!improvedThisPass) break;
+        }
+
+        afterQuality = currentQuality;
+        if (afterQuality.score <= beforeQuality.score + 0.50 ||
+            afterQuality.alignedEdges <= beforeQuality.alignedEdges) return false;
+
+        annotateStripProxy(design, current);
+        const RouteProxy baseProxy = estimateRouteProxy(design, base);
+        const RouteProxy refinedProxy = estimateRouteProxy(design, current);
+        const bool noOpenRegression =
+            refinedProxy.disconnectedPairs <= baseProxy.disconnectedPairs;
+        const bool directionalSafe =
+            refinedProxy.maxDirectionalUtil <=
+            max(baseProxy.maxDirectionalUtil * ALIGNMENT_PROXY_GUARD_RATIO + 0.03,
+                baseProxy.maxDirectionalUtil + 0.15);
+        const bool channelSafe =
+            refinedProxy.channelRisk <=
+            max(baseProxy.channelRisk * ALIGNMENT_PROXY_GUARD_RATIO + 2500.0,
+                baseProxy.channelRisk + 75000.0);
+        const bool ftSafe =
+            refinedProxy.ftRisk <=
+            max(baseProxy.ftRisk * ALIGNMENT_PROXY_GUARD_RATIO + 1000.0,
+                baseProxy.ftRisk + 30000.0);
+        const bool stripSafe =
+            current.stripPeakUtilProxy <=
+            max(base.stripPeakUtilProxy * 1.08 + 0.04,
+                base.stripPeakUtilProxy + 0.12) &&
+            current.stripOverflowProxy <=
+            max(base.stripOverflowProxy * 1.10 + 5000.0,
+                base.stripOverflowProxy + 1000000.0);
+        if (!noOpenRegression || !directionalSafe || !channelSafe || !ftSafe || !stripSafe) {
+            return false;
+        }
+
+        out = std::move(current);
+        return true;
+    }
+
+    static vector<LayoutResult> makeAlignmentArchive(
+        const Design& design,
+        const vector<LayoutResult>& seeds
+    ) {
+        struct RankedAlignment {
+            LayoutResult layout;
+            AlignmentQuality before;
+            AlignmentQuality after;
+            double rank = INF;
+            int seed = -1;
+            int variant = -1;
+            int acceptedMoves = 0;
+            int guideCount = 0;
+        };
+
+        const array<AlignmentRefineConfig, 3> configs = {
+            AlignmentRefineConfig{ 0.0045, 4, 1, false },
+            AlignmentRefineConfig{ 0.0100, 6, 2, true },
+            AlignmentRefineConfig{ 0.0220, ALIGNMENT_MAX_GUIDES_PER_AXIS, 2, true }
+        };
+
+        vector<RankedAlignment> ranked;
+        const int seedLimit = min(ALIGNMENT_SEED_LIMIT, static_cast<int>(seeds.size()));
+        for (int seedIndex = 0; seedIndex < seedLimit; ++seedIndex) {
+            const LayoutResult& base = seeds[seedIndex];
+            for (int variant = 0; variant < static_cast<int>(configs.size()); ++variant) {
+                LayoutResult refined;
+                AlignmentQuality before;
+                AlignmentQuality after;
+                int acceptedMoves = 0;
+                int guideCount = 0;
+                const bool accepted = refineLayoutAlignment(
+                    design, base, configs[variant], refined,
+                    before, after, acceptedMoves, guideCount);
+
+                cerr << fixed << setprecision(3)
+                    << "[Alignment] seed=" << seedIndex
+                    << " variant=" << variant
+                    << " snapFrac=" << configs[variant].snapFraction
+                    << " guides=" << guideCount
+                    << " moves=" << acceptedMoves
+                    << " lines=" << before.sharedLines << "->" << after.sharedLines
+                    << " edges=" << before.alignedEdges << "->" << after.alignedEdges
+                    << " blocks=" << before.alignedBlocks << "->" << after.alignedBlocks
+                    << " alignScore=" << before.score << "->" << after.score
+                    << " accept=" << (accepted ? "Y" : "N");
+                if (accepted) {
+                    cerr << " hpwl=" << base.hpwl << "->" << refined.hpwl
+                        << " routeGap=" << base.routePenalty << "->" << refined.routePenalty
+                        << " stripPeak=" << base.stripPeakUtilProxy << "->" << refined.stripPeakUtilProxy
+                        << " stripOv=" << base.stripOverflowProxy << "->" << refined.stripOverflowProxy;
+                }
+                cerr << "\n";
+
+                if (!accepted) continue;
+                const RouteProxy baseProxy = estimateRouteProxy(design, base);
+                const RouteProxy refinedProxy = estimateRouteProxy(design, refined);
+                const double alignmentGain = after.score - before.score;
+                const double hpwlRatio = refined.hpwl / max(1.0, base.hpwl);
+                const double routeRatio =
+                    (refined.routePenalty + 1000.0) / (base.routePenalty + 1000.0);
+                const double proxyRatio =
+                    (refinedProxy.channelRisk + 0.35 * refinedProxy.ftRisk + 1000.0) /
+                    (baseProxy.channelRisk + 0.35 * baseProxy.ftRisk + 1000.0);
+                const double rank =
+                    -alignmentGain + 0.20 * hpwlRatio +
+                    0.35 * routeRatio + 0.45 * proxyRatio;
+                ranked.push_back({
+                    std::move(refined), before, after, rank,
+                    seedIndex, variant, acceptedMoves, guideCount
+                    });
+            }
+        }
+
+        sort(ranked.begin(), ranked.end(), [](const RankedAlignment& a, const RankedAlignment& b) {
+            if (fabs(a.rank - b.rank) > 1.0e-9) return a.rank < b.rank;
+            if (fabs(a.after.score - b.after.score) > 1.0e-9)
+                return a.after.score > b.after.score;
+            return a.layout.score < b.layout.score;
+            });
+
+        vector<LayoutResult> out;
+        vector<AlignmentQuality> keptQuality;
+        for (RankedAlignment& candidate : ranked) {
+            bool duplicate = false;
+            for (int i = 0; i < static_cast<int>(out.size()); ++i) {
+                if (fabs(candidate.after.score - keptQuality[i].score) <= 0.25 &&
+                    fabs(candidate.layout.hpwl - out[i].hpwl) <=
+                    max(1.0, 0.0005 * min(candidate.layout.hpwl, out[i].hpwl)) &&
+                    fabs(candidate.layout.routePenalty - out[i].routePenalty) <=
+                    max(1.0, 0.005 * min(candidate.layout.routePenalty, out[i].routePenalty))) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (duplicate) continue;
+            keptQuality.push_back(candidate.after);
+            out.push_back(std::move(candidate.layout));
+            if (static_cast<int>(out.size()) >= ALIGNMENT_KEEP_LIMIT) break;
+        }
+        return out;
+    }
+
     static LayoutResult applyDSUScaleCandidate(
         const Design& design,
         const LayoutResult& base,
@@ -4552,6 +8166,100 @@ namespace {
         return best;
     }
 
+    static vector<LayoutResult> makeCompactAfterSpreadArchive(const Design& design, const vector<LayoutResult>& spreadArchive) {
+        vector<LayoutResult> out;
+        if (spreadArchive.empty()) return out;
+        const int seedLimit = min(4, static_cast<int>(spreadArchive.size()));
+        const double scales[] = { 0.970, 0.945, 0.920, 0.895 };
+        int tried = 0;
+        for (int si = 0; si < seedLimit; ++si) {
+            const LayoutResult& base = spreadArchive[si];
+            if (!layoutPlacementLegal(base)) continue;
+            for (double scale : scales) {
+                for (int mode = 0; mode < 3; ++mode) {
+                    const bool cx = (mode == 0 || mode == 2);
+                    const bool cy = (mode == 1 || mode == 2);
+                    double newW = cx ? base.W * scale : base.W;
+                    double newH = cy ? base.H * scale : base.H;
+                    newW = clampD(newW, 1.0, design.maxOutlineW);
+                    newH = clampD(newH, 1.0, design.maxOutlineH);
+                    if (newW * newH >= base.area - 1.0) continue;
+                    ++tried;
+                    LayoutResult cand = applyDSUScaleCandidate(design, base, newW, newH, cx, cy);
+                    if (!layoutPlacementLegal(cand)) continue;
+                    if (cand.area >= base.area - 1.0) continue;
+                    if (cand.hpwl > base.hpwl * 1.10 + 12000.0) continue;
+                    if (cand.routeViolPairs > base.routeViolPairs + 1) continue;
+                    if (cand.routeMaxGapMiss > base.routeMaxGapMiss + 8.0) continue;
+                    addToBStarWireArchive(design, out, cand, false);
+                    if (static_cast<int>(out.size()) >= BSTAR_COMPACT_SPREAD_KEEP) break;
+                }
+                if (static_cast<int>(out.size()) >= BSTAR_COMPACT_SPREAD_KEEP) break;
+            }
+            if (static_cast<int>(out.size()) >= BSTAR_COMPACT_SPREAD_KEEP) break;
+        }
+        if (FAST_VERBOSE_LOG) {
+            cerr << fixed << setprecision(3)
+                << "[CompactAfterSpread] seeds=" << seedLimit
+                << " tried=" << tried
+                << " keep=" << out.size();
+            if (!out.empty()) {
+                cerr << " bestArea=" << out.front().area
+                    << " bestHpwl=" << out.front().hpwl
+                    << " bestRouteGap=" << out.front().routePenalty;
+            }
+            cerr << "\n";
+        }
+        return out;
+    }
+
+    static void anchorRequiredCornerEdges(Design& design) {
+        for (BlockInst& block : design.blocks) {
+            if (block.spec.type != BlockType::EDGE) continue;
+            bool hasT = false, hasB = false, hasL = false, hasR = false;
+            for (const EdgeRule& rule : edgeRules(block.spec)) {
+                if (!rule.valid) continue;
+                hasT = hasT || rule.side == 'T';
+                hasB = hasB || rule.side == 'B';
+                hasL = hasL || rule.side == 'L';
+                hasR = hasR || rule.side == 'R';
+            }
+            if (!(hasT || hasB) || !(hasL || hasR)) continue;
+            if (hasL && !hasR) block.rect.x = 0.0;
+            else if (hasR && !hasL)
+                block.rect.x = max(0.0, design.outlineW - block.rect.w);
+            if (hasB && !hasT) block.rect.y = 0.0;
+            else if (hasT && !hasB)
+                block.rect.y = max(0.0, design.outlineH - block.rect.h);
+        }
+    }
+
+    static bool integerizeCommittedLayout(Design& design) {
+        try {
+            phase1_warm_start::Problem problem =
+                phase1_warm_start::makeProblem(design);
+            phase1_warm_start::Placement placement;
+            placement.W = placement.decodedW = design.outlineW;
+            placement.H = placement.decodedH = design.outlineH;
+            placement.rects.reserve(design.blocks.size());
+            for (const BlockInst& block : design.blocks)
+                placement.rects.push_back(block.rect);
+            auto integerPlacement =
+                phase1_warm_start::integerizePlacementCoordinates(
+                    problem, placement);
+            if (!integerPlacement) return false;
+            design.outlineW = integerPlacement->W;
+            design.outlineH = integerPlacement->H;
+            for (int i = 0;
+                i < static_cast<int>(design.blocks.size()); ++i)
+                design.blocks[i].rect = integerPlacement->rects[i];
+            return true;
+        }
+        catch (const exception&) {
+            return false;
+        }
+    }
+
     static void commitLayout(Design& design, const LayoutResult& best) {
         design.outlineW = clampD(best.W, 1.0, design.maxOutlineW);
         design.outlineH = clampD(best.H, 1.0, design.maxOutlineH);
@@ -4568,6 +8276,7 @@ namespace {
             b.ftOverflowArea = 0.0;
             design.blocks.push_back(b);
         }
+        anchorRequiredCornerEdges(design);
         design.blockNameToIndex.clear();
         for (int i = 0; i < static_cast<int>(design.blocks.size()); ++i) {
             design.blockNameToIndex[design.blocks[i].spec.name] = i;
@@ -4767,25 +8476,74 @@ void Floorplanner::run(Design& design) {
     if (ENABLE_BSTAR_AREA_SA) {
         int saTried = 0, saPacked = 0, saLegal = 0;
         vector<LayoutResult> saArchive;
-        LayoutResult saBest = runBStarAreaSA(design, saTried, saPacked, saLegal, &saArchive);
+        BStarState saBestState;
+        LayoutResult saBest = runBStarAreaSA(design, saTried, saPacked, saLegal, &saArchive, &saBestState);
+        int secondTried = 0, secondPacked = 0, secondLegal = 0;
+        vector<LayoutResult> secondArchive = runBStarSecondProxySA(design, saBestState, secondTried, secondPacked, secondLegal);
+        int wireTried = 0, wirePacked = 0, wireLegal = 0;
+        int spreadTried = 0, spreadPacked = 0, spreadLegal = 0;
+        vector<LayoutResult> wireArchive;
+        vector<LayoutResult> spreadArchive;
+        vector<LayoutResult> compactSpreadArchive;
+        if (static_cast<int>(design.blockSpecs.size()) > 8) {
+            vector<LayoutResult> wireSeedLayouts = saArchive;
+            for (const LayoutResult& second : secondArchive) wireSeedLayouts.push_back(second);
+            vector<BStarState> wireSeeds = makeWireBStarSeeds(design, saBestState, wireSeedLayouts, false);
+            wireArchive = runBStarWireProxySA(design, wireSeeds, false, wireTried, wirePacked, wireLegal);
+            vector<BStarState> spreadSeeds = makeWireBStarSeeds(design, saBestState, wireSeedLayouts, true);
+            spreadArchive = runBStarWireProxySA(design, spreadSeeds, true, spreadTried, spreadPacked, spreadLegal);
+            compactSpreadArchive = makeCompactAfterSpreadArchive(design, spreadArchive);
+        }
         vector<LayoutResult> forceArchive = makeHpwlForceRefinedArchive(design, saArchive);
+        vector<LayoutResult> alignmentSeeds = saArchive;
+        for (const LayoutResult& second : secondArchive) alignmentSeeds.push_back(second);
+        for (const LayoutResult& wire : wireArchive) alignmentSeeds.push_back(wire);
+        for (const LayoutResult& compact : compactSpreadArchive) alignmentSeeds.push_back(compact);
+        for (const LayoutResult& refined : forceArchive) alignmentSeeds.push_back(refined);
+        vector<LayoutResult> alignmentArchive = makeAlignmentArchive(design, alignmentSeeds);
+        const int saArchiveCount = static_cast<int>(saArchive.size());
+        const int secondArchiveCount = static_cast<int>(secondArchive.size());
+        const int wireArchiveCount = static_cast<int>(wireArchive.size());
+        const int spreadArchiveCount = static_cast<int>(spreadArchive.size());
+        const int compactSpreadArchiveCount = static_cast<int>(compactSpreadArchive.size());
+        const int forceArchiveCount = static_cast<int>(forceArchive.size());
         vector<LayoutResult> commitArchive = saArchive;
+        for (auto& second : secondArchive) commitArchive.push_back(std::move(second));
+        for (auto& wire : wireArchive) commitArchive.push_back(std::move(wire));
+        for (auto& spread : spreadArchive) commitArchive.push_back(std::move(spread));
+        for (auto& compact : compactSpreadArchive) commitArchive.push_back(std::move(compact));
         for (auto& refined : forceArchive) commitArchive.push_back(std::move(refined));
-        const int archiveLimit = min(24 + FORCE_REFINE_KEEP_LIMIT, static_cast<int>(commitArchive.size()));
+        for (auto& aligned : alignmentArchive) commitArchive.push_back(std::move(aligned));
+        const int archiveLimit = min(
+            BSTAR_ARCHIVE_LIMIT +
+                BSTAR_SECOND_ARCHIVE_LIMIT +
+                BSTAR_WIRE_ARCHIVE_LIMIT +
+                BSTAR_SPREAD_ARCHIVE_LIMIT +
+                BSTAR_COMPACT_SPREAD_KEEP +
+                2 * PHASE1_WARM_RESTARTS_LARGE +
+                FORCE_REFINE_KEEP_LIMIT +
+                ALIGNMENT_KEEP_LIMIT,
+            static_cast<int>(commitArchive.size()));
         archiveDesigns.reserve(static_cast<size_t>(archiveLimit) + 2);
         archiveOrigins.reserve(static_cast<size_t>(archiveLimit) + 2);
         for (int ai = 0; ai < archiveLimit; ++ai) {
             Design candidate = design;
             commitLayout(candidate, commitArchive[ai]);
             archiveDesigns.push_back(std::move(candidate));
-            archiveOrigins.push_back(ai < static_cast<int>(saArchive.size()) ? "archive" : "force");
+            if (ai < saArchiveCount) archiveOrigins.push_back("archive");
+            else if (ai < saArchiveCount + secondArchiveCount) archiveOrigins.push_back("second-sa");
+            else if (ai < saArchiveCount + secondArchiveCount + wireArchiveCount) archiveOrigins.push_back("wire-sa");
+            else if (ai < saArchiveCount + secondArchiveCount + wireArchiveCount + spreadArchiveCount) archiveOrigins.push_back("spread-wire-sa");
+            else if (ai < saArchiveCount + secondArchiveCount + wireArchiveCount + spreadArchiveCount + compactSpreadArchiveCount) archiveOrigins.push_back("compact-spread");
+            else if (ai < saArchiveCount + secondArchiveCount + wireArchiveCount + spreadArchiveCount + compactSpreadArchiveCount + forceArchiveCount) archiveOrigins.push_back("force");
+            else archiveOrigins.push_back("alignment");
         }
-        tried += saTried;
-        packed += saPacked;
-        strictTried += saTried;
-        strictPacked += saPacked;
-        strictLegal += saLegal;
-        strictEdgeOK += saLegal;
+        tried += saTried + secondTried + wireTried + spreadTried;
+        packed += saPacked + secondPacked + wirePacked + spreadPacked;
+        strictTried += saTried + secondTried + wireTried + spreadTried;
+        strictPacked += saPacked + secondPacked + wirePacked + spreadPacked;
+        strictLegal += saLegal + secondLegal + wireLegal + spreadLegal;
+        strictEdgeOK += saLegal + secondLegal + wireLegal + spreadLegal;
         if (saBest.legal) {
             best = std::move(saBest);
             have = true;
@@ -4803,7 +8561,15 @@ void Floorplanner::run(Design& design) {
                     << " bestW/H=" << best.W << "x" << best.H
                     << " routeGap=" << best.routePenalty
                     << " archive=" << saArchive.size()
+                    << " secondArchive=" << secondArchive.size()
+                    << " secondTried=" << secondTried
+                    << " wireArchive=" << wireArchiveCount
+                    << " wireTried=" << wireTried
+                    << " spreadArchive=" << spreadArchiveCount
+                    << " spreadTried=" << spreadTried
+                    << " compactSpread=" << compactSpreadArchiveCount
                     << " forceArchive=" << forceArchive.size()
+                    << " alignmentArchive=" << alignmentArchive.size()
                     << " stripPeak=" << best.stripPeakUtilProxy
                     << " stripOvProxy=" << best.stripOverflowProxy;
             }
@@ -4986,106 +8752,15 @@ void Floorplanner::setEdgePlacementMode(int mode) {
     g_edgePlacementMode = max(0, min(2, mode));
 }
 
+void Floorplanner::setRoutingFeedback(const Design& routedDesign) {
+    routingFeedbackDesign = routedDesign;
+    routingFeedbackEnabled = true;
+}
+
 const vector<Design>& Floorplanner::archivedCandidates() const {
     return archiveDesigns;
 }
 
 const vector<string>& Floorplanner::archivedCandidateOrigins() const {
     return archiveOrigins;
-}
-
-Rect Floorplanner::makeInitialShape(const BlockSpec& spec) const {
-    return makeShape(spec, aspectMid(spec));
-}
-
-void Floorplanner::initBlockShapes(Design& design) {
-    design.blocks.clear();
-    design.blocks.reserve(design.blockSpecs.size());
-    for (const auto& spec : design.blockSpecs) {
-        BlockInst b;
-        b.spec = spec;
-        b.rect = makeInitialShape(spec);
-        b.ftUsed = 0.0;
-        b.ftOverflowArea = 0.0;
-        design.blocks.push_back(b);
-    }
-}
-
-Rect Floorplanner::placeByLocation(const Rect& shape, const string& loc, double W, double H) const {
-    EdgeRule r = parseRule(loc);
-    Rect out = shape;
-    double len = sideLen(shape, r.side);
-    auto zb = zoneBounds(r, W, H);
-    double axis = clampD(zoneCenter(r, W, H) - 0.5 * len, zb.first, zb.second - len);
-    setEdgeAxis(out, r, axis, W, H);
-    return out;
-}
-
-bool Floorplanner::insideOutline(const Rect& r, double W, double H) const {
-    return inside(r, W, H);
-}
-
-bool Floorplanner::overlapsPlaced(const Rect& r, const vector<BlockInst>& blocks, const vector<bool>& placed) const {
-    for (int i = 0; i < static_cast<int>(blocks.size()); ++i) {
-        if (!placed[i]) continue;
-        if (ovArea(r, blocks[i].rect) > EPS) return true;
-    }
-    return false;
-}
-
-double Floorplanner::connectionWeightToPlaced(int blockId, const Design& design, const vector<bool>& placed, const Rect& cand) const {
-    double s = 0.0;
-    for (int j = 0; j < static_cast<int>(design.blocks.size()); ++j) {
-        if (!placed[j]) continue;
-        int nets = totalConnBetween(design, blockId, j);
-        if (nets <= 0) continue;
-        s += static_cast<double>(nets) *
-            (fabs(rectCx(cand) - rectCx(design.blocks[j].rect)) + fabs(rectCy(cand) - rectCy(design.blocks[j].rect)));
-    }
-    return s;
-}
-
-vector<double> Floorplanner::collectCandidateXs(const Design& design, double w) const {
-    vector<double> xs = { 0.0 };
-    for (const auto& b : design.blocks) {
-        xs.push_back(b.rect.x);
-        xs.push_back(rectRight(b.rect));
-        xs.push_back(max(0.0, b.rect.x - w));
-        xs.push_back(max(0.0, rectRight(b.rect) - w));
-    }
-    xs.push_back(max(0.0, design.outlineW - w));
-    sort(xs.begin(), xs.end());
-    xs.erase(unique(xs.begin(), xs.end(), [](double a, double b) { return fabs(a - b) < 1e-3; }), xs.end());
-    return xs;
-}
-
-vector<double> Floorplanner::collectCandidateYs(const Design& design, double h) const {
-    vector<double> ys = { 0.0 };
-    for (const auto& b : design.blocks) {
-        ys.push_back(b.rect.y);
-        ys.push_back(rectTop(b.rect));
-        ys.push_back(max(0.0, b.rect.y - h));
-        ys.push_back(max(0.0, rectTop(b.rect) - h));
-    }
-    ys.push_back(max(0.0, design.outlineH - h));
-    sort(ys.begin(), ys.end());
-    ys.erase(unique(ys.begin(), ys.end(), [](double a, double b) { return fabs(a - b) < 1e-3; }), ys.end());
-    return ys;
-}
-
-void Floorplanner::placeEdgeBlocks(Design& design) {
-    if (design.blocks.size() != design.blockSpecs.size()) initBlockShapes(design);
-    ShapeState st;
-    st.ratio.assign(design.blockSpecs.size(), 1.0);
-    for (int i = 0; i < static_cast<int>(design.blockSpecs.size()); ++i) st.ratio[i] = aspectMid(design.blockSpecs[i]);
-    vector<Rect> shapes = makeShapes(design, st);
-    vector<Rect> rects, obstacles;
-    placeEdgesFast(design, shapes, design.outlineW, design.outlineH, rects, obstacles, false);
-    for (int i = 0; i < static_cast<int>(design.blocks.size()) && i < static_cast<int>(rects.size()); ++i) {
-        if (design.blockSpecs[i].type == BlockType::EDGE) design.blocks[i].rect = rects[i];
-    }
-}
-
-void Floorplanner::placeRemainingBlocksGreedy(Design& design) {
-    (void)design;
 }

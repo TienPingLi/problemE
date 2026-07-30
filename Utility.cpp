@@ -1,7 +1,9 @@
 #include "Utility.hpp"
+#include "DataModel.hpp"
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <cmath>
 
 using namespace std;
 
@@ -118,6 +120,27 @@ int edgeOpposite(int e) {
     if (e == 2) return 4;
     if (e == 4) return 2;
     return 0;
+}
+
+double feedthroughRateForNets(const BlockSpec& spec, double ftNets) {
+    if (ftNets <= 3000.0) return spec.ftRate[0];
+    if (ftNets <= 6000.0) return spec.ftRate[1];
+    if (ftNets <= 9000.0) return spec.ftRate[2];
+    return spec.ftRate[3];
+}
+
+double requiredSoftAreaWithFeedthrough(const BlockInst& b, double ftNets) {
+    const double baseArea = max(1.0, b.spec.area);
+    if (b.spec.type != BlockType::SOFT || ftNets <= EPS) return baseArea;
+
+    const double rate = feedthroughRateForNets(b.spec, ftNets);
+    const double delta = (ftNets / CHANNEL_DENSITY) * rate / 2.0;
+    const double side = sqrt(baseArea) + delta;
+    return max(baseArea, side * side);
+}
+
+double requiredSoftAreaWithFeedthrough(const BlockInst& b) {
+    return requiredSoftAreaWithFeedthrough(b, b.ftUsed);
 }
 
 string passFail(bool bad) {

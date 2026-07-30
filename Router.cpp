@@ -360,7 +360,12 @@ namespace {
 
     DirDelta deltaForInternalTraversal(int inEdge, int outEdge, double nets) {
         DirDelta d;
-        if (!validEdgeLocal(inEdge) || !validEdgeLocal(outEdge) || inEdge == outEdge) return d;
+        if (!validEdgeLocal(inEdge) || !validEdgeLocal(outEdge)) return d;
+        if (inEdge == outEdge) {
+            if (inEdge == 1 || inEdge == 3) d.tb += nets;
+            else if (inEdge == 2 || inEdge == 4) d.lr += nets;
+            return d;
+        }
         if (isOppositeLR(inEdge, outEdge)) d.lr += nets;
         else if (isOppositeTB(inEdge, outEdge)) d.tb += nets;
         else if (isTurn(inEdge, outEdge)) { d.lr += nets; d.tb += nets; }
@@ -376,44 +381,8 @@ namespace {
     // ----------------------------------------------------------------------------
     // FT helpers
     // ----------------------------------------------------------------------------
-    double ftRateForNetsLocal(const BlockSpec& spec, double ftNets) {
-        if (ftNets <= 3000.0) return spec.ftRate[0];
-        if (ftNets <= 6000.0) return spec.ftRate[1];
-        if (ftNets <= 9000.0) return spec.ftRate[2];
-        return spec.ftRate[3];
-    }
-
-    struct FTShapeLocal {
-        double coreW = 0.0;
-        double coreH = 0.0;
-        double d = 0.0;
-        double finalW = 0.0;
-        double finalH = 0.0;
-        double finalArea = 0.0;
-    };
-
-    FTShapeLocal ftShapeForNetsLocal(const BlockInst& b, double ftNets) {
-        FTShapeLocal s;
-        const double baseArea = max(1.0, b.spec.area);
-        double aspect = b.rect.h > EPS ? b.rect.w / b.rect.h : 1.0;
-        if (b.spec.aspectMin > EPS) aspect = max(aspect, b.spec.aspectMin);
-        if (b.spec.aspectMax > EPS) aspect = min(aspect, b.spec.aspectMax);
-        if (!std::isfinite(aspect) || aspect <= EPS) aspect = 1.0;
-
-        s.coreW = sqrt(baseArea * aspect);
-        s.coreH = baseArea / max(1.0, s.coreW);
-        if (b.spec.type == BlockType::SOFT && ftNets > EPS) {
-            const double rate = ftRateForNetsLocal(b.spec, ftNets);
-            s.d = ceil((ftNets / CHANNEL_DENSITY) * rate) / 2.0;
-        }
-        s.finalW = s.coreW + s.d;
-        s.finalH = s.coreH + s.d;
-        s.finalArea = max(baseArea, s.finalW * s.finalH);
-        return s;
-    }
-
     double requiredAreaWithFTLocal(const BlockInst& b, double ftNets) {
-        return ftShapeForNetsLocal(b, ftNets).finalArea;
+        return requiredSoftAreaWithFeedthrough(b, ftNets);
     }
     double incrementalFTAreaLocal(const BlockInst& b, int netCount) {
         const double oldReq = requiredAreaWithFTLocal(b, b.ftUsed);
@@ -664,7 +633,7 @@ namespace {
     ) {
         DirectionalPenaltyInfo info;
 
-        if (!validEdgeLocal(inEdge) || !validEdgeLocal(outEdge) || inEdge == outEdge) {
+        if (!validEdgeLocal(inEdge) || !validEdgeLocal(outEdge)) {
             info.feasible = false;
             info.penalty = numeric_limits<double>::infinity();
             return info;
@@ -1565,6 +1534,9 @@ void Router::setSoftFTCostRelaxed(bool enabled) {
 void Router::setContactAwareCostEnabled(bool enabled) {
     g_contactAwareCostEnabled = enabled;
 }
+void Router::setDetailedFailureAnalysisEnabled(bool enabled) {
+    detailedFailureAnalysisEnabled = enabled;
+}
 const vector<Router::FailureCertificate>& Router::failureCertificates() const {
     return lastFailureCertificates;
 }
@@ -1966,6 +1938,56 @@ void Router::run(Design& design) {
 //   - 找到 path 後 analyzeRoute() 仍會再做 projected overflow 檢查。
 //
 // Step1/2 是主要 router；Step3/4 只有在 soft block 幾何上可作為中繼時才會發揮。
+    unordered_map<unsigned long long, bool> geometryReachabilityCache;
+    auto geometryPairKey = [](int a, int b) {
+        const unsigned int lo = static_cast<unsigned int>(min(a, b));
+        const unsigned int hi = static_cast<unsigned int>(max(a, b));
+        return (static_cast<unsigned long long>(lo) << 32) |
+            static_cast<unsigned long long>(hi);
+        };
+
+    auto geometryReachable = [&](const Design& d, const Connection& conn, bool allowSoftFT) {
+        const vector<Node>& nodes = routeGraphNodes;
+        const vector<vector<AdjEdge>>& graph = routeGraphAdj;
+        const int nodeCount = static_cast<int>(nodes.size());
+        if (!routeGraphCacheValid || conn.src < 0 || conn.dst < 0 ||
+            conn.src >= static_cast<int>(d.blocks.size()) ||
+            conn.dst >= static_cast<int>(d.blocks.size()) ||
+            conn.src >= nodeCount || conn.dst >= nodeCount) return false;
+        if (conn.src == conn.dst) return true;
+
+        vector<char> reachedState(nodeCount * EDGE_STATE_COUNT, 0);
+        queue<pair<int, int>> pending;
+        reachedState[conn.src * EDGE_STATE_COUNT] = 1;
+        pending.push({ conn.src, 0 });
+        while (!pending.empty()) {
+            const auto [u, inEdge] = pending.front();
+            pending.pop();
+            for (const AdjEdge& edge : graph[u]) {
+                const int v = edge.to;
+                const bool vEndpoint = v == conn.src || v == conn.dst;
+                if (!vEndpoint && nodes[v].isBlock) {
+                    const BlockInst& block = d.blocks[nodes[v].index];
+                    if (!allowSoftFT || block.spec.type != BlockType::SOFT) continue;
+                }
+                if (u == conn.src &&
+                    !allowsPortEdgeLocal(d.blocks[conn.src].spec, edge.edgeFrom)) continue;
+                if (v == conn.dst &&
+                    !allowsPortEdgeLocal(d.blocks[conn.dst].spec, edge.edgeTo)) continue;
+                if (u != conn.src && u != conn.dst && nodes[u].isBlock &&
+                    inEdge == edge.edgeFrom) continue;
+                if (v == conn.dst) return true;
+
+                const int state = v * EDGE_STATE_COUNT + edge.edgeTo;
+                if (state < 0 || state >= static_cast<int>(reachedState.size()) ||
+                    reachedState[state]) continue;
+                reachedState[state] = 1;
+                pending.push({ v, edge.edgeTo });
+            }
+        }
+        return false;
+        };
+
     auto addFailureCertificate = [&](const Connection& conn, const RoutePath& chPath, const RouteMetrics& chM,
         const RoutePath& ftPath, const RouteMetrics& ftM) {
             FailureCertificate cert;
@@ -1973,8 +1995,16 @@ void Router::run(Design& design) {
             const bool useFT = shouldUseOverflowFTCandidate(chM, ftM);
             cert.diagnosticPath = useFT ? ftPath : chPath;
             cert.diagnosticOpen = cert.diagnosticPath.open;
-            cert.geometryDisconnected = cert.diagnosticOpen;
-            cert.policyBlocked = cert.diagnosticOpen;
+            if (cert.diagnosticOpen && detailedFailureAnalysisEnabled) {
+                const unsigned long long pairKey = geometryPairKey(conn.src, conn.dst);
+                auto cached = geometryReachabilityCache.find(pairKey);
+                if (cached == geometryReachabilityCache.end()) {
+                    const bool reachable = geometryReachable(design, conn, true);
+                    cached = geometryReachabilityCache.emplace(pairKey, reachable).first;
+                }
+                cert.geometryDisconnected = !cached->second;
+                cert.policyBlocked = cached->second;
+            }
             cert.hasLegalFTAlternative = !ftM.open && ftM.usesSoftFT &&
                 ftM.channelOverflowIncrement <= EPS && ftM.ftOverflowAfterTouched <= EPS;
 
@@ -3252,7 +3282,8 @@ RoutePath Router::routeOneConnection(const Design& design, const Connection& con
 
                 double resourcePenalty = 0.0;
                 if (u != srcNode && u != dstNode) {
-                    if (!validEdgeLocal(uIn) || uIn == e.edgeFrom) continue;
+                    if (!validEdgeLocal(uIn)) continue;
+                    if (nodes[u].isBlock && uIn == e.edgeFrom) continue;
 
                     if (!nodes[u].isBlock) {
                         const Channel& ch = design.channels[nodes[u].index];
@@ -3390,7 +3421,8 @@ RoutePath Router::routeOneConnection(const Design& design, const Connection& con
 
             double resourcePenalty = 0.0;
             if (u != srcNode && u != dstNode) {
-                if (!validEdgeLocal(uIn) || uIn == dc.edgeFrom) continue;
+                if (!validEdgeLocal(uIn)) continue;
+                if (nodes[u].isBlock && uIn == dc.edgeFrom) continue;
 
                 if (!nodes[u].isBlock) {
                     const Channel& ch = design.channels[nodes[u].index];

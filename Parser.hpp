@@ -7,16 +7,7 @@ class Parser {
 public:
     bool read(const std::string& inputPath, Design& design);
 
-    //
-    bool parsePortfolioCfg(const char* cfgText, const Design& base, Design& out);
-
-    //
-    std::string getLastError() const { return lastError; }
-
 private:
-    //
-    std::string lastError;
-
     struct BlockColumns {
         int name = -1;
         int area = -1;

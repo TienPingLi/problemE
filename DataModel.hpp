@@ -39,6 +39,7 @@ struct BlockSpec {
     BlockType type = BlockType::UNKNOWN;
 
     double area = 0.0;
+    double floorplanAreaOverride = 0.0;
 
     bool hasFixedSize = false;
     double fixedW = 0.0;
@@ -119,13 +120,29 @@ struct Design {
 struct EvalReport {
     double outlineArea = 0.0;
     double totalWireLength = 0.0;
+    double baseCost = 0.0;
     double cost = 0.0;
 
+    double totalChannelCapacity = 0.0;
+    double channelOverflowRate = 0.0;
     double totalChannelOverflow = 0.0;
     double maxChannelOverflow = 0.0;
 
     double totalFeedthroughOverflow = 0.0;
     double maxFeedthroughOverflow = 0.0;
+
+    double illegalFeedthroughDeltaArea = 0.0;
+    int illegalFeedthroughCount = 0;
+
+    double edgeLocationOffset = 0.0;
+    int edgeLocationViolationCount = 0;
+
+    double overflowPenalty = 0.0;
+    double feedthroughPenalty = 0.0;
+    double illegalFeedthroughPenalty = 0.0;
+    double edgeLocationPenalty = 0.0;
+    double runtimePenalty = 0.0;
+    double warningPenaltyCost = 0.0;
 
     bool formatFailed = false;
     bool blockOverlap = false;

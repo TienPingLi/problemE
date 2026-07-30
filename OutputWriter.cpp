@@ -14,6 +14,8 @@ namespace {
     // ¨Ò¦p¡G800.000 -> 800, 300.500 -> 300.5
     string fmt(double v) {
         if (fabs(v) < 1e-9) v = 0.0;
+        double rounded = round(v);
+        if (fabs(v - rounded) < 1e-6) v = rounded;
 
         ostringstream oss;
         oss << fixed << setprecision(6) << v;

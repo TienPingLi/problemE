@@ -43,7 +43,7 @@ pair<double, double> edgeCenterPoint(const Rect& r, int edge) {
 }
 
 bool EvalReport::hasPenalty() const {
-    return totalChannelOverflow > EPS || totalFeedthroughOverflow > EPS;
+    return warningPenaltyCost > EPS;
 }
 
 bool EvalReport::hasFail() const {

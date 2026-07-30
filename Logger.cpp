@@ -289,15 +289,28 @@ void Logger::printFinalReport(const Design& design, const EvalReport& rpt, doubl
     cout << "Open paths              : " << rpt.openPathCount << '\n';
     cout << "TotalWireLength         : " << rpt.totalWireLength << '\n';
     cout << "Total FT overflow       : " << rpt.totalFeedthroughOverflow << '\n';
-    cout << "Max FT overflow         : " << rpt.maxFeedthroughOverflow << "\n\n";
+    cout << "Max FT overflow         : " << rpt.maxFeedthroughOverflow << '\n';
+    cout << "Illegal FT blocks       : " << rpt.illegalFeedthroughCount << '\n';
+    cout << "Illegal FT delta area   : " << rpt.illegalFeedthroughDeltaArea << "\n\n";
 
     cout << "========== Cost ==========" << '\n';
+    cout << "Base cost               : " << rpt.baseCost << '\n';
+    cout << "Overflow rate           : " << rpt.channelOverflowRate << '\n';
+    cout << "Overflow penalty        : " << rpt.overflowPenalty << '\n';
+    cout << "FT penalty              : " << rpt.feedthroughPenalty << '\n';
+    cout << "Illegal FT penalty      : " << rpt.illegalFeedthroughPenalty << '\n';
+    cout << "Edge location offset    : " << rpt.edgeLocationOffset
+        << "  count=" << rpt.edgeLocationViolationCount << '\n';
+    cout << "Edge location penalty   : " << rpt.edgeLocationPenalty << '\n';
+    cout << "Runtime penalty         : " << rpt.runtimePenalty << '\n';
     cout << "Cost                    : " << rpt.cost << '\n';
-    cout << "Formula                 : OutlineArea + alpha * TotalWireLength\n\n";
+    cout << "Formula                 : OutlineArea + alpha * TotalWireLength + V5 penalties\n\n";
 
     cout << "========== Penalty condition ==========" << '\n';
     cout << "Channel overflow        : " << passFail(rpt.totalChannelOverflow > EPS) << '\n';
-    cout << "Feedthrough overflow    : " << passFail(rpt.totalFeedthroughOverflow > EPS) << "\n\n";
+    cout << "Feedthrough overflow    : " << passFail(rpt.totalFeedthroughOverflow > EPS) << '\n';
+    cout << "Illegal feedthrough     : " << passFail(rpt.illegalFeedthroughDeltaArea > EPS) << '\n';
+    cout << "Edge location warning   : " << passFail(rpt.edgeLocationOffset > EPS) << "\n\n";
 
     cout << "========== Fail condition ==========" << '\n';
     cout << "Format failed           : " << passFail(rpt.formatFailed) << '\n';

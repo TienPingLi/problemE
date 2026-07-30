@@ -2,6 +2,9 @@
 #include <string>
 #include <vector>
 
+struct BlockInst;
+struct BlockSpec;
+
 inline constexpr double EPS = 1e-6;
 inline constexpr double CHANNEL_DENSITY = 25.0; // 25 nets / um
 
@@ -17,5 +20,8 @@ bool containsToken(const std::vector<std::string>& row, const std::string& token
 int firstNonEmptyIndex(const std::vector<std::string>& row);
 std::string firstNonEmptyCell(const std::vector<std::string>& row);
 int edgeOpposite(int e);
+double feedthroughRateForNets(const BlockSpec& spec, double ftNets);
+double requiredSoftAreaWithFeedthrough(const BlockInst& b, double ftNets);
+double requiredSoftAreaWithFeedthrough(const BlockInst& b);
 std::string passFail(bool bad);
 std::string yesNo(bool b);
