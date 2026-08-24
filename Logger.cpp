@@ -15,8 +15,8 @@ using namespace std;
 
 namespace {
 
-    // ¤£»İ­n§ï main.cpp / Logger.hpp¡C
-    // ³o­Ó®É¶¡ÂI·|¦bµ{¦¡±Ò°Ê®É«Ø¥ß¡A±µªñ main() ¶}©l®É¶¡¡C
+    // ä¸éœ€è¦æ”¹ main.cpp / Logger.hppã€‚
+    // é€™å€‹æ™‚é–“é»æœƒåœ¨ç¨‹å¼å•Ÿå‹•æ™‚å»ºç«‹ï¼Œæ¥è¿‘ main() é–‹å§‹æ™‚é–“ã€‚
     const auto PROGRAM_START_TIME = chrono::steady_clock::now();
 
     double getRuntimeSeconds() {
@@ -28,23 +28,23 @@ namespace {
     // =========================================================================
 // Logger-side directional channel usage recomputation
 // -------------------------------------------------------------------------
-// Logger ªº¥ô°È¬O¡u³ø§i¡v¡A¤£À³¸Ó¨Ì¿à Router ¯d¤Uªº ch.usedNets/ch.capacity¡C
-// ¦b direction-aware channel model ¤U¡A¤@­Ó channel ¦³¨â­Ó®e¶q¤À¶q¡G
+// Logger çš„ä»»å‹™æ˜¯ã€Œå ±å‘Šã€ï¼Œä¸æ‡‰è©²ä¾è³´ Router ç•™ä¸‹çš„ ch.usedNets/ch.capacityã€‚
+// åœ¨ direction-aware channel model ä¸‹ï¼Œä¸€å€‹ channel æœ‰å…©å€‹å®¹é‡åˆ†é‡ï¼š
 //
 //   Horizontal / LR / edge 1 <-> edge 3:
-//       ¥ª¥k¨«ªº¤ô¥­½u¡A»İ­nªu y ¤è¦V¨Ã±Æ¡A
-//       ©Ò¥H®e¶q = channel height * CHANNEL_DENSITY¡C
+//       å·¦å³èµ°çš„æ°´å¹³ç·šï¼Œéœ€è¦æ²¿ y æ–¹å‘ä¸¦æ’ï¼Œ
+//       æ‰€ä»¥å®¹é‡ = channel height * CHANNEL_DENSITYã€‚
 //
 //   Vertical / TB / edge 2 <-> edge 4:
-//       ¤W¤U¨«ªº««ª½½u¡A»İ­nªu x ¤è¦V¨Ã±Æ¡A
-//       ©Ò¥H®e¶q = channel width * CHANNEL_DENSITY¡C
+//       ä¸Šä¸‹èµ°çš„å‚ç›´ç·šï¼Œéœ€è¦æ²¿ x æ–¹å‘ä¸¦æ’ï¼Œ
+//       æ‰€ä»¥å®¹é‡ = channel width * CHANNEL_DENSITYã€‚
 //
 //   Turn / L-shape:
-//       ¦P®É¦Y horizontal »P vertical ¦U¤@¦¸¡C
+//       åŒæ™‚åƒ horizontal èˆ‡ vertical å„ä¸€æ¬¡ã€‚
 //
-// ª`·N¡G³o¸Ì¬O aggregate directional model¡AÁÙ¤£¬O interval/cut-based
-// overlap model¡C¤]´N¬O¦P¤@­Ó channel ¤º©Ò¦³¤ô¥­¬q¥ı¥[Á`¡B©Ò¦³««ª½¬q
-// ¥ı¥[Á`¡C³o©M¥Ø«e baseline Router / Evaluator ¤ñ¸û®e©ö¹ï»ô¡C
+// æ³¨æ„ï¼šé€™è£¡æ˜¯ aggregate directional modelï¼Œé‚„ä¸æ˜¯ interval/cut-based
+// overlap modelã€‚ä¹Ÿå°±æ˜¯åŒä¸€å€‹ channel å…§æ‰€æœ‰æ°´å¹³æ®µå…ˆåŠ ç¸½ã€æ‰€æœ‰å‚ç›´æ®µ
+// å…ˆåŠ ç¸½ã€‚é€™å’Œç›®å‰ baseline Router / Evaluator æ¯”è¼ƒå®¹æ˜“å°é½Šã€‚
 // =========================================================================
 
     struct LoggerChannelUse {
@@ -81,12 +81,12 @@ namespace {
     }
 
     double horizontalCapacityForLogger(const Channel& ch) {
-        // edge 1 <-> edge 3¡A¥ª¥k¨«¡A¦Y channel °ª«×¡C
+        // edge 1 <-> edge 3ï¼Œå·¦å³èµ°ï¼Œåƒ channel é«˜åº¦ã€‚
         return max(0.0, ch.rect.h) * CHANNEL_DENSITY;
     }
 
     double verticalCapacityForLogger(const Channel& ch) {
-        // edge 2 <-> edge 4¡A¤W¤U¨«¡A¦Y channel ¼e«×¡C
+        // edge 2 <-> edge 4ï¼Œä¸Šä¸‹èµ°ï¼Œåƒ channel å¯¬åº¦ã€‚
         return max(0.0, ch.rect.w) * CHANNEL_DENSITY;
     }
 
@@ -105,19 +105,19 @@ namespace {
             if (route.netCount <= 0) continue;
             if (route.steps.size() < 4) continue;
 
-            // PATH ®æ¦¡¡G
+            // PATH æ ¼å¼ï¼š
             //   start block
             //   intermediate rectangle in/out pair
             //   intermediate rectangle in/out pair
             //   end block
             //
-            // ©Ò¥H¤¤¶¡ rectangle À³¸Ó¥X²{¦b steps[1], steps[2]¡B
-            // steps[3], steps[4] ... ³oºØ pair¡C
+            // æ‰€ä»¥ä¸­é–“ rectangle æ‡‰è©²å‡ºç¾åœ¨ steps[1], steps[2]ã€
+            // steps[3], steps[4] ... é€™ç¨® pairã€‚
             for (int i = 1; i + 1 < static_cast<int>(route.steps.size()); i += 2) {
                 const auto& in = route.steps[i];
                 const auto& out = route.steps[i + 1];
 
-                // ¤¤Ä~ rectangle ¥²¶·¬O¤@¶i¤@¥X¦P¤@­Óª«¥ó¡C
+                // ä¸­ç¹¼ rectangle å¿…é ˆæ˜¯ä¸€é€²ä¸€å‡ºåŒä¸€å€‹ç‰©ä»¶ã€‚
                 if (in.rectName != out.rectName) continue;
 
                 auto it = channelNameToIndex.find(in.rectName);
@@ -125,7 +125,13 @@ namespace {
 
                 LoggerChannelUse& u = use[it->second];
 
-                if (isOppositeLRForLogger(in.edge, out.edge)) {
+                if (in.edge == out.edge && (in.edge == 1 || in.edge == 3)) {
+                    u.horizontalNets += static_cast<double>(route.netCount);
+                }
+                else if (in.edge == out.edge && (in.edge == 2 || in.edge == 4)) {
+                    u.verticalNets += static_cast<double>(route.netCount);
+                }
+                else if (isOppositeLRForLogger(in.edge, out.edge)) {
                     u.horizontalNets += static_cast<double>(route.netCount);
                 }
                 else if (isOppositeTBForLogger(in.edge, out.edge)) {
@@ -173,9 +179,9 @@ void Logger::printFinalReport(const Design& design, const EvalReport& rpt, doubl
     // -------------------------------------------------------------------------
     // Direction-aware channel report
     // -------------------------------------------------------------------------
-    // ÂÂª© Logger ª½±µ¥[Á` ch.capacity / ch.usedNets¡C
-    // ¦ı²{¦b channel capacity ¤w¸g©î¦¨¤ô¥­¡B««ª½¨â­Ó¤è¦V¡A¦]¦¹³o¸Ì­«·s
-    // ±q PATH ±½´y¤@¦¸¡AÁ×§K»~§â legacy scalar Äæ¦ì·í§@¥¿¦¡®e¶q¡C
+    // èˆŠç‰ˆ Logger ç›´æ¥åŠ ç¸½ ch.capacity / ch.usedNetsã€‚
+    // ä½†ç¾åœ¨ channel capacity å·²ç¶“æ‹†æˆæ°´å¹³ã€å‚ç›´å…©å€‹æ–¹å‘ï¼Œå› æ­¤é€™è£¡é‡æ–°
+    // å¾ PATH æƒæä¸€æ¬¡ï¼Œé¿å…èª¤æŠŠ legacy scalar æ¬„ä½ç•¶ä½œæ­£å¼å®¹é‡ã€‚
     // -------------------------------------------------------------------------
     vector<LoggerChannelUse> dirUse = recomputeDirectionalChannelUseForLogger(design);
 
@@ -251,8 +257,8 @@ void Logger::printFinalReport(const Design& design, const EvalReport& rpt, doubl
 
     cout << "Directional overflow    : " << totalDirectionalOverflow << '\n';
 
-    // ¦pªG³o¸Ì©M rpt.totalChannelOverflow ¤£¤@­P¡A¥Nªí Evaluator ªº channel
-    // overflow ­pºâ¼Ò«¬©|¥¼©M Logger/Router ¹ï»ô¡C
+    // å¦‚æœé€™è£¡å’Œ rpt.totalChannelOverflow ä¸ä¸€è‡´ï¼Œä»£è¡¨ Evaluator çš„ channel
+    // overflow è¨ˆç®—æ¨¡å‹å°šæœªå’Œ Logger/Router å°é½Šã€‚
     if (fabs(totalDirectionalOverflow - rpt.totalChannelOverflow) > 1e-3) {
         cout << "Directional overflow note: logger recompute differs from evaluator report by "
             << fabs(totalDirectionalOverflow - rpt.totalChannelOverflow)

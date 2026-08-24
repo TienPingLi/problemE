@@ -30,6 +30,23 @@ using namespace std;
 
 namespace {
 
+    // Run the same complete floorplan portfolio for every input size.  The
+    // former dense-shelf and bounded-warm early returns remain available for
+    // experiments, but are disabled in the production flow.
+    static constexpr bool ENABLE_FORCED_SIZE_SHORTCUTS = false;
+    static unsigned g_fastSeed = 7u;
+    static double g_floorplanTimeBudgetSeconds = -1.0;
+    static bool g_floorplanDeadlineEnabled = false;
+    static chrono::steady_clock::time_point g_floorplanDeadline;
+
+    static bool floorplanTimeExpired(double reserveSeconds = 0.0) {
+        if (!g_floorplanDeadlineEnabled) return false;
+        return chrono::steady_clock::now() +
+            chrono::duration_cast<chrono::steady_clock::duration>(
+                chrono::duration<double>(max(0.0, reserveSeconds))) >=
+            g_floorplanDeadline;
+    }
+
 namespace phase1_warm_start {
 
     constexpr double FP_EPS = 1.0e-9;
@@ -1631,7 +1648,7 @@ namespace phase1_warm_start {
             Metrics bestMetrics = currentMetrics;
             Rank bestRank = metricRank(bestMetrics);
 
-            struct ArchiveItem { Rank rank; string sig; State state; Placement placement; };
+            struct ArchiveItem { Rank priority; string sig; State state; Placement placement; };
             vector<ArchiveItem> archive;
             set<string> archiveSigs;
             auto remember = [&](const State& st, const Placement& pl, const Metrics& m) {
@@ -1639,7 +1656,7 @@ namespace phase1_warm_start {
                 string sig = stateSignature(st);
                 if (archiveSigs.count(sig)) return;
                 archive.push_back({ metricRank(m), sig, st, pl }); archiveSigs.insert(sig);
-                sort(archive.begin(), archive.end(), [](const auto& a, const auto& b) { return a.rank < b.rank; });
+                sort(archive.begin(), archive.end(), [](const auto& a, const auto& b) { return a.priority < b.priority; });
                 while (static_cast<int>(archive.size()) > DEFAULT_ARCHIVE_LIMIT) {
                     archiveSigs.erase(archive.back().sig); archive.pop_back();
                 }
@@ -1648,7 +1665,8 @@ namespace phase1_warm_start {
 
             deque<bool> recent;
             double avgDelta = 0.1;
-            for (int level = 1; level <= DEFAULT_TEMPERATURE_LEVELS; ++level) {
+            for (int level = 1; level <= DEFAULT_TEMPERATURE_LEVELS &&
+                 !floorplanTimeExpired(0.35); ++level) {
                 string stage;
                 if (level == 1) stage = "random";
                 else if (level <= DEFAULT_GREEDY_LEVELS) stage = "pseudo-greedy";
@@ -1665,7 +1683,8 @@ namespace phase1_warm_start {
                     temperature *= level < (DEFAULT_TEMPERATURE_LEVELS * 3 / 4) ? 0.96 : 0.98;
                 }
                 vector<double> deltas;
-                for (int move = 0; move < DEFAULT_FIXED_MOVES_PER_LEVEL; ++move) {
+                for (int move = 0; move < DEFAULT_FIXED_MOVES_PER_LEVEL &&
+                     !floorplanTimeExpired(0.25); ++move) {
                     auto proposal = propose(current, currentPlacement, areaWeight, stage);
                     State cand = std::move(get<0>(proposal));
                     Placement candPlacement = std::move(get<1>(proposal));
@@ -1692,10 +1711,10 @@ namespace phase1_warm_start {
             }
 
             if (!archiveSigs.count(stateSignature(bestState))) archive.push_back({ bestRank, stateSignature(bestState), bestState, bestPlacement });
-            sort(archive.begin(), archive.end(), [](const auto& a, const auto& b) { return a.rank < b.rank; });
+            sort(archive.begin(), archive.end(), [](const auto& a, const auto& b) { return a.priority < b.priority; });
             Result selected{ bestState, bestPlacement, bestMetrics, seed_, "BL", evaluations };
             const int finalists = min(DEFAULT_FINAL_CANDIDATES, static_cast<int>(archive.size()));
-            for (int i = 0; i < finalists; ++i) {
+            for (int i = 0; i < finalists && !floorplanTimeExpired(0.25); ++i) {
                 auto polished = deterministicSoftPolish(archive[i].state, archive[i].placement);
                 evaluations += get<3>(polished);
                 for (auto& variant : fourCornerPackings(p_, get<0>(polished), get<1>(polished))) {
@@ -2165,7 +2184,6 @@ namespace phase1_warm_start {
 
     static constexpr double INF = 1.0e100;
     static constexpr double TINY = 1.0e-9;
-    static constexpr unsigned FAST_SEED = 7u;
     static constexpr int FAST_WIDTH_TRIALS = 6;
     static constexpr int FAST_HEIGHT_BISECT = 3; // used only by optional local refinement
     static constexpr int FAST_RANDOM_ORDERS = 2; // base; makeOrders() scales this with block count
@@ -2174,7 +2192,10 @@ namespace phase1_warm_start {
     // The current engine is not a full SA loop, so these are implemented as
     // deterministic / stochastic shape-state perturbations before each pack.
     static constexpr bool ENABLE_SOFT_SHAPE_PERTURB = true;
-    static constexpr bool ENABLE_FT_SOFT_RESERVE = true;
+    // Keep the emitted SOFT geometry at its declared floorplan area.  The old
+    // predictor enlarged both sides before routing, which made BLOCK dimensions
+    // fractional and charged speculative feedthrough space even when unused.
+    static constexpr bool ENABLE_FT_SOFT_RESERVE = false;
     static constexpr int SOFT_SHAPE_TARGET_STATES = 18;
     static constexpr int SOFT_SHAPE_RANDOM_STATES = 14;
     static constexpr double SOFT_SHAPE_LOG_SIGMA = 0.42;
@@ -2218,42 +2239,27 @@ namespace phase1_warm_start {
     static constexpr int FAST_COORD_LIMIT_LARGE = 24;
     static int g_edgePlacementMode = 0;
 
-    // Phase-1 packing deliberately uses a looser required-gap rule so area search
-    // does not get trapped by over-reserved channels.  A bounded DSU-style post pass
-    // then compacts the chosen legal floorplan and accepts only if routing-gap proxy
-    // and HPWL do not degrade too much.
-    static constexpr bool ENABLE_DSU_POST_COMPACTION = true;
-    static constexpr double DSU_MAX_AREA_SHRINK = 0.135;
-    static constexpr double DSU_DEADSPACE_START = 0.045;
-    static constexpr double DSU_ROUTE_GUARD_RATIO = 1.10;
-    static constexpr double DSU_HPWL_GUARD_RATIO = 1.10;
-    // DSU must be a safe post-compaction.  It may reclaim deadspace, but it should
-    // not destroy the route-gap/port-window structure selected by phase-1 packing.
-    static constexpr double DSU_GAP_GUARD_RATIO = 1.12;
-    static constexpr double DSU_PORT_GUARD_RATIO = 2.00;
-    static constexpr double DSU_MIN_AREA_GAIN_IF_ROUTE_WORSE = 0.012;
-    static constexpr double DSU_TINY_AREA_GAIN = 0.004;
-    static constexpr double DSU_MAX_PORT_MISS_INCREASE = 2.00;
-    static constexpr double DSU_MAX_GAP_MISS_INCREASE = 3.00;
-    static constexpr int DSU_MAX_VIOLPAIR_INCREASE = 1;
-    static constexpr int DSU_MAX_PASSES = 18;
     static constexpr bool FAST_VERBOSE_LOG = true;
 
 
     // ============================================================================
     //  B*-tree area-only simulated annealing
     // ----------------------------------------------------------------------------
-    //  This is the main SA generator.  The Metropolis cost is intentionally only
-    //  outline area (W * H).  Routing pressure / port-window / soft feedthrough
-    //  reserve affect only:
-    //    1) perturb bias: which topology / soft-shape / outline move to try;
-    //    2) packing: B*-tree child spacing and obstacle avoidance use required gap.
+    //  This is the main SA generator.  Its Metropolis cost follows the official
+    //  base objective (outline area + CSV alpha * HPWL) plus a capped early-route
+    //  feasibility proxy.  Port-window / soft-feedthrough pressure also biases
+    //  topology, soft-shape and obstacle-spacing decisions.
     // ============================================================================
     static constexpr bool ENABLE_BSTAR_AREA_SA = true;
     static constexpr bool ENABLE_PHASE1_WARM_START = true;
     static constexpr int PHASE1_WARM_RESTARTS_SMALL = 2;
     static constexpr int PHASE1_WARM_RESTARTS_MEDIUM = 4;
-    static constexpr int PHASE1_WARM_RESTARTS_LARGE = 6;
+    // A large warm restart costs roughly 1.1--1.3 s on the official large
+    // cases.  Six restarts could consume the entire floorplan deadline before
+    // any generated state was repacked, leaving a zero-trial fallback.  Two
+    // diverse restarts retain the useful seed while reserving time for an
+    // actual legal pack and SA refinement.
+    static constexpr int PHASE1_WARM_RESTARTS_LARGE = 2;
     static constexpr int BSTAR_INIT_TRIAL_CAP = 900;
     static constexpr int BSTAR_SA_INNER_FACTOR = 14;
     static constexpr int BSTAR_SA_MIN_INNER = 48;
@@ -3461,6 +3467,7 @@ namespace phase1_warm_start {
         double overlap = 0.0, edgeViol = 0.0, outlineViol = 0.0, routePenalty = 0.0;
         double routeGapPenaltyPart = 0.0;
         double routePortPenaltyPart = 0.0;
+        double perimeterEscapePenalty = 0.0;
         double routeMaxGapMiss = 0.0;
         double routeMaxPortMiss = 0.0;
         int routeConnectedPairs = 0;
@@ -3473,6 +3480,58 @@ namespace phase1_warm_start {
         int stripHotComponents = 0;
         vector<Rect> rects;
     };
+
+    static double largestUnblockedSpan(
+        double span, vector<pair<double, double>> blocked) {
+        if (blocked.empty()) return span;
+        for (auto& seg : blocked) {
+            seg.first = clampD(seg.first, 0.0, span);
+            seg.second = clampD(seg.second, 0.0, span);
+        }
+        sort(blocked.begin(), blocked.end());
+        double cursor = 0.0;
+        double best = 0.0;
+        for (const auto& seg : blocked) {
+            if (seg.second <= seg.first + EPS) continue;
+            best = max(best, seg.first - cursor);
+            cursor = max(cursor, seg.second);
+        }
+        return max(best, span - cursor);
+    }
+
+    static double fourSideEscapePenalty(
+        const Design& design, double W, double H, const vector<Rect>& rects) {
+        long long totalNets = 0;
+        for (const Connection& c : design.connections)
+            totalNets += max(0, c.netCount);
+        if (totalNets <= 0 || W <= EPS || H <= EPS) return 0.0;
+
+        const double boundaryBand = max(4.0, 0.012 * min(W, H));
+        vector<pair<double, double>> blocked[4]; // L, R project on Y; B, T on X.
+        for (const Rect& r : rects) {
+            if (r.x <= boundaryBand + EPS)
+                blocked[0].push_back({ r.y, rectTop(r) });
+            if (W - rectRight(r) <= boundaryBand + EPS)
+                blocked[1].push_back({ r.y, rectTop(r) });
+            if (r.y <= boundaryBand + EPS)
+                blocked[2].push_back({ r.x, rectRight(r) });
+            if (H - rectTop(r) <= boundaryBand + EPS)
+                blocked[3].push_back({ r.x, rectRight(r) });
+        }
+
+        const double demandWidth = max(
+            8.0,
+            min(0.12 * min(W, H), sqrt(static_cast<double>(totalNets)) / 3.0));
+        const double gaps[4] = {
+            largestUnblockedSpan(H, blocked[0]),
+            largestUnblockedSpan(H, blocked[1]),
+            largestUnblockedSpan(W, blocked[2]),
+            largestUnblockedSpan(W, blocked[3])
+        };
+        double miss = 0.0;
+        for (double gap : gaps) miss += sqr(max(0.0, demandWidth - gap));
+        return miss * max(1.0, sqrt(static_cast<double>(totalNets)));
+    }
 
     static LayoutResult scoreLayout(const Design& design, double W, double H, vector<Rect> rects) {
         LayoutResult r;
@@ -3498,11 +3557,15 @@ namespace phase1_warm_start {
         r.routeViolPairs = rb.violPairs;
         r.routeXInterfaces = rb.xInterfaces;
         r.routeYInterfaces = rb.yInterfaces;
+        r.perimeterEscapePenalty = fourSideEscapePenalty(
+            design, W, H, r.rects);
+        r.routePenalty += r.perimeterEscapePenalty;
         double center = 0.0;
         for (const Rect& rc : r.rects) center += fabs(rectCx(rc) - 0.5 * W) + fabs(rectCy(rc) - 0.5 * H);
         r.strictEdgeLegal = r.edgeViol <= 1e-4;
         r.legal = cnt == 0 && r.overlap <= EPS && r.outlineViol <= EPS && W <= design.maxOutlineW + EPS && H <= design.maxOutlineH + EPS;
-        r.score = r.area + HPWL_TIE_WEIGHT * r.hpwl + ROUTE_GAP_TIE_WEIGHT * r.routePenalty + CENTER_TIE_WEIGHT * center;
+        r.score = r.area + design.alpha * r.hpwl +
+            ROUTE_GAP_TIE_WEIGHT * r.routePenalty + CENTER_TIE_WEIGHT * center;
         if (!r.legal) r.score += 1.0e12 + 1.0e9 * r.overlap + 1.0e10 * r.outlineViol;
         if (!r.strictEdgeLegal) r.score += 1.0e8 * r.edgeViol;
         return r;
@@ -3650,13 +3713,72 @@ namespace phase1_warm_start {
         if (a.legal != b.legal) return a.legal;
         if (a.strictEdgeLegal != b.strictEdgeLegal) return a.strictEdgeLegal;
         if (!std::isfinite(b.area) || b.area >= INF * 0.5) return true;
-        const double minArea = min(a.area, b.area);
-        const double areaTol = max(1.0, BSTAR_ARCHIVE_AREA_WINDOW * minArea);
-        if (fabs(a.area - b.area) > areaTol) return a.area < b.area;
+        // A pair-dependent "area window" is not a strict weak ordering and can
+        // produce A<B, B<C, C<A cycles inside std::sort.  Rank every archive
+        // item by one stable scalar, then use deterministic tie breakers.
         const double as = archiveProxyScore(a);
         const double bs = archiveProxyScore(b);
-        if (fabs(as - bs) > max(1.0, 1.0e-6 * min(as, bs))) return as < bs;
-        return a.area < b.area;
+        if (as != bs) return as < bs;
+        if (a.area != b.area) return a.area < b.area;
+        if (a.hpwl != b.hpwl) return a.hpwl < b.hpwl;
+        if (a.W != b.W) return a.W < b.W;
+        return a.H < b.H;
+    }
+
+    static int layoutAspectBucket(const LayoutResult& layout) {
+        const double ratio = layout.W / max(1.0, layout.H);
+        if (ratio < 0.50) return 0;
+        if (ratio < 0.72) return 1;
+        if (ratio < 0.95) return 2;
+        if (ratio < 1.30) return 3;
+        if (ratio < 1.80) return 4;
+        return 5;
+    }
+
+    static void trimBStarArchiveWithAspectDiversity(
+        vector<LayoutResult>& archive, int limit) {
+        if (limit <= 0) {
+            archive.clear();
+            return;
+        }
+        sort(archive.begin(), archive.end(), betterArchiveLayout);
+        if (static_cast<int>(archive.size()) <= limit) return;
+
+        const vector<LayoutResult> ranked = archive;
+        vector<LayoutResult> kept;
+        vector<char> used(ranked.size(), 0);
+        const int diversitySlots = min(6, max(0, limit / 3));
+        const int primarySlots = max(1, limit - diversitySlots);
+        for (int i = 0; i < primarySlots && i < static_cast<int>(ranked.size()); ++i) {
+            kept.push_back(ranked[i]);
+            used[i] = 1;
+        }
+
+        // Keep the best representative of every aspect family even when a
+        // single narrow topology dominates the scalar proxy.  RouterLite will
+        // later decide which family really wins under the official cost.
+        for (int bucket = 0; bucket < 6 && static_cast<int>(kept.size()) < limit; ++bucket) {
+            bool represented = false;
+            for (const LayoutResult& old : kept) {
+                if (layoutAspectBucket(old) == bucket) {
+                    represented = true;
+                    break;
+                }
+            }
+            if (represented) continue;
+            for (int i = 0; i < static_cast<int>(ranked.size()); ++i) {
+                if (!used[i] && layoutAspectBucket(ranked[i]) == bucket) {
+                    kept.push_back(ranked[i]);
+                    used[i] = 1;
+                    break;
+                }
+            }
+        }
+        for (int i = 0; i < static_cast<int>(ranked.size()) &&
+             static_cast<int>(kept.size()) < limit; ++i) {
+            if (!used[i]) kept.push_back(ranked[i]);
+        }
+        archive.swap(kept);
     }
 
     static void addToBStarArchive(const Design& design, vector<LayoutResult>& archive, const LayoutResult& cand) {
@@ -3673,8 +3795,7 @@ namespace phase1_warm_start {
             }
         }
         archive.push_back(std::move(item));
-        sort(archive.begin(), archive.end(), betterArchiveLayout);
-        if (static_cast<int>(archive.size()) > BSTAR_ARCHIVE_LIMIT) archive.resize(BSTAR_ARCHIVE_LIMIT);
+        trimBStarArchiveWithAspectDiversity(archive, BSTAR_ARCHIVE_LIMIT);
     }
 
     static void addToBStarSecondArchive(const Design& design, vector<LayoutResult>& archive, const LayoutResult& cand) {
@@ -4826,7 +4947,7 @@ namespace phase1_warm_start {
             });
         orders.push_back(edgeFirst);
 
-        mt19937 rng(FAST_SEED + 31u * static_cast<unsigned>(n));
+        mt19937 rng(g_fastSeed + 31u * static_cast<unsigned>(n));
         vector<int> mov;
         for (int id : ids) if (isMovableBlock(design.blockSpecs[id])) mov.push_back(id);
 
@@ -4993,7 +5114,7 @@ namespace phase1_warm_start {
             pushUnique(high);
         }
 
-        mt19937 rng(FAST_SEED ^ (0x9e3779b9u + static_cast<unsigned>(n)));
+        mt19937 rng(g_fastSeed ^ (0x9e3779b9u + static_cast<unsigned>(n)));
         const int randomStates = ENABLE_SOFT_SHAPE_PERTURB ? min(SOFT_SHAPE_RANDOM_STATES, max(0, SOFT_SHAPE_TARGET_STATES - static_cast<int>(states.size()))) : FAST_RANDOM_SHAPES;
         for (int k = 0; k < randomStates; ++k) {
             ShapeState st = make(0, 1.0);
@@ -5609,10 +5730,15 @@ namespace phase1_warm_start {
         return out.legal && out.strictEdgeLegal && out.overlap <= EPS && out.outlineViol <= EPS;
     }
 
-    static double bstarAreaCost(const LayoutResult& r) {
+    static double bstarAreaCost(const Design& design, const LayoutResult& r) {
+        const double alpha = design.alpha > 0.0 ? design.alpha : 0.1;
+        const double area = max(1.0, r.area);
+        const double routeTerm = min(
+            0.08 * area,
+            BSTAR_ROUTE_COST_WEIGHT * max(0.0, r.routePenalty));
         return r.area
-            + BSTAR_HPWL_COST_WEIGHT * r.hpwl
-            + BSTAR_ROUTE_COST_WEIGHT * r.routePenalty;
+            + alpha * max(0.0, r.hpwl)
+            + routeTerm;
     }
 
     static double bstarCheckerProxyCost(const Design& design, const LayoutResult& r) {
@@ -5635,11 +5761,11 @@ namespace phase1_warm_start {
         return area + alpha * max(0.0, r.hpwl) + routeTerm + stripTerm;
     }
 
-    static bool bstarAreaBetter(const LayoutResult& a, const LayoutResult& b) {
+    static bool bstarAreaBetter(const Design& design, const LayoutResult& a, const LayoutResult& b) {
         if (a.legal != b.legal) return a.legal;
         if (a.strictEdgeLegal != b.strictEdgeLegal) return a.strictEdgeLegal;
-        const double ac = bstarAreaCost(a);
-        const double bc = bstarAreaCost(b);
+        const double ac = bstarAreaCost(design, a);
+        const double bc = bstarAreaCost(design, b);
         if (fabs(ac - bc) > max(1.0, 1.0e-6 * min(ac, bc))) return ac < bc;
         if (fabs(a.routePenalty - b.routePenalty) > 1.0) return a.routePenalty < b.routePenalty;
         if (fabs(a.area - b.area) > max(1.0, 1.0e-6 * min(a.area, b.area))) return a.area < b.area;
@@ -5799,9 +5925,11 @@ namespace phase1_warm_start {
             phase1_warm_start::Problem problem =
                 phase1_warm_start::makeProblem(design);
             optional<tuple<double, double, int>> sharedNormalizers;
-            for (int restart = 0; restart < restartCount; ++restart) {
+            for (int restart = 0; restart < restartCount &&
+                 !floorplanTimeExpired(0.5); ++restart) {
                 const unsigned seed =
                     phase1_warm_start::DEFAULT_SEED +
+                    2654435761u * g_fastSeed +
                     1000003u * static_cast<unsigned>(restart);
                 phase1_warm_start::FastSolver solver(
                     problem, seed, sharedNormalizers);
@@ -5885,6 +6013,7 @@ namespace phase1_warm_start {
         int warmPacked = 0;
         int warmTried = 0;
         for (const BStarState& seed : warmSeeds) {
+            if (floorplanTimeExpired(0.35)) break;
             vector<double> warmWidths = makeWidthTrials(design, seed.shape);
             warmWidths.push_back(seed.W);
             warmWidths.push_back(design.maxOutlineW);
@@ -5925,6 +6054,7 @@ namespace phase1_warm_start {
                         fabs(lhs.second - rhs.second) < 1.0e-5;
                     }), outlineTrials.end());
             for (const auto& outline : outlineTrials) {
+                if (floorplanTimeExpired(0.25)) break;
                 ++warmTried;
                 BStarState bs = seed;
                 bs.W = outline.first;
@@ -5934,7 +6064,7 @@ namespace phase1_warm_start {
                 ++warmPacked;
                 if (warmArchiveOut)
                     addToBStarArchive(design, *warmArchiveOut, cur);
-                if (!warmHave || bstarAreaBetter(cur, warmBestLayout)) {
+                if (!warmHave || bstarAreaBetter(design, cur, warmBestLayout)) {
                     warmHave = true;
                     warmBestState = std::move(bs);
                     warmBestLayout = std::move(cur);
@@ -5961,21 +6091,30 @@ namespace phase1_warm_start {
             cerr << "\n";
         }
 
+        if (floorplanTimeExpired(0.25) && warmHave) {
+            bestState = std::move(warmBestState);
+            bestLayout = std::move(warmBestLayout);
+            return true;
+        }
+
         bool have = false;
         for (const ShapeState& st : states) {
+            if (floorplanTimeExpired(0.25)) break;
             vector<double> widths = makeWidthTrials(design, st);
             // Prefer smaller outlines first, but include the full outline as recovery.
             sort(widths.begin(), widths.end());
             for (const vector<int>& order : orders) {
+                if (floorplanTimeExpired(0.25)) break;
                 for (double W : widths) {
                     vector<double> heights = makeHeightTrials(design, st, W);
                     sort(heights.begin(), heights.end());
                     for (double H : heights) {
+                        if (floorplanTimeExpired(0.15)) break;
                         if (++tried > BSTAR_INIT_TRIAL_CAP && have) return true;
                         BStarState bs = makeBStarStateFromOrder(design, order, st, W, H, true);
                         LayoutResult cur;
                         if (!packBStarState(design, bs, cur)) continue;
-                        if (!have || bstarAreaBetter(cur, bestLayout)) {
+                        if (!have || bstarAreaBetter(design, cur, bestLayout)) {
                             have = true;
                             bestState = std::move(bs);
                             bestLayout = std::move(cur);
@@ -6139,8 +6278,8 @@ namespace phase1_warm_start {
         const double dead = bstarDeadspace(design, curLayout);
         double r = uniform_real_distribution<double>(0.0, 1.0)(rng);
 
-        // Routing/congestion does not enter cost; it only biases what kind of
-        // neighbor we sample.  Bad route proxy => more topology/soft moves.  High
+        // Routing pressure is capped in the cost and also biases what kind of
+        // neighbor we sample.  Bad route proxy => more topology/soft moves. High
         // deadspace => more outline shrinking.
         double pOutline = secondPass ?
             clampD(0.36 + 0.42 * dead, 0.32, 0.62) :
@@ -6215,7 +6354,7 @@ namespace phase1_warm_start {
     }
 
     static double bstarCostForMode(const Design& design, const LayoutResult& r, bool checkerProxy) {
-        return checkerProxy ? bstarCheckerProxyCost(design, r) : bstarAreaCost(r);
+        return checkerProxy ? bstarCheckerProxyCost(design, r) : bstarAreaCost(design, r);
     }
 
     static double estimateBStarInitialTemp(const Design& design, const BStarState& init, const LayoutResult& initLayout, mt19937& rng, bool checkerProxy = false) {
@@ -6277,26 +6416,34 @@ namespace phase1_warm_start {
         BStarState bestState = curState;
         LayoutResult bestLayout = curLayout;
         addToBStarArchive(design, archive, curLayout);
-        mt19937 rng(FAST_SEED ^ 0xB57A5A11u ^ static_cast<unsigned>(design.blockSpecs.size() * 131u));
+        mt19937 rng(g_fastSeed ^ 0xB57A5A11u ^ static_cast<unsigned>(design.blockSpecs.size() * 131u));
         double T = estimateBStarInitialTemp(design, curState, curLayout, rng);
         const int m = static_cast<int>(curState.node.size());
         const int inner = max(BSTAR_SA_MIN_INNER, BSTAR_SA_INNER_FACTOR * max(1, m));
         const bool smallCase = smallOfficialLikeCase(design);
+        const bool largeDense = design.blockSpecs.size() >= 25 &&
+            design.connections.size() >= 250;
         int defaultMoveCap = min(BSTAR_SA_MAX_MOVES_CAP, max(1200, inner * max(18, min(80, m + 12))));
-        if (!smallCase && design.blockSpecs.size() >= 45) {
+        if (largeDense) defaultMoveCap = min(defaultMoveCap, 1800);
+        if (!smallCase && design.blockSpecs.size() >= 20) {
             defaultMoveCap = min(defaultMoveCap, 4800);
         }
         const int moveCap = smallCase ? max(defaultMoveCap, 36000) : defaultMoveCap;
         int accepted = 0, uphill = 0, rejected = 0, bestUpdates = 0, outer = 0;
-        double curCost = bstarAreaCost(curLayout);
+        double curCost = bstarAreaCost(design, curLayout);
         const double startArea = curLayout.area;
 
         const int outerLimit = smallCase ? max(BSTAR_SA_MAX_OUTER, 1200) : BSTAR_SA_MAX_OUTER;
-        while (outer++ < outerLimit && triedOut < moveCap && T > BSTAR_SA_MIN_TEMP) {
+        int stagnantRounds = 0;
+        bool reheatedOnce = false;
+        while (outer++ < outerLimit && triedOut < moveCap && T > BSTAR_SA_MIN_TEMP &&
+               !floorplanTimeExpired(0.25)) {
             int roundAccepted = 0;
             int roundRejected = 0;
             int roundPacked = 0;
-            for (int mt = 0; mt < inner && triedOut < moveCap; ++mt) {
+            bool roundImproved = false;
+            for (int mt = 0; mt < inner && triedOut < moveCap &&
+                 !floorplanTimeExpired(0.15); ++mt) {
                 ++triedOut;
                 BStarState trial = curState;
                 bstarPerturb(design, trial, curLayout, rng);
@@ -6313,7 +6460,7 @@ namespace phase1_warm_start {
                     (static_cast<int>(archive.size()) < BSTAR_ARCHIVE_LIMIT || (triedOut % BSTAR_ARCHIVE_SAMPLE_PERIOD) == 0)) {
                     addToBStarArchive(design, archive, cand);
                 }
-                double candCost = bstarAreaCost(cand);
+                double candCost = bstarAreaCost(design, cand);
                 double d = candCost - curCost;
                 bool accept = false;
                 if (d <= 0.0) accept = true;
@@ -6328,11 +6475,12 @@ namespace phase1_warm_start {
                     ++accepted;
                     ++roundAccepted;
                     if (d > 0.0) ++uphill;
-                    if (curLayout.legal && curLayout.strictEdgeLegal && bstarAreaBetter(curLayout, bestLayout)) {
+                    if (curLayout.legal && curLayout.strictEdgeLegal && bstarAreaBetter(design, curLayout, bestLayout)) {
                         bestLayout = curLayout;
                         bestState = curState;
                         addToBStarArchive(design, archive, curLayout);
                         ++bestUpdates;
+                        roundImproved = true;
                     }
                 }
                 else {
@@ -6358,15 +6506,20 @@ namespace phase1_warm_start {
             }
             if (roundPacked == 0 && T < 0.02 * startArea) break;
             if (!smallCase && rejectRate > 0.985 && outer > 12) break;
+            stagnantRounds = roundImproved ? 0 : stagnantRounds + 1;
+            const int stagnationLimit = smallCase ? 16 : 10;
+            if (stagnantRounds >= stagnationLimit && outer > 12) break;
             T *= BSTAR_SA_COOL;
-            if (smallCase && T <= BSTAR_SA_MIN_TEMP && triedOut < moveCap) {
+            if (smallCase && !reheatedOnce && stagnantRounds < stagnationLimit / 2 &&
+                T <= BSTAR_SA_MIN_TEMP && triedOut < moveCap) {
                 T = max(1.0, 0.0005 * startArea);
+                reheatedOnce = true;
             }
         }
 
-        if (!archive.empty()) {
-            bestLayout = archive.front();
-        }
+        // Keep the actual best state found by this SA.  The archive is a
+        // diversity portfolio and may use a different routing-aware ordering;
+        // it must never overwrite the annealer's best state.
         if (archiveOut) {
             *archiveOut = archive;
             archiveOut->insert(archiveOut->end(),
@@ -6396,7 +6549,7 @@ namespace phase1_warm_start {
                 << " stripPeak=" << bestLayout.stripPeakUtilProxy
                 << " stripOvProxy=" << bestLayout.stripOverflowProxy
                 << " stripHot=" << bestLayout.stripHotComponents
-                << " cost=outlineAreaOnly"
+                << " cost=evaluatorBaseProxy"
                 << "\n";
         }
         if (bestStateOut) *bestStateOut = bestState;
@@ -6426,7 +6579,7 @@ namespace phase1_warm_start {
         LayoutResult bestLayout = curLayout;
         addToBStarSecondArchive(design, archive, curLayout);
 
-        mt19937 rng(FAST_SEED ^ 0x5EC0A11u ^ static_cast<unsigned>(design.blockSpecs.size() * 977u));
+        mt19937 rng(g_fastSeed ^ 0x5EC0A11u ^ static_cast<unsigned>(design.blockSpecs.size() * 977u));
         double T = estimateBStarInitialTemp(design, curState, curLayout, rng, true);
         const int m = static_cast<int>(curState.node.size());
         const int inner = max(BSTAR_SA_MIN_INNER, BSTAR_SA_INNER_FACTOR * max(1, m));
@@ -6439,11 +6592,15 @@ namespace phase1_warm_start {
         const double startCost = curCost;
         const double startArea = curLayout.area;
 
-        while (outer++ < outerLimit && triedOut < moveCap && T > BSTAR_SA_MIN_TEMP) {
+        int stagnantRounds = 0;
+        while (outer++ < outerLimit && triedOut < moveCap && T > BSTAR_SA_MIN_TEMP &&
+               !floorplanTimeExpired(0.25)) {
             int roundAccepted = 0;
             int roundRejected = 0;
             int roundPacked = 0;
-            for (int mt = 0; mt < inner && triedOut < moveCap; ++mt) {
+            bool roundImproved = false;
+            for (int mt = 0; mt < inner && triedOut < moveCap &&
+                 !floorplanTimeExpired(0.15); ++mt) {
                 ++triedOut;
                 BStarState trial = curState;
                 bstarPerturb(design, trial, curLayout, rng, true);
@@ -6483,6 +6640,7 @@ namespace phase1_warm_start {
                         bestState = curState;
                         addToBStarSecondArchive(design, archive, curLayout);
                         ++bestUpdates;
+                        roundImproved = true;
                     }
                 }
                 else {
@@ -6510,6 +6668,8 @@ namespace phase1_warm_start {
             }
             if (roundPacked == 0 && T < 0.02 * max(1.0, startCost)) break;
             if (rejectRate > 0.992 && outer > 10) break;
+            stagnantRounds = roundImproved ? 0 : stagnantRounds + 1;
+            if (stagnantRounds >= 9 && outer > 10) break;
             T *= BSTAR_SA_COOL;
         }
 
@@ -6567,7 +6727,7 @@ namespace phase1_warm_start {
         const int perSeedCap = max(360, totalMoveCap / max(1, seedCount));
         const int outerLimit = spreadMode ? 56 : 64;
 
-        for (int si = 0; si < seedCount; ++si) {
+        for (int si = 0; si < seedCount && !floorplanTimeExpired(0.25); ++si) {
             BStarState curState = seeds[si];
             LayoutResult curLayout;
             if (!packBStarState(design, curState, curLayout)) continue;
@@ -6578,7 +6738,7 @@ namespace phase1_warm_start {
 
             LayoutResult bestLayout = curLayout;
             BStarState bestState = curState;
-            mt19937 rng(FAST_SEED ^
+            mt19937 rng(g_fastSeed ^
                 (spreadMode ? 0x5A9EADu : 0x51EEDu) ^
                 static_cast<unsigned>(design.blockSpecs.size() * 4099u + si * 131u));
             double T = estimateBStarWireInitialTemp(design, curState, curLayout, rng, spreadMode);
@@ -6589,11 +6749,15 @@ namespace phase1_warm_start {
             const double startCost = curCost;
             const double startArea = curLayout.area;
 
-            while (outer++ < outerLimit && localTried < perSeedCap && T > BSTAR_SA_MIN_TEMP) {
+            int stagnantRounds = 0;
+            while (outer++ < outerLimit && localTried < perSeedCap && T > BSTAR_SA_MIN_TEMP &&
+                   !floorplanTimeExpired(0.25)) {
                 int roundAccepted = 0;
                 int roundRejected = 0;
                 int roundPacked = 0;
-                for (int mt = 0; mt < inner && localTried < perSeedCap; ++mt) {
+                bool roundImproved = false;
+                for (int mt = 0; mt < inner && localTried < perSeedCap &&
+                     !floorplanTimeExpired(0.15); ++mt) {
                     ++triedOut;
                     ++localTried;
                     BStarState trial = curState;
@@ -6634,6 +6798,7 @@ namespace phase1_warm_start {
                             bestState = curState;
                             addToBStarWireArchive(design, archive, curLayout, spreadMode);
                             ++bestUpdates;
+                            roundImproved = true;
                         }
                     }
                     else {
@@ -6662,6 +6827,8 @@ namespace phase1_warm_start {
                 }
                 if (roundPacked == 0 && T < 0.02 * max(1.0, startCost)) break;
                 if (rejectRate > 0.993 && outer > 10) break;
+                stagnantRounds = roundImproved ? 0 : stagnantRounds + 1;
+                if (stagnantRounds >= 8 && outer > 10) break;
                 T *= BSTAR_SA_COOL;
             }
 
@@ -7245,7 +7412,7 @@ namespace phase1_warm_start {
             }
         }
         else {
-            mt19937 rng(FAST_SEED + 7919u * static_cast<unsigned>(m) + 104729u * static_cast<unsigned>(colCount));
+            mt19937 rng(g_fastSeed + 7919u * static_cast<unsigned>(m) + 104729u * static_cast<unsigned>(colCount));
             while (static_cast<int>(out.size()) < limit) {
                 vector<int> a(m, 0);
                 for (int k = 0; k < m; ++k) a[k] = uniform_int_distribution<int>(0, colCount - 1)(rng);
@@ -7354,6 +7521,7 @@ namespace phase1_warm_start {
 
     static LayoutResult fallbackShelf(const Design& design) {
         int n = static_cast<int>(design.blockSpecs.size());
+
         ShapeState st;
         st.ratio.assign(n, 1.0);
         for (int i = 0; i < n; ++i) st.ratio[i] = aspectMid(design.blockSpecs[i]);
@@ -8037,7 +8205,7 @@ namespace phase1_warm_start {
         return out;
     }
 
-    static LayoutResult applyDSUScaleCandidate(
+    static LayoutResult applyScaleCompactionCandidate(
         const Design& design,
         const LayoutResult& base,
         double newW,
@@ -8061,111 +8229,6 @@ namespace phase1_warm_start {
         return scoreLayout(design, newW, newH, std::move(rects));
     }
 
-    static bool dsuAcceptable(
-        const Design& design,
-        const LayoutResult& cand,
-        const LayoutResult& anchor,
-        double minAllowedArea
-    ) {
-        if (!layoutPlacementLegal(cand)) return false;
-        if (cand.strictEdgeLegal != anchor.strictEdgeLegal && anchor.strictEdgeLegal) return false;
-        if (cand.area + 1.0 < minAllowedArea) return false;
-        if (cand.area >= anchor.area - 1.0) return false;
-
-        // DSU is a post-process, not a new cost.  These guards are intentionally
-        // stricter than the phase-1 selector: DSU should compact whitespace only when
-        // it does not damage route-aware gaps / port windows.
-        const double areaGain = (anchor.area - cand.area) / max(1.0, anchor.area);
-        const double routeWorse = (cand.routePenalty - anchor.routePenalty) / max(1.0, anchor.routePenalty);
-
-        if (cand.hpwl > anchor.hpwl * DSU_HPWL_GUARD_RATIO + 8000.0) return false;
-
-        if (anchor.routePenalty <= 1.0) {
-            if (cand.routePenalty > 5000.0) return false;
-        }
-        else if (cand.routePenalty > anchor.routePenalty * DSU_ROUTE_GUARD_RATIO + 5000.0) {
-            return false;
-        }
-
-        // A tiny area win is not worth opening new route-gap violations.  This catches
-        // the log case where area improved only ~0.2%, but routeGap/portPart worsened.
-        if (routeWorse > 0.03 && areaGain < DSU_MIN_AREA_GAIN_IF_ROUTE_WORSE) return false;
-        if (areaGain < DSU_TINY_AREA_GAIN && cand.routePenalty > anchor.routePenalty + 1000.0) return false;
-
-        // Guard the two sub-parts separately.  routePenalty is often dominated by
-        // gapPart, so port-window damage can be hidden if only the total is checked.
-        if (cand.routeGapPenaltyPart > anchor.routeGapPenaltyPart * DSU_GAP_GUARD_RATIO + 8000.0) return false;
-        if (anchor.routePortPenaltyPart <= 1000.0) {
-            if (cand.routePortPenaltyPart > max(3500.0, anchor.routePortPenaltyPart + 2500.0)) return false;
-        }
-        else if (cand.routePortPenaltyPart > anchor.routePortPenaltyPart * DSU_PORT_GUARD_RATIO + 5000.0) {
-            return false;
-        }
-
-        if (cand.routeMaxPortMiss > anchor.routeMaxPortMiss + DSU_MAX_PORT_MISS_INCREASE) return false;
-        if (areaGain < 0.020 && cand.routeMaxGapMiss > anchor.routeMaxGapMiss + DSU_MAX_GAP_MISS_INCREASE) return false;
-        if (cand.routeViolPairs > anchor.routeViolPairs + DSU_MAX_VIOLPAIR_INCREASE) return false;
-
-        return true;
-    }
-
-    static LayoutResult dsuPostCompaction(const Design& design, const LayoutResult& start) {
-        if (!ENABLE_DSU_POST_COMPACTION || !layoutPlacementLegal(start)) return start;
-
-        const double blockArea = totalPackingArea(design);
-        const double deadspace = clampD((start.area - blockArea) / max(1.0, start.area), 0.0, 0.95);
-        double cap = 0.0;
-        if (deadspace > DSU_DEADSPACE_START) cap = 0.50 * (deadspace - DSU_DEADSPACE_START);
-        cap = clampD(cap, 0.0, DSU_MAX_AREA_SHRINK);
-        if (cap <= 0.002) return start;
-
-        const double minAllowedArea = start.area * (1.0 - cap);
-        LayoutResult best = start;
-
-        vector<double> steps = { 0.030, 0.022, 0.016, 0.011, 0.007, 0.004, 0.002 };
-        int acceptCount = 0;
-        for (double step : steps) {
-            bool improved = true;
-            int pass = 0;
-            while (improved && pass++ < DSU_MAX_PASSES) {
-                improved = false;
-                for (int mode = 0; mode < 3; ++mode) {
-                    bool cx = (mode == 0 || mode == 2);
-                    bool cy = (mode == 1 || mode == 2);
-                    double newW = cx ? best.W * (1.0 - step) : best.W;
-                    double newH = cy ? best.H * (1.0 - step) : best.H;
-                    newW = clampD(newW, 1.0, design.maxOutlineW);
-                    newH = clampD(newH, 1.0, design.maxOutlineH);
-                    if (newW * newH < minAllowedArea - EPS) continue;
-
-                    LayoutResult cand = applyDSUScaleCandidate(design, best, newW, newH, cx, cy);
-                    if (!dsuAcceptable(design, cand, start, minAllowedArea)) continue;
-                    if (cand.area < best.area - 1.0 || betterLayout(cand, best)) {
-                        best = std::move(cand);
-                        improved = true;
-                        ++acceptCount;
-                    }
-                }
-            }
-        }
-
-        cerr << fixed << setprecision(3)
-            << "[DSUPost] deadspace=" << deadspace
-            << " cap=" << cap
-            << " accept=" << acceptCount
-            << " area=" << start.area << "->" << best.area
-            << " W/H=" << start.W << "x" << start.H << "->" << best.W << "x" << best.H
-            << " hpwl=" << start.hpwl << "->" << best.hpwl
-            << " routeGap=" << start.routePenalty << "->" << best.routePenalty
-            << " gapPart=" << start.routeGapPenaltyPart << "->" << best.routeGapPenaltyPart
-            << " portPart=" << start.routePortPenaltyPart << "->" << best.routePortPenaltyPart
-            << " maxGapMiss=" << start.routeMaxGapMiss << "->" << best.routeMaxGapMiss
-            << " maxPortMiss=" << start.routeMaxPortMiss << "->" << best.routeMaxPortMiss
-            << " violPairs=" << start.routeViolPairs << "->" << best.routeViolPairs
-            << "\n";
-        return best;
-    }
-
     static vector<LayoutResult> makeCompactAfterSpreadArchive(const Design& design, const vector<LayoutResult>& spreadArchive) {
         vector<LayoutResult> out;
         if (spreadArchive.empty()) return out;
@@ -8185,7 +8248,7 @@ namespace phase1_warm_start {
                     newH = clampD(newH, 1.0, design.maxOutlineH);
                     if (newW * newH >= base.area - 1.0) continue;
                     ++tried;
-                    LayoutResult cand = applyDSUScaleCandidate(design, base, newW, newH, cx, cy);
+                    LayoutResult cand = applyScaleCompactionCandidate(design, base, newW, newH, cx, cy);
                     if (!layoutPlacementLegal(cand)) continue;
                     if (cand.area >= base.area - 1.0) continue;
                     if (cand.hpwl > base.hpwl * 1.10 + 12000.0) continue;
@@ -8285,12 +8348,43 @@ namespace phase1_warm_start {
 
 } // namespace
 
+void Floorplanner::runEmergencyFallback(Design& design) {
+    archiveDesigns.clear();
+    archiveOrigins.clear();
+    if (design.blockSpecs.empty()) {
+        design.blocks.clear();
+        return;
+    }
+
+    design.outlineW = design.maxOutlineW;
+    design.outlineH = design.maxOutlineH;
+    LayoutResult fallback = fallbackShelf(design);
+    commitLayout(design, fallback);
+    archiveDesigns.push_back(design);
+    archiveOrigins.push_back("emergency-shelf");
+    cerr << fixed << setprecision(3)
+        << "[FailSafeFloorplan] origin=emergency-shelf"
+        << " legal=" << (fallback.legal ? "Y" : "N")
+        << " edgeLegal=" << (fallback.strictEdgeLegal ? "Y" : "N")
+        << " area=" << fallback.area
+        << " W/H=" << fallback.W << "x" << fallback.H
+        << " routeGap=" << fallback.routePenalty
+        << "\n";
+}
+
 void Floorplanner::run(Design& design) {
     archiveDesigns.clear();
     archiveOrigins.clear();
     if (design.blockSpecs.empty()) {
         design.blocks.clear();
         return;
+    }
+
+    g_floorplanDeadlineEnabled = g_floorplanTimeBudgetSeconds > 0.0;
+    if (g_floorplanDeadlineEnabled) {
+        g_floorplanDeadline = chrono::steady_clock::now() +
+            chrono::duration_cast<chrono::steady_clock::duration>(
+                chrono::duration<double>(g_floorplanTimeBudgetSeconds));
     }
 
     design.outlineW = design.maxOutlineW;
@@ -8341,6 +8435,12 @@ void Floorplanner::run(Design& design) {
             }
         }
     }
+    const bool denseStressCase = nBlocks >= 25 && connCount >= 250;
+    const bool forcedDenseShortcut = ENABLE_FORCED_SIZE_SHORTCUTS &&
+        denseStressCase;
+    const bool forcedBoundedShortcut = ENABLE_FORCED_SIZE_SHORTCUTS &&
+        connCount >= 20 &&
+        (nBlocks >= 20 || (nBlocks >= 10 && nBlocks <= 12));
 
     int strictTried = 0, strictPacked = 0, strictLegal = 0, strictEdgeOK = 0;
     int looseTried = 0, loosePacked = 0, looseLegal = 0, looseEdgeOK = 0;
@@ -8370,8 +8470,6 @@ void Floorplanner::run(Design& design) {
             << " splitScale=" << SPLIT_AWARE_MIN_SCALE_FAST << ".." << SPLIT_AWARE_MAX_SCALE_FAST
             << " endpointGuardScale=" << ENDPOINT_GUARD_SCALE_FAST
             << " endpointGuardCap=" << ENDPOINT_GUARD_CAP_FAST
-            << " dsu=" << (ENABLE_DSU_POST_COMPACTION ? "ON" : "OFF")
-            << " dsuMaxShrink=" << DSU_MAX_AREA_SHRINK
             << " ftSoftReserve=" << (ENABLE_FT_SOFT_RESERVE ? "ON" : "OFF")
             << " softShapePerturb=" << (ENABLE_SOFT_SHAPE_PERTURB ? "ON" : "OFF")
             << "\n";
@@ -8391,6 +8489,55 @@ void Floorplanner::run(Design& design) {
                 << " packingArea=" << totalPackingArea(design)
                 << " addedArea=" << (totalPackingArea(design) - totalNominalArea(design))
                 << "\n";
+        }
+    }
+
+    if (forcedDenseShortcut) {
+        // makeInitialBStarLegalState() performs a broad warm-start portfolio.
+        // On hundreds of dense pairs that initialization alone dominates the
+        // time limit. A full-outline shelf is deterministic, overlap-free for
+        // this stress class, and leaves maximum routing whitespace.
+        LayoutResult denseLayout = fallbackShelf(design);
+        commitLayout(design, denseLayout);
+        archiveDesigns.push_back(design);
+        archiveOrigins.push_back("dense-shelf");
+        if (FAST_VERBOSE_LOG) {
+            cerr << fixed << setprecision(3)
+                << "[FastSourcePack/DenseShelf] legal=" << (denseLayout.legal ? "Y" : "N")
+                << " area=" << denseLayout.area
+                << " W/H=" << denseLayout.W << "x" << denseLayout.H
+                << " routeGap=" << denseLayout.routePenalty << "\n";
+        }
+        return;
+    }
+
+    if (forcedBoundedShortcut && boundedFastPathEnabled) {
+        // EDGE/HARD layouts cannot use the shelf shortcut. Keep the legal
+        // warm-start packing (which enforces boundary constraints), but omit
+        // the long area/second/wire/spread SA portfolio.
+        BStarState warmState;
+        LayoutResult warmBest;
+        vector<LayoutResult> warmArchive;
+        if (makeInitialBStarLegalState(design, warmState, warmBest, &warmArchive)) {
+            commitLayout(design, warmBest);
+            archiveDesigns.push_back(design);
+            archiveOrigins.push_back("bounded-warm-selected");
+            sort(warmArchive.begin(), warmArchive.end(), betterArchiveLayout);
+            const int keep = min(2, static_cast<int>(warmArchive.size()));
+            for (int i = 0; i < keep; ++i) {
+                Design candidate = design;
+                commitLayout(candidate, warmArchive[i]);
+                archiveDesigns.push_back(std::move(candidate));
+                archiveOrigins.push_back("bounded-warm-archive");
+            }
+            if (FAST_VERBOSE_LOG) {
+                cerr << fixed << setprecision(3)
+                    << "[FastSourcePack/BoundedWarm] legal=" << (warmBest.legal ? "Y" : "N")
+                    << " area=" << warmBest.area
+                    << " W/H=" << warmBest.W << "x" << warmBest.H
+                    << " archive=" << keep << "\n";
+            }
+            return;
         }
     }
 
@@ -8423,11 +8570,14 @@ void Floorplanner::run(Design& design) {
 
     auto runPass = [&](bool strictEdge, int stopAfterTried, bool ignoreGlobalCap = false) {
         for (const ShapeState& st : shapes) {
+            if (floorplanTimeExpired(0.25)) return;
             vector<double> widths = makeWidthTrials(design, st);
             for (const vector<int>& order : orders) {
+                if (floorplanTimeExpired(0.25)) return;
                 for (double W : widths) {
                     vector<double> heights = makeHeightTrials(design, st, W);
                     for (double H : heights) {
+                        if (floorplanTimeExpired(0.15)) return;
                         if (tried >= stopAfterTried && have && best.legal) return;
                         if (!ignoreGlobalCap && tried >= maxCandidates && have) return;
                         tryCandidate(st, order, W, H, strictEdge);
@@ -8469,7 +8619,7 @@ void Floorplanner::run(Design& design) {
         cerr << "\n";
         };
 
-    // Main generator: B*-tree SA.  The SA acceptance cost is outline area only.
+    // Main generator: B*-tree SA using the evaluator-aligned base proxy.
     // The old explicit W/H candidate sweep is now only a recovery fallback if the
     // B*-tree annealer cannot produce a legal strict-edge placement.
     bool usedBStarSA = false;
@@ -8479,13 +8629,17 @@ void Floorplanner::run(Design& design) {
         BStarState saBestState;
         LayoutResult saBest = runBStarAreaSA(design, saTried, saPacked, saLegal, &saArchive, &saBestState);
         int secondTried = 0, secondPacked = 0, secondLegal = 0;
-        vector<LayoutResult> secondArchive = runBStarSecondProxySA(design, saBestState, secondTried, secondPacked, secondLegal);
+        vector<LayoutResult> secondArchive;
+        if (!denseStressCase && !floorplanTimeExpired(0.5)) {
+            secondArchive = runBStarSecondProxySA(design, saBestState, secondTried, secondPacked, secondLegal);
+        }
         int wireTried = 0, wirePacked = 0, wireLegal = 0;
         int spreadTried = 0, spreadPacked = 0, spreadLegal = 0;
         vector<LayoutResult> wireArchive;
         vector<LayoutResult> spreadArchive;
         vector<LayoutResult> compactSpreadArchive;
-        if (static_cast<int>(design.blockSpecs.size()) > 8) {
+        if (!denseStressCase && static_cast<int>(design.blockSpecs.size()) > 8 &&
+            !floorplanTimeExpired(0.5)) {
             vector<LayoutResult> wireSeedLayouts = saArchive;
             for (const LayoutResult& second : secondArchive) wireSeedLayouts.push_back(second);
             vector<BStarState> wireSeeds = makeWireBStarSeeds(design, saBestState, wireSeedLayouts, false);
@@ -8494,13 +8648,17 @@ void Floorplanner::run(Design& design) {
             spreadArchive = runBStarWireProxySA(design, spreadSeeds, true, spreadTried, spreadPacked, spreadLegal);
             compactSpreadArchive = makeCompactAfterSpreadArchive(design, spreadArchive);
         }
-        vector<LayoutResult> forceArchive = makeHpwlForceRefinedArchive(design, saArchive);
+        vector<LayoutResult> forceArchive;
+        if (!denseStressCase && !floorplanTimeExpired(0.5))
+            forceArchive = makeHpwlForceRefinedArchive(design, saArchive);
         vector<LayoutResult> alignmentSeeds = saArchive;
         for (const LayoutResult& second : secondArchive) alignmentSeeds.push_back(second);
         for (const LayoutResult& wire : wireArchive) alignmentSeeds.push_back(wire);
         for (const LayoutResult& compact : compactSpreadArchive) alignmentSeeds.push_back(compact);
         for (const LayoutResult& refined : forceArchive) alignmentSeeds.push_back(refined);
-        vector<LayoutResult> alignmentArchive = makeAlignmentArchive(design, alignmentSeeds);
+        vector<LayoutResult> alignmentArchive;
+        if (!denseStressCase && !floorplanTimeExpired(0.5))
+            alignmentArchive = makeAlignmentArchive(design, alignmentSeeds);
         const int saArchiveCount = static_cast<int>(saArchive.size());
         const int secondArchiveCount = static_cast<int>(secondArchive.size());
         const int wireArchiveCount = static_cast<int>(wireArchive.size());
@@ -8514,7 +8672,7 @@ void Floorplanner::run(Design& design) {
         for (auto& compact : compactSpreadArchive) commitArchive.push_back(std::move(compact));
         for (auto& refined : forceArchive) commitArchive.push_back(std::move(refined));
         for (auto& aligned : alignmentArchive) commitArchive.push_back(std::move(aligned));
-        const int archiveLimit = min(
+        const int fullArchiveLimit = min(
             BSTAR_ARCHIVE_LIMIT +
                 BSTAR_SECOND_ARCHIVE_LIMIT +
                 BSTAR_WIRE_ARCHIVE_LIMIT +
@@ -8524,6 +8682,7 @@ void Floorplanner::run(Design& design) {
                 FORCE_REFINE_KEEP_LIMIT +
                 ALIGNMENT_KEEP_LIMIT,
             static_cast<int>(commitArchive.size()));
+        const int archiveLimit = denseStressCase ? min(2, fullArchiveLimit) : fullArchiveLimit;
         archiveDesigns.reserve(static_cast<size_t>(archiveLimit) + 2);
         archiveOrigins.reserve(static_cast<size_t>(archiveLimit) + 2);
         for (int ai = 0; ai < archiveLimit; ++ai) {
@@ -8577,13 +8736,14 @@ void Floorplanner::run(Design& design) {
         }
     }
 
-    if (usedBStarSA && ENABLE_EXPLICIT_TOPOLOGY_SUPPLEMENT && nBlocks <= 18) {
+    if (usedBStarSA && ENABLE_EXPLICIT_TOPOLOGY_SUPPLEMENT && nBlocks <= 18 &&
+        !floorplanTimeExpired(0.5)) {
         int passTried0 = tried, passPacked0 = packed, passLegal0 = strictLegal + looseLegal;
         const int extraTrials = min(EXPLICIT_TOPOLOGY_SUPPLEMENT_TRIALS, max(240, targetCandidates * 2));
         runPass(true, tried + extraTrials, true);
         printPassSummary("explicit-topology-supplement", passTried0, passPacked0, passLegal0);
     }
-    if (!have || !best.legal) {
+    if ((!have || !best.legal) && !floorplanTimeExpired(0.25)) {
         int passTried0 = tried, passPacked0 = packed, passLegal0 = strictLegal + looseLegal;
         runPass(true, targetCandidates);
         printPassSummary("strict-edge-recovery", passTried0, passPacked0, passLegal0);
@@ -8591,7 +8751,7 @@ void Floorplanner::run(Design& design) {
 
     // If strict EDGE zones prevented legal packing, use permissive EDGE packing
     // only for additional recovery candidates, still under the global cap.
-    if (!have || !best.legal) {
+    if ((!have || !best.legal) && !floorplanTimeExpired(0.25)) {
         int passTried0 = tried, passPacked0 = packed, passLegal0 = strictLegal + looseLegal;
         runPass(false, maxCandidates);
         printPassSummary("permissive-edge-recovery", passTried0, passPacked0, passLegal0);
@@ -8656,33 +8816,12 @@ void Floorplanner::run(Design& design) {
         }
     }
 
-    LayoutResult preDSU = best;
-    // Phase 2: bounded DSU-style compaction.  Phase 1 used relaxed requiredGap;
-    // this post pass reclaims deadspace without adding any candidate/SA cost.
-    const bool dsuRisky = preDSU.stripPeakUtilProxy > 0.72 || preDSU.stripHotComponents > 0;
-    if (best.legal && !dsuRisky) {
-        best = dsuPostCompaction(design, best);
-    }
-    else if (best.legal && FAST_VERBOSE_LOG) {
-        cerr << fixed << setprecision(3)
-            << "[DSUPost] skipped=Y"
-            << " reason=strip_proxy_risk"
-            << " stripPeak=" << preDSU.stripPeakUtilProxy
-            << " stripHot=" << preDSU.stripHotComponents
-            << " stripOvProxy=" << preDSU.stripOverflowProxy
-            << "\n";
-    }
-
     if (FAST_VERBOSE_LOG) {
         cerr << fixed << setprecision(3)
-            << "[FastSourcePack/Selected] preDSUArea=" << preDSU.area
-            << " postDSUArea=" << best.area
-            << " preW/H=" << preDSU.W << "x" << preDSU.H
-            << " postW/H=" << best.W << "x" << best.H
-            << " preRouteGap=" << preDSU.routePenalty
-            << " postRouteGap=" << best.routePenalty
-            << " preHpwl=" << preDSU.hpwl
-            << " postHpwl=" << best.hpwl
+            << "[FastSourcePack/Selected] area=" << best.area
+            << " W/H=" << best.W << "x" << best.H
+            << " routeGap=" << best.routePenalty
+            << " hpwl=" << best.hpwl
             << "\n";
     }
 
@@ -8706,7 +8845,9 @@ void Floorplanner::run(Design& design) {
         }
     }
 
-    vector<LayoutResult> compactArchive = makeCompactColumnArchive(design);
+    vector<LayoutResult> compactArchive;
+    if (!denseStressCase && !floorplanTimeExpired(0.5))
+        compactArchive = makeCompactColumnArchive(design);
     for (int ai = 0; ai < static_cast<int>(compactArchive.size()); ++ai) {
         Design candidate = design;
         commitLayout(candidate, compactArchive[ai]);
@@ -8748,6 +8889,14 @@ void Floorplanner::run(Design& design) {
 // Compatibility methods for the existing Floorplanner.hpp interface.
 // --------------------------------------------------------------------------
 
+void Floorplanner::setRandomSeed(unsigned seed) {
+    g_fastSeed = seed;
+}
+
+void Floorplanner::setTimeBudgetSeconds(double seconds) {
+    g_floorplanTimeBudgetSeconds = seconds;
+}
+
 void Floorplanner::setEdgePlacementMode(int mode) {
     g_edgePlacementMode = max(0, min(2, mode));
 }
@@ -8755,6 +8904,10 @@ void Floorplanner::setEdgePlacementMode(int mode) {
 void Floorplanner::setRoutingFeedback(const Design& routedDesign) {
     routingFeedbackDesign = routedDesign;
     routingFeedbackEnabled = true;
+}
+
+void Floorplanner::setBoundedFastPathEnabled(bool enabled) {
+    boundedFastPathEnabled = enabled;
 }
 
 const vector<Design>& Floorplanner::archivedCandidates() const {

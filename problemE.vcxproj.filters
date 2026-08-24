@@ -39,9 +39,23 @@
     <ClCompile Include="Parser.cpp">
       <Filter>來源檔案</Filter>
     </ClCompile>
-    <ClCompile Include="Router.cpp">
+    <ClCompile Include="RouterLiteAdapter.cpp">
       <Filter>來源檔案</Filter>
     </ClCompile>
+    <ClCompile Include="RouterLiteEngine.cpp">
+      <Filter>來源檔案</Filter>
+    </ClCompile>
+    <ClCompile Include="RouterX\RxCandidate.cpp"><Filter>來源檔案</Filter></ClCompile>
+    <ClCompile Include="RouterX\RxCandidateFactoryLite.cpp"><Filter>來源檔案</Filter></ClCompile>
+    <ClCompile Include="RouterX\RxDelta.cpp"><Filter>來源檔案</Filter></ClCompile>
+    <ClCompile Include="RouterX\RxEmit.cpp"><Filter>來源檔案</Filter></ClCompile>
+    <ClCompile Include="RouterX\RxGraph.cpp"><Filter>來源檔案</Filter></ClCompile>
+    <ClCompile Include="RouterX\RxPairOrder.cpp"><Filter>來源檔案</Filter></ClCompile>
+    <ClCompile Include="RouterX\RxResource.cpp"><Filter>來源檔案</Filter></ClCompile>
+    <ClCompile Include="RouterX\RxResourceLedgerLite.cpp"><Filter>來源檔案</Filter></ClCompile>
+    <ClCompile Include="RouterX\RxRouteLedger.cpp"><Filter>來源檔案</Filter></ClCompile>
+    <ClCompile Include="RouterX\RxScore.cpp"><Filter>來源檔案</Filter></ClCompile>
+    <ClCompile Include="RouterX\RxSearch.cpp"><Filter>來源檔案</Filter></ClCompile>
     <ClCompile Include="Utility.cpp">
       <Filter>來源檔案</Filter>
     </ClCompile>
@@ -71,6 +85,18 @@
     <ClInclude Include="Router.hpp">
       <Filter>標頭檔</Filter>
     </ClInclude>
+    <ClInclude Include="RouterLiteEngine.hpp"><Filter>標頭檔</Filter></ClInclude>
+    <ClInclude Include="RouterX\RxCandidate.hpp"><Filter>標頭檔</Filter></ClInclude>
+    <ClInclude Include="RouterX\RxCandidateFactoryLite.hpp"><Filter>標頭檔</Filter></ClInclude>
+    <ClInclude Include="RouterX\RxDelta.hpp"><Filter>標頭檔</Filter></ClInclude>
+    <ClInclude Include="RouterX\RxEmit.hpp"><Filter>標頭檔</Filter></ClInclude>
+    <ClInclude Include="RouterX\RxGraph.hpp"><Filter>標頭檔</Filter></ClInclude>
+    <ClInclude Include="RouterX\RxPairOrder.hpp"><Filter>標頭檔</Filter></ClInclude>
+    <ClInclude Include="RouterX\RxResource.hpp"><Filter>標頭檔</Filter></ClInclude>
+    <ClInclude Include="RouterX\RxResourceLedgerLite.hpp"><Filter>標頭檔</Filter></ClInclude>
+    <ClInclude Include="RouterX\RxRouteLedger.hpp"><Filter>標頭檔</Filter></ClInclude>
+    <ClInclude Include="RouterX\RxScore.hpp"><Filter>標頭檔</Filter></ClInclude>
+    <ClInclude Include="RouterX\RxSearch.hpp"><Filter>標頭檔</Filter></ClInclude>
     <ClInclude Include="Utility.hpp">
       <Filter>標頭檔</Filter>
     </ClInclude>

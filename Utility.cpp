@@ -122,6 +122,19 @@ int edgeOpposite(int e) {
     return 0;
 }
 
+bool isPortEdgeAllowed(const BlockInst& block, int edge,
+                       double outlineW, double outlineH, double eps) {
+    (void)outlineW;
+    (void)outlineH;
+    (void)eps;
+
+    if (edge < 1 || edge > 4) return false;
+    if (block.spec.type == BlockType::SOFT) return true;
+    if (block.spec.portEdges.empty()) return true;
+    return find(block.spec.portEdges.begin(), block.spec.portEdges.end(), edge) !=
+        block.spec.portEdges.end();
+}
+
 double feedthroughRateForNets(const BlockSpec& spec, double ftNets) {
     if (ftNets <= 3000.0) return spec.ftRate[0];
     if (ftNets <= 6000.0) return spec.ftRate[1];
@@ -133,8 +146,10 @@ double requiredSoftAreaWithFeedthrough(const BlockInst& b, double ftNets) {
     const double baseArea = max(1.0, b.spec.area);
     if (b.spec.type != BlockType::SOFT || ftNets <= EPS) return baseArea;
 
-    const double rate = feedthroughRateForNets(b.spec, ftNets);
-    const double delta = (ftNets / CHANNEL_DENSITY) * rate / 2.0;
+    // The checker counts both the entry and exit crossing of a feedthrough.
+    const double crossingNets = 2.0 * ftNets;
+    const double rate = feedthroughRateForNets(b.spec, crossingNets);
+    const double delta = (crossingNets / CHANNEL_DENSITY) * rate / 2.0;
     const double side = sqrt(baseArea) + delta;
     return max(baseArea, side * side);
 }

@@ -70,6 +70,16 @@ struct Channel {
     std::string name;
     Rect rect;
 
+    // Directional whole-channel capacity/usage.  LR capacity is based on the
+    // channel height; TB capacity is based on its width (25 nets/um).
+    double lrUsed = 0.0;
+    double tbUsed = 0.0;
+    double lrCapacity = 0.0;
+    double tbCapacity = 0.0;
+    double lrOverflow = 0.0;
+    double tbOverflow = 0.0;
+
+    // Legacy aggregate fields are retained for Evaluator/Logger compatibility.
     double usedNets = 0.0;
     double capacity = 0.0;
     double overflow = 0.0;
@@ -104,6 +114,16 @@ struct Design {
 
     double outlineW = 0.0;
     double outlineH = 0.0;
+
+    // Optional routing core retained when the declared output outline is
+    // expanded to create a legal four-side perimeter halo.  These coordinates
+    // are runtime-only metadata (the CFG still declares just the final outline):
+    // a perimeter candidate must visit a channel extending beyond this core.
+    bool hasRoutingCore = false;
+    double routingCoreX = 0.0;
+    double routingCoreY = 0.0;
+    double routingCoreW = 0.0;
+    double routingCoreH = 0.0;
 
     std::vector<BlockSpec> blockSpecs;
     std::vector<BlockInst> blocks;

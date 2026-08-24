@@ -1,5 +1,6 @@
 #include "Evaluator.hpp"
 #include "Utility.hpp"
+#include "RouterX/RxScore.hpp"
 
 #include <algorithm>
 #include <cmath>
@@ -436,15 +437,36 @@ namespace {
         const vector<string> locs = splitLocTokens(b.spec.locations);
         if (locs.empty()) return 0.0;
 
-        double best = numeric_limits<double>::infinity();
+        // Multiple zones on the same outline side are alternatives; different
+        // sides (for example RB/BR) are simultaneous corner requirements.
+        unordered_map<char, double> bestBySide;
         for (const string& loc : locs) {
             char side = 0;
             int zone = -1;
             if (!decodeLocationToken(loc, side, zone)) continue;
-            best = min(best, edgeLocationOffsetToTarget(b.rect, side, zone, W, H));
+            const double offset = edgeLocationOffsetToTarget(b.rect, side, zone, W, H);
+            auto it = bestBySide.find(side);
+            if (it == bestBySide.end()) bestBySide.emplace(side, offset);
+            else it->second = min(it->second, offset);
         }
-        if (!isfinite(best)) return 0.0;
-        return best > CHECKER_GEOM_EPS ? best : 0.0;
+        double total = 0.0;
+        if (bestBySide.size() == 2) {
+            // The reference checker reports corner displacement as the
+            // difference between the two adjacent-side offsets. This exactly
+            // reproduces RB/BR=(0,8)->8, BR/RB=(0,32)->32 and
+            // RT/TR=(6,6)->0 from the supplied official reports.
+            auto it = bestBySide.begin();
+            const double a = it->second;
+            const double b = (++it)->second;
+            total = fabs(a - b);
+        }
+        else {
+            for (const auto& kv : bestBySide) {
+                if (kv.second > CHECKER_GEOM_EPS) total += kv.second;
+            }
+        }
+        if (total <= CHECKER_GEOM_EPS) total = 0.0;
+        return total;
     }
 
     static bool edgeBlockLocationOK(const BlockInst& b, double W, double H) {
@@ -535,8 +557,8 @@ namespace {
 
     static void addChannelDirectionalUse(ChannelUse& use, int inEdge, int outEdge, double nets) {
         if (inEdge == outEdge) {
-            if (inEdge == 1 || inEdge == 3) use.tbNets += nets;
-            else if (inEdge == 2 || inEdge == 4) use.lrNets += nets;
+            if (inEdge == 1 || inEdge == 3) use.lrNets += nets;
+            else if (inEdge == 2 || inEdge == 4) use.tbNets += nets;
             return;
         }
 
@@ -788,12 +810,15 @@ namespace {
                             << " actual=" << actual[i][j] << "\n";
                     }
                 }
-                else if (actual[i][j] > expected[i][j] && printed < MAX_PRINT) {
-                    ++printed;
-                    cerr << "[EvalConnectionCoverage] extra_routed pair="
-                        << design.blocks[i].spec.name << "-" << design.blocks[j].spec.name
-                        << " expected=" << expected[i][j]
-                        << " actual=" << actual[i][j] << "\n";
+                else if (actual[i][j] > expected[i][j]) {
+                    ++issues;
+                    if (printed < MAX_PRINT) {
+                        ++printed;
+                        cerr << "[EvalConnectionCoverage] extra_routed pair="
+                            << design.blocks[i].spec.name << "-" << design.blocks[j].spec.name
+                            << " expected=" << expected[i][j]
+                            << " actual=" << actual[i][j] << "\n";
+                    }
                 }
             }
         }
@@ -1005,6 +1030,12 @@ namespace {
         summary.illegalFeedthroughUsed.assign(design.blocks.size(), 0.0);
 
         for (auto& ch : design.channels) {
+            ch.lrUsed = 0.0;
+            ch.tbUsed = 0.0;
+            ch.lrCapacity = 0.0;
+            ch.tbCapacity = 0.0;
+            ch.lrOverflow = 0.0;
+            ch.tbOverflow = 0.0;
             ch.usedNets = 0.0;
             ch.capacity = 0.0;
             ch.overflow = 0.0;
@@ -1027,6 +1058,13 @@ namespace {
             const double capTB = channelTBCapacity(ch.rect);
             const double ovLR = max(0.0, u.lrNets - capLR);
             const double ovTB = max(0.0, u.tbNets - capTB);
+
+            ch.lrUsed = u.lrNets;
+            ch.tbUsed = u.tbNets;
+            ch.lrCapacity = capLR;
+            ch.tbCapacity = capTB;
+            ch.lrOverflow = ovLR;
+            ch.tbOverflow = ovTB;
 
             // Legacy scalar fields:
             //   usedNets/capacity are set to the dominant-utilization component so
@@ -1078,13 +1116,38 @@ EvalReport Evaluator::evaluate(Design& design, double alpha, double runtimeSec) 
     calcChannelOverflow(design, rpt.totalChannelOverflow, rpt.maxChannelOverflow, rpt.totalChannelCapacity);
     calcFeedthroughOverflow(design, rpt.totalFeedthroughOverflow, rpt.maxFeedthroughOverflow);
 
-    rpt.illegalFeedthroughDeltaArea = routingSummary.illegalFeedthroughDeltaArea;
-    rpt.illegalFeedthroughCount = routingSummary.illegalFeedthroughCount;
+    vector<rxscore::BlockFt> ftBlocks;
+    ftBlocks.reserve(design.blocks.size());
+    for (int i = 0; i < static_cast<int>(design.blocks.size()); ++i) {
+        const BlockInst& b = design.blocks[i];
+        rxscore::BlockFt ft;
+        // The checker uses declared AREA for SOFT blocks, but the emitted
+        // rectangle area for fixed HARD/EDGE blocks (which may differ slightly
+        // within the 3um geometry tolerance).
+        ft.baseArea = b.spec.type == BlockType::SOFT
+            ? max(0.0, b.spec.area)
+            : rectArea(b.rect);
+        ft.kind = b.spec.type == BlockType::SOFT ? rxscore::BlockKind::Soft
+            : (b.spec.type == BlockType::EDGE ? rxscore::BlockKind::Edge : rxscore::BlockKind::Hard);
+        const double rawUsed = b.spec.type == BlockType::SOFT
+            ? b.ftUsed
+            : routingSummary.illegalFeedthroughUsed[i];
+        ft.ftUsedRaw = max<long long>(0, llround(rawUsed));
+        for (int tier = 0; tier < 4; ++tier) ft.ftRate[tier] = b.spec.ftRate[tier];
+        ftBlocks.push_back(ft);
+    }
+    const rxscore::FtResult officialFt = rxscore::feedthroughPenalty(ftBlocks, rpt.outlineArea);
+    rpt.totalFeedthroughOverflow = officialFt.areaExcess;
+    rpt.maxFeedthroughOverflow = officialFt.areaExcess;
+    rpt.illegalFeedthroughDeltaArea = officialFt.illegalDeltaArea;
+    rpt.illegalFeedthroughCount = officialFt.illegalBlocks;
 
     for (const auto& b : design.blocks) {
         const double offset = edgeBlockLocationOffset(b, design.outlineW, design.outlineH);
-        if (offset > 0.0) {
-            rpt.edgeLocationOffset += offset;
+        rpt.edgeLocationOffset += offset;
+        if (b.spec.type == BlockType::EDGE &&
+            !edgeBlockMatchesLocationUnion(
+                b.rect, splitLocTokens(b.spec.locations), design.outlineW, design.outlineH)) {
             ++rpt.edgeLocationViolationCount;
         }
     }
@@ -1161,12 +1224,16 @@ bool Evaluator::checkOutlineViolation(const Design& design, int& violationCount)
 }
 
 bool Evaluator::checkRoutingOpen(const Design& design, int& openPathCount) const {
-    openPathCount = 0;
-    for (const auto& p : design.routes) {
-        if (routeOpen(p)) ++openPathCount;
+    // Coverage catches normal shortages and over-routing. A malformed/open
+    // redundant PATH must still fail even when another valid PATH happens to
+    // satisfy the same pair demand; coverage alone would miss it.
+    openPathCount = countConnectionCoverageIssues(design);
+    int invalidRoutes = 0;
+    for (const auto& route : design.routes) {
+        if (routeOpen(route)) ++invalidRoutes;
     }
-    openPathCount += countConnectionCoverageIssues(design);
-    return openPathCount > 0;
+    if (openPathCount == 0) openPathCount = invalidRoutes;
+    return openPathCount > 0 || invalidRoutes > 0;
 }
 
 void Evaluator::calcChannelOverflow(Design& design, double& totalOverflow, double& maxOverflow, double& totalCapacity) const {

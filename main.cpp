@@ -7,9 +7,11 @@
 #include "OutputWriter.hpp"
 #include "Logger.hpp"
 #include "Utility.hpp"
+#include "RouterX/RxGraph.hpp"
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <chrono>
 #include <cstdlib>
@@ -19,8 +21,11 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <random>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -28,6 +33,7 @@ using namespace std;
 namespace fs = std::filesystem;
 
 static const auto PROGRAM_START_TIME_MAIN = chrono::steady_clock::now();
+static constexpr bool ENABLE_FORCED_SIZE_SHORTCUTS_MAIN = false;
 
 static double programRuntimeSecondsMain() {
     const auto now = chrono::steady_clock::now();
@@ -35,39 +41,37 @@ static double programRuntimeSecondsMain() {
     return elapsed.count();
 }
 
-struct PortfolioEntry {
-    int caseId = -1;
-    const char* tag = "";
-    const char* const* chunks = nullptr;
-    int chunkCount = 0;
-};
-
-#include "PortfolioCache.inc"
-
 static string gLastPortfolioParseError;
 
-static string lowerAsciiCopy(string s) {
-    for (char& c : s) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
-    return s;
-}
-
-static int detectKnownCaseId(const string& inputPath) {
-    const string p = lowerAsciiCopy(inputPath);
-    for (int i = 0; i <= 4; ++i) {
-        const string d = to_string(i);
-        if (p.find("case.case" + d) != string::npos) return i;
-        if (p.find("case" + d + ".csv") != string::npos) return i;
-        if (p.find("case" + d + "_") != string::npos) return i;
-        if (p.find("case" + d + ".") != string::npos) return i;
+// The contest EDGE kind differs from HARD only in its LOCATION displacement
+// penalty. Packing must therefore see EDGE as a movable, fixed-shape HARD
+// obstacle. Restore the official specs before routing/evaluation so PORT EDGE,
+// no-feedthrough legality and the LOCATION penalty still use the input data.
+static vector<BlockSpec> convertEdgeToMovableHardForPackingMain(Design& design) {
+    vector<BlockSpec> official = design.blockSpecs;
+    for (BlockSpec& spec : design.blockSpecs) {
+        if (spec.type == BlockType::EDGE) spec.type = BlockType::HARD;
     }
-    return -1;
+    for (int i = 0; i < static_cast<int>(design.blocks.size()) &&
+                    i < static_cast<int>(official.size()); ++i) {
+        if (official[i].type == BlockType::EDGE)
+            design.blocks[i].spec.type = BlockType::HARD;
+    }
+    return official;
 }
 
-static double checkerDefaultAlphaForCaseId(int caseId) {
-    if (caseId == 0) return 0.3;
-    if (caseId == 1) return 0.15;
-    if (caseId >= 2 && caseId <= 4) return 0.1;
-    return numeric_limits<double>::quiet_NaN();
+static bool restoreOfficialBlockSpecsMain(
+    Design& design, const vector<BlockSpec>& official) {
+    if (design.blockSpecs.size() != official.size()) return false;
+    if (!design.blocks.empty() && design.blocks.size() != official.size())
+        return false;
+    design.blockSpecs = official;
+    design.blockNameToIndex.clear();
+    for (int i = 0; i < static_cast<int>(design.blocks.size()); ++i) {
+        design.blocks[i].spec = official[i];
+        design.blockNameToIndex[official[i].name] = i;
+    }
+    return true;
 }
 
 static bool parsePortfolioCfg(const char* cfgText, const Design& base, Design& out) {
@@ -148,223 +152,39 @@ static bool parsePortfolioCfg(const char* cfgText, const Design& base, Design& o
 }
 
 
-static bool makeAggressiveClusterSeedsMain(const string& inputPath, const Design& base, vector<Design>& out, vector<string>& origins) {
-    const int caseId = detectKnownCaseId(inputPath);
-    string tag;
-    const char* cfg = nullptr;
-
-    if (caseId == 0) {
-        tag = "case0-known-fast-seed";
-        cfg = R"CFG(Outline 2145 1908
-
-BLOCK
-BLOCK BLK01 0 1065 419.5 843
-BLOCK BLK02 567 962 907.041949 454.280974
-BLOCK BLK03 512 0 959 960
-BLOCK BLK04 1480 0 665 600
-BLOCK BLK05 567 1417 906.660569 475.812329
-BLOCK BLK06 1476 620 592 1198
-BLOCK BLK07 0 322 511.477027 729.280492
-END BLOCK
-
-PATH
-PATH 1 BLK01 1 BLK02 3
-END PATH
-)CFG";
-    }
-    else if (caseId == 1) {
-        tag = "case1-known-fast-seed";
-        cfg = R"CFG(Outline 3480 1881
-
-BLOCK
-BLOCK BLK01 2581 1275 705 501
-BLOCK BLK02 2581 800 509 475
-BLOCK BLK03 1723 800 858 475
-BLOCK BLK04 846 0 932 442
-BLOCK BLK05 1778 325 691 475
-BLOCK BLK06 3090 800 390 475
-BLOCK BLK07 1001 800 722 475
-BLOCK BLK08 0 800 1001 475
-BLOCK BLK09 846 442 212 358
-BLOCK BLK10 1058 442 700 358
-BLOCK BLK11 0 0 334 800
-BLOCK BLK12 0 1275 1400 498
-BLOCK BLK13 334 0 512 800
-BLOCK BLK14 1400 1275 1130 606
-END BLOCK
-
-PATH
-PATH 1 BLK01 1 BLK02 3
-END PATH
-)CFG";
-    }
-    else if (caseId == 2) {
-        tag = "case2-known-fast-seed";
-        cfg = R"CFG(Outline 4691 5607
-
-BLOCK
-BLOCK BLK01 452 3890 1335.08099 1699.807771
-BLOCK BLK02 357 0 957.60618 1073.991162
-BLOCK BLK03 3204 1745 1384.597152 2106.181743
-BLOCK BLK04 300 1131 2899.50545 1494.460967
-BLOCK BLK05 1792 3903 2587.523263 1314.024147
-BLOCK BLK06 3204 0 1030.02954 1740.44153
-BLOCK BLK07 1315 155 1881.582191 969.803709
-BLOCK BLK08 100 2632 2878.611688 1252.275515
-BLOCK BLK09 0 4302 300 1305
-BLOCK BLK10 4391 4302 300 1305
-BLOCK BLK11 0 0 300 1305
-BLOCK BLK12 4391 0 300 1305
-BLOCK BLK13 0 2403 100 800
-BLOCK BLK14 1945 0 800 100
-BLOCK BLK15 4591 2653 100 300
-BLOCK BLK16 2125 5507 440 100
-END BLOCK
-
-PATH
-PATH 1 BLK01 1 BLK02 3
-END PATH
-)CFG";
-    }
-    else if (caseId == 3) {
-        tag = "case3-ftaware-right-cluster-v5";
-        cfg = R"CFG(Outline 5806 2850
-
-BLOCK
-BLOCK BLK01 0 2320 1004 530
-BLOCK BLK02 4235 0 1571 755
-BLOCK BLK03 530 254 1367 2066
-BLOCK BLK04 1917 0 2312 1066
-BLOCK BLK05 1004 2690 3851 160
-BLOCK BLK06 5466 2522 340 328
-BLOCK BLK07 5651 755 155 1414
-BLOCK BLK08 1004 2320 215 370
-BLOCK BLK09 2657 1066 1236 623
-BLOCK BLK10 1897 1066 760 395
-BLOCK BLK11 1917 1689 1750 532
-BLOCK BLK12 3667 1689 960 779
-BLOCK BLK13 5239 1157 412 1002
-BLOCK BLK14 4627 755 612 1350
-BLOCK BLK15 1897 2221 1111 469
-END BLOCK
-
-PATH
-PATH 1 BLK01 1 BLK02 3
-END PATH
-)CFG";
-    }
-    else if (caseId == 4) {
-        tag = "case4-topright-compress-v2";
-        cfg = R"CFG(Outline 5095 4954
-
-BLOCK
-BLOCK BLK01 2387 1735 963.224049 242.218501
-BLOCK BLK02 2681 0 2295 600.781067
-BLOCK BLK03 3629 601 1129 1593
-BLOCK BLK04 1353 988 1015 1109
-BLOCK BLK05 684 601 552 632
-BLOCK BLK06 2372 988 731 747
-BLOCK BLK07 1801 475 875.381372 220.728028
-BLOCK BLK08 689 0 1678.917081 474.29851
-BLOCK BLK09 0 0 588 2404
-BLOCK BLK10 4811 3207 284 1747
-BLOCK BLK11 4976 0 119 2493
-BLOCK BLK12 0 4283 1181 671
-BLOCK BLK13 1184 4417 542 537
-BLOCK BLK14 1949 4509 1340 445
-BLOCK BLK15 0 3199 159 495
-BLOCK BLK16 4483 2629 612 578
-BLOCK BLK17 689 1429 645 641
-BLOCK BLK18 2677 601 951.441736 386.498249
-BLOCK BLK19 2014 2198 372.044084 1313.916746
-BLOCK BLK20 3087 1978 537.072757 1429.017878
-BLOCK BLK21 684 2262 1330 1243
-BLOCK BLK22 1731 4140 1301.74022 368.596221
-BLOCK BLK23 3625 3406 406.146977 1498.991338
-BLOCK BLK24 2387 3512 280.344421 627.785308
-END BLOCK
-
-PATH
-PATH 1 BLK01 1 BLK02 3
-END PATH
-)CFG";
-    }
-
-
-    if (!cfg) return false;
-
-    Design cfgBase = base;
-    cfgBase.blocks.clear();
-    cfgBase.blocks.reserve(cfgBase.blockSpecs.size());
-    for (const BlockSpec& spec : cfgBase.blockSpecs) {
-        BlockInst b;
-        b.spec = spec;
-        cfgBase.blocks.push_back(b);
-    }
-
-    Design seed;
-    if (!parsePortfolioCfg(cfg, cfgBase, seed)) {
-        cerr << "[AggressiveClusterSeed] reject tag=" << tag
-            << " reason=parse_failed detail=" << gLastPortfolioParseError << "\n";
-        return false;
-    }
-    seed.channels.clear();
-    seed.routes.clear();
-    out.push_back(std::move(seed));
-    origins.push_back(tag);
-    cerr << "[AggressiveClusterSeed] add tag=" << tag << "\n";
-    return true;
-}
-
-static bool applyKnownPortfolioIfBetter(const string& inputPath, const Design& baseDesign, Evaluator& evaluator, double alpha, EvalReport& bestRpt, Design& bestDesign) {
-    const int caseId = detectKnownCaseId(inputPath);
-    if (caseId < 0) return false;
-
-    bool changed = false;
-    for (const PortfolioEntry& entry : kPortfolioEntries) {
-        if (entry.caseId != caseId) continue;
-        Design candidate;
-        string cfgText;
-        for (int ci = 0; ci < entry.chunkCount; ++ci) cfgText += entry.chunks[ci];
-        if (!parsePortfolioCfg(cfgText.c_str(), baseDesign, candidate)) {
-            cerr << "[Portfolio] reject tag=" << entry.tag << " reason=parse_failed detail=" << gLastPortfolioParseError << "\n";
-            continue;
-        }
-        EvalReport rpt = evaluator.evaluate(candidate, alpha);
-        const bool legalNoPenalty = !rpt.hasFail() && !rpt.hasPenalty();
-        const bool currentLegalNoPenalty = !bestRpt.hasFail() && !bestRpt.hasPenalty();
-        const bool better = legalNoPenalty && (!currentLegalNoPenalty || rpt.cost + 1.0 < bestRpt.cost);
-        cerr << fixed << setprecision(3)
-            << "[Portfolio] tag=" << entry.tag
-            << " status=" << (legalNoPenalty ? "LEGAL" : "REJECT")
-            << " open=" << rpt.openPathCount
-            << " chOv=" << rpt.totalChannelOverflow
-            << " ftOv=" << rpt.totalFeedthroughOverflow
-            << " fmtFail=" << (rpt.formatFailed ? "Y" : "N")
-            << " overlap=" << (rpt.blockOverlap ? "Y" : "N")
-            << " outlineFail=" << (rpt.outlineViolation ? "Y" : "N")
-            << " cost=" << rpt.cost
-            << " current=" << bestRpt.cost
-            << " accept=" << (better ? "Y" : "N") << "\n";
-        if (better) {
-            bestDesign = std::move(candidate);
-            bestRpt = rpt;
-            changed = true;
-        }
-    }
-    return changed;
-}
-
 struct Options {
+    struct CfgBlockOverride {
+        string name;
+        double x = 0.0;
+        double y = 0.0;
+        double w = 0.0;
+        double h = 0.0;
+    };
     string inputPath;
     string outputPath;
     bool outputPathProvided = false;
     string evalCfgPath;
     bool evalCfgProvided = false;
+    string scanCfgRoot;
+    bool scanCfgRootProvided = false;
+    string scanSort = "cost";
     string routeCfgBlocksPath;
     bool routeCfgBlocksProvided = false;
+    bool preserveCfgGeometry = false;
+    bool skipCfgPerimeter = false;
+    double spreadCfgX = 1.0;
+    double spreadCfgY = 1.0;
+    double padCfgX = 0.0;
+    double padCfgY = 0.0;
+    vector<CfgBlockOverride> cfgBlockOverrides;
+    int jiggleCfgIterations = 0;
     double alpha = 1.0;
     bool alphaOverride = false;
+    double targetAreaMax = numeric_limits<double>::infinity();
+    double targetWireLengthMax = numeric_limits<double>::infinity();
+    bool qualityTargetProvided = false;
+    double timeLimitSeconds = 840.0;
+    unsigned randomSeed = 7u;
 };
 
 static void printUsage() {
@@ -372,7 +192,7 @@ static void printUsage() {
     cerr << "  ./EarlyFloorplanning_with_GlobalRoute input.csv\n";
     cerr << "\n";
     cerr << "Output defaults to the input filename with .cfg extension.\n";
-    cerr << "Local debug options are still accepted: -o output.cfg --alpha <value> --eval-cfg candidate.cfg --route-cfg-blocks candidate.cfg\n";
+    cerr << "Local debug options are still accepted: -o output.cfg --alpha <value> --target-area-max <value> --target-wirelength-max <value> --time-limit <seconds> --seed <integer> --eval-cfg candidate.cfg --scan-cfg-root directory --route-cfg-blocks candidate.cfg [--preserve-cfg-geometry] [--spread-cfg-x <factor>] [--spread-cfg-y <factor>] [--set-cfg-block NAME X Y W H] [--jiggle-cfg-placement <iterations>] [--skip-cfg-perimeter]\n";
 }
 
 static Options parseArgs(int argc, char** argv) {
@@ -388,7 +208,7 @@ static Options parseArgs(int argc, char** argv) {
     for (int i = 2; i < argc; ++i) {
         string arg = argv[i];
 
-        // §‰¥© -o / --o / --output
+        // ÊîØÊè¥ -o / --o / --output
         if ((arg == "-o" || arg == "--o" || arg == "--output") && i + 1 < argc) {
             opt.outputPath = argv[++i];
             opt.outputPathProvided = true;
@@ -397,13 +217,64 @@ static Options parseArgs(int argc, char** argv) {
             opt.alpha = stod(argv[++i]);
             opt.alphaOverride = true;
         }
+        else if (arg == "--target-area-max" && i + 1 < argc) {
+            opt.targetAreaMax = stod(argv[++i]);
+            opt.qualityTargetProvided = true;
+        }
+        else if (arg == "--target-wirelength-max" && i + 1 < argc) {
+            opt.targetWireLengthMax = stod(argv[++i]);
+            opt.qualityTargetProvided = true;
+        }
+        else if (arg == "--time-limit" && i + 1 < argc) {
+            opt.timeLimitSeconds = max(0.25, stod(argv[++i]));
+        }
+        else if (arg == "--seed" && i + 1 < argc) {
+            opt.randomSeed = static_cast<unsigned>(stoul(argv[++i]));
+        }
         else if (arg == "--eval-cfg" && i + 1 < argc) {
             opt.evalCfgPath = argv[++i];
             opt.evalCfgProvided = true;
         }
+        else if (arg == "--scan-cfg-root" && i + 1 < argc) {
+            opt.scanCfgRoot = argv[++i];
+            opt.scanCfgRootProvided = true;
+        }
+        else if (arg == "--scan-sort" && i + 1 < argc) {
+            opt.scanSort = argv[++i];
+        }
         else if (arg == "--route-cfg-blocks" && i + 1 < argc) {
             opt.routeCfgBlocksPath = argv[++i];
             opt.routeCfgBlocksProvided = true;
+        }
+        else if (arg == "--preserve-cfg-geometry") {
+            opt.preserveCfgGeometry = true;
+        }
+        else if (arg == "--spread-cfg-x" && i + 1 < argc) {
+            opt.spreadCfgX = max(1.0, stod(argv[++i]));
+        }
+        else if (arg == "--spread-cfg-y" && i + 1 < argc) {
+            opt.spreadCfgY = max(1.0, stod(argv[++i]));
+        }
+        else if (arg == "--pad-cfg-x" && i + 1 < argc) {
+            opt.padCfgX = max(0.0, stod(argv[++i]));
+        }
+        else if (arg == "--pad-cfg-y" && i + 1 < argc) {
+            opt.padCfgY = max(0.0, stod(argv[++i]));
+        }
+        else if (arg == "--skip-cfg-perimeter") {
+            opt.skipCfgPerimeter = true;
+        }
+        else if (arg == "--set-cfg-block" && i + 5 < argc) {
+            Options::CfgBlockOverride blockOverride;
+            blockOverride.name = argv[++i];
+            blockOverride.x = stod(argv[++i]);
+            blockOverride.y = stod(argv[++i]);
+            blockOverride.w = stod(argv[++i]);
+            blockOverride.h = stod(argv[++i]);
+            opt.cfgBlockOverrides.push_back(blockOverride);
+        }
+        else if (arg == "--jiggle-cfg-placement" && i + 1 < argc) {
+            opt.jiggleCfgIterations = max(0, stoi(argv[++i]));
         }
         else if (arg == "-h" || arg == "--help") {
             printUsage();
@@ -448,8 +319,8 @@ static tm getLocalTimeNow() {
     return localTm;
 }
 
-// ≤£•Õ¿…¶W°G07blk05240238.cfg
-// ÆÊ¶°°G<®‚¶Ïº∆blockº∆>blk<§Î§ÈÆ…§¿>.cfg
+// Áî¢ÁîüÊ™îÂêçÔºö07blk05240238.cfg
+// Ê†ºÂºèÔºö<ÂÖ©‰ΩçÊï∏blockÊï∏>blk<ÊúàÊó•ÊôÇÂàÜ>.cfg
 static string makeAutoCfgFileName(size_t blockCount) {
     tm localTm = getLocalTimeNow();
 
@@ -466,11 +337,11 @@ static string makeAutoCfgFileName(size_t blockCount) {
     return oss.str();
 }
 
-// ¶p™G -o µπ™∫¨O∏ÍÆ∆ß®°A®“¶p C:\problemE\problemE\result
-// ¥N¶€∞ ≈‹¶® C:\problemE\problemE\result\07blk05240238.cfg
+// Â¶ÇÊûú -o Áµ¶ÁöÑÊòØË≥áÊñôÂ§æÔºå‰æãÂ¶Ç C:\problemE\problemE\result
+// Â∞±Ëá™ÂãïËÆäÊàê C:\problemE\problemE\result\07blk05240238.cfg
 //
-// ¶p™G -o µπ™∫¨Oßπæ„¿…¶W°A®“¶p C:\problemE\problemE\result\my.cfg
-// ¥N∑”≠Ï•ª¿…¶WøÈ•X°C
+// Â¶ÇÊûú -o Áµ¶ÁöÑÊòØÂÆåÊï¥Ê™îÂêçÔºå‰æãÂ¶Ç C:\problemE\problemE\result\my.cfg
+// Â∞±ÁÖßÂéüÊú¨Ê™îÂêçËº∏Âá∫„ÄÇ
 static string resolveOutputPath(const string& rawOutputPath, size_t blockCount) {
     fs::path p(rawOutputPath);
 
@@ -480,7 +351,7 @@ static string resolveOutputPath(const string& rawOutputPath, size_t blockCount) 
         outputIsDirectory = true;
     }
     else if (!endsWithCfg(p.string())) {
-        // ®S¶≥ .cfg ∞∆¿…¶W°A¥Nß‚•¶∑Ì∏ÍÆ∆ß®°C
+        // Ê≤íÊúâ .cfg ÂâØÊ™îÂêçÔºåÂ∞±ÊääÂÆÉÁï∂Ë≥áÊñôÂ§æ„ÄÇ
         outputIsDirectory = true;
     }
 
@@ -518,13 +389,16 @@ static bool overlapsAnyOtherBlockMain(const vector<BlockInst>& blocks, int id, c
 }
 
 static int ftResizeIterationLimit(const Design& design) {
-    const int n = static_cast<int>(design.blockSpecs.size());
-    if (n >= 45) return 0;
-    if (n >= 20) return 1;
-    return 3;
+    (void)design;
+    // SOFT blocks keep their declared floorplan area.  Do not enlarge them in
+    // response to routed feedthrough demand; any excess remains an FT penalty.
+    return 0;
 }
 
 static bool resizeSoftBlocksForActualFeedthrough(Design& design) {
+    (void)design;
+    return false;
+#if 0
     bool changed = false;
 
     struct ResizeNeed {
@@ -618,6 +492,7 @@ static bool resizeSoftBlocksForActualFeedthrough(Design& design) {
     }
 
     return changed;
+#endif
 }
 static bool makeFeedthroughReFloorplanCandidates(const Design& routed, vector<Design>& out, int maxCandidates, bool allowRoutingOnly) {
     if (maxCandidates <= 0) return false;
@@ -642,32 +517,20 @@ static bool makeFeedthroughReFloorplanCandidates(const Design& routed, vector<De
     fpInput.channels.clear();
     fpInput.routes.clear();
 
-    bool changed = false;
-    int inflatedBlocks = 0;
-    double addedArea = 0.0;
-    const int n = min(static_cast<int>(fpInput.blockSpecs.size()), static_cast<int>(routed.blocks.size()));
-    for (int i = 0; i < n; ++i) {
-        const BlockInst& b = routed.blocks[i];
-        if (b.spec.type != BlockType::SOFT || b.ftUsed <= EPS) continue;
-
-        const double requiredArea = requiredSoftAreaWithFTMain(b);
-        const double currentPlacedArea = max(0.0, b.rect.w * b.rect.h);
-        if (requiredArea <= currentPlacedArea + 1.0e-3) continue;
-        const double currentSpecArea = max(fpInput.blockSpecs[i].floorplanAreaOverride, fpInput.blockSpecs[i].area);
-
-        const double newArea = max(requiredArea * 1.01, currentSpecArea);
-        fpInput.blockSpecs[i].floorplanAreaOverride = newArea;
-        if (i < static_cast<int>(fpInput.blocks.size())) fpInput.blocks[i].spec.floorplanAreaOverride = newArea;
-        addedArea += newArea - currentSpecArea;
-        ++inflatedBlocks;
-        changed = true;
-    }
-
-    if (!changed && (!hasRoutingPressure || !allowRoutingOnly)) return false;
+    // Deliberately do not raise floorplanAreaOverride for SOFT blocks.  This
+    // routine may still produce a routing-feedback placement when requested,
+    // but it cannot inflate the declared block geometry.
+    constexpr int inflatedBlocks = 0;
+    constexpr double addedArea = 0.0;
+    if (!hasRoutingPressure || !allowRoutingOnly) return false;
 
     Floorplanner fp;
     fp.setEdgePlacementMode(0);
-    fp.setRoutingFeedback(routed);
+    Design routingFeedback = routed;
+    convertEdgeToMovableHardForPackingMain(routingFeedback);
+    fp.setRoutingFeedback(routingFeedback);
+    const vector<BlockSpec> officialSpecs =
+        convertEdgeToMovableHardForPackingMain(fpInput);
     fp.run(fpInput);
 
     auto addCandidate = [&](Design cand) {
@@ -691,10 +554,13 @@ static bool makeFeedthroughReFloorplanCandidates(const Design& routed, vector<De
         out.push_back(std::move(cand));
         };
 
-    addCandidate(fpInput);
+    if (restoreOfficialBlockSpecsMain(fpInput, officialSpecs))
+        addCandidate(fpInput);
     const vector<Design>& archived = fp.archivedCandidates();
     for (int i = 0; i < static_cast<int>(archived.size()) && static_cast<int>(out.size()) < maxCandidates; ++i) {
-        addCandidate(archived[i]);
+        Design candidate = archived[i];
+        if (restoreOfficialBlockSpecsMain(candidate, officialSpecs))
+            addCandidate(std::move(candidate));
     }
 
     cerr << fixed << setprecision(3)
@@ -706,7 +572,10 @@ static bool makeFeedthroughReFloorplanCandidates(const Design& routed, vector<De
     return static_cast<int>(out.size()) > 0;
 }
 static bool blockMovableForHotRepair(const BlockSpec& spec) {
-    return spec.type != BlockType::EDGE;
+    (void)spec;
+    // HARD, EDGE and SOFT blocks are all movable placement objects. Their
+    // shape/feedthrough rules differ, but LOCATION never makes EDGE immovable.
+    return true;
 }
 
 static bool placementLegalAfterMove(const Design& design, const vector<BlockInst>& blocks) {
@@ -910,12 +779,257 @@ static bool nudgeEdgeBlocksIntoLocationSegmentsMain(Design& design) {
     }
     return true;
 }
+
+static bool geometryIsIntegerMain(const Design& design) {
+    auto isInteger = [](double v) {
+        return isfinite(v) && fabs(v - static_cast<double>(llround(v))) <= 1.0e-7;
+    };
+    if (!isInteger(design.outlineW) || !isInteger(design.outlineH)) return false;
+    for (const BlockInst& b : design.blocks) {
+        if (!isInteger(b.rect.x) || !isInteger(b.rect.y) ||
+            !isInteger(b.rect.w) || !isInteger(b.rect.h)) return false;
+    }
+    return true;
+}
+
+static vector<char> requiredEdgeSidesMain(const BlockSpec& spec) {
+    vector<char> sides;
+    for (char side : { 'L', 'R', 'B', 'T' }) {
+        if (edgeLocationRequiresSideMain(spec, side)) sides.push_back(side);
+    }
+    return sides;
+}
+
+static bool edgeRectMatchesLocationsMain(
+    const BlockSpec& spec, const Rect& r, double W, double H) {
+    if (spec.type != BlockType::EDGE) return true;
+    const vector<char> sides = requiredEdgeSidesMain(spec);
+    if (sides.empty()) return true;
+    for (char side : sides) {
+        const bool touches = side == 'L' ? fabs(r.x) <= 1.0e-7
+            : side == 'R' ? fabs(rectRight(r) - W) <= 1.0e-7
+            : side == 'B' ? fabs(r.y) <= 1.0e-7
+            : fabs(rectTop(r) - H) <= 1.0e-7;
+        if (!touches) return false;
+        const bool horizontal = side == 'T' || side == 'B';
+        const double extent = horizontal ? W : H;
+        const double lo = horizontal ? r.x : r.y;
+        const double hi = horizontal ? rectRight(r) : rectTop(r);
+        if (!intervalOverlapsAnyMain(
+                lo, hi, edgeLocationIntervalsForSideMain(spec, side, extent))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool repairEdgeEdgeOverlapsMain(Design& design) {
+    vector<int> edgeIds;
+    for (int i = 0; i < static_cast<int>(design.blocks.size()); ++i) {
+        if (design.blocks[i].spec.type == BlockType::EDGE) edgeIds.push_back(i);
+    }
+
+    auto overlapsOtherEdge = [&](int id, const Rect& cand) {
+        for (int other : edgeIds) {
+            if (other == id) continue;
+            if (rectOverlapAreaPositive(cand, design.blocks[other].rect)) return true;
+        }
+        return false;
+    };
+
+    auto trySlide = [&](int id) {
+        const vector<char> sides = requiredEdgeSidesMain(design.blocks[id].spec);
+        if (sides.size() != 1) return false; // A true corner block is fixed.
+        const char side = sides.front();
+        const bool horizontal = side == 'T' || side == 'B';
+        const double extent = horizontal ? design.outlineW : design.outlineH;
+        const double len = horizontal ? design.blocks[id].rect.w : design.blocks[id].rect.h;
+        const double current = horizontal ? design.blocks[id].rect.x : design.blocks[id].rect.y;
+        vector<double> candidates = { current, 0.0, max(0.0, extent - len) };
+        for (const auto& seg : edgeLocationIntervalsForSideMain(
+                 design.blocks[id].spec, side, extent)) {
+            candidates.push_back(seg.first);
+            candidates.push_back(seg.second - len);
+            candidates.push_back(0.5 * (seg.first + seg.second - len));
+        }
+        for (int other : edgeIds) {
+            if (other == id) continue;
+            const Rect& o = design.blocks[other].rect;
+            if (horizontal) {
+                candidates.push_back(o.x - len);
+                candidates.push_back(rectRight(o));
+            }
+            else {
+                candidates.push_back(o.y - len);
+                candidates.push_back(rectTop(o));
+            }
+        }
+
+        Rect best;
+        double bestMove = numeric_limits<double>::infinity();
+        bool found = false;
+        for (double pos : candidates) {
+            pos = static_cast<double>(llround(max(0.0, min(pos, extent - len))));
+            Rect cand = design.blocks[id].rect;
+            if (side == 'T') { cand.x = pos; cand.y = design.outlineH - cand.h; }
+            else if (side == 'B') { cand.x = pos; cand.y = 0.0; }
+            else if (side == 'L') { cand.x = 0.0; cand.y = pos; }
+            else { cand.x = design.outlineW - cand.w; cand.y = pos; }
+            if (!rectInsideOutlineMain(cand, design.outlineW, design.outlineH)) continue;
+            if (!edgeRectMatchesLocationsMain(
+                    design.blocks[id].spec, cand, design.outlineW, design.outlineH)) continue;
+            if (overlapsOtherEdge(id, cand)) continue;
+            const double move = fabs(pos - current);
+            if (!found || move < bestMove) {
+                best = cand;
+                bestMove = move;
+                found = true;
+            }
+        }
+        if (!found) return false;
+        design.blocks[id].rect = best;
+        return true;
+    };
+
+    for (int pass = 0; pass < 64; ++pass) {
+        bool foundOverlap = false;
+        bool repaired = false;
+        for (int ai = 0; ai < static_cast<int>(edgeIds.size()) && !repaired; ++ai) {
+            for (int bi = ai + 1; bi < static_cast<int>(edgeIds.size()) && !repaired; ++bi) {
+                const int a = edgeIds[ai];
+                const int b = edgeIds[bi];
+                if (!rectOverlapAreaPositive(
+                        design.blocks[a].rect, design.blocks[b].rect)) continue;
+                foundOverlap = true;
+                const size_t as = requiredEdgeSidesMain(design.blocks[a].spec).size();
+                const size_t bs = requiredEdgeSidesMain(design.blocks[b].spec).size();
+                if ((as <= bs && trySlide(a)) || trySlide(b) || trySlide(a)) {
+                    repaired = true;
+                }
+            }
+        }
+        if (!foundOverlap) return true;
+        if (!repaired) return false;
+    }
+    return false;
+}
+
+static bool makeFourSidePerimeterCandidatesMain(
+    const Design& design, vector<Design>& out, int maxCandidates) {
+    if (maxCandidates <= 0 || design.blocks.empty()) return false;
+    const double spareW = design.maxOutlineW - design.outlineW;
+    const double spareH = design.maxOutlineH - design.outlineH;
+    if (spareW < 2.0 - EPS || spareH < 2.0 - EPS) return false;
+
+    const double oldW = design.outlineW;
+    const double oldH = design.outlineH;
+    const double scale = max(1.0, min(oldW, oldH));
+    const vector<double> requested = {
+        max(8.0, 0.010 * scale),
+        max(24.0, 0.025 * scale),
+        max(64.0, 0.050 * scale)
+    };
+
+    for (double requestedHalo : requested) {
+        if (static_cast<int>(out.size()) >= maxCandidates) break;
+        const double haloX = floorToIntegerGridMain(
+            min(requestedHalo, 0.5 * spareW));
+        const double haloY = floorToIntegerGridMain(
+            min(requestedHalo, 0.5 * spareH));
+        if (haloX < 1.0 - EPS || haloY < 1.0 - EPS) continue;
+
+        Design cand = design;
+        cand.outlineW = oldW + 2.0 * haloX;
+        cand.outlineH = oldH + 2.0 * haloY;
+        if (cand.outlineW > cand.maxOutlineW + EPS ||
+            cand.outlineH > cand.maxOutlineH + EPS) {
+            continue;
+        }
+
+        for (size_t i = 0; i < cand.blocks.size(); ++i) {
+            BlockInst& b = cand.blocks[i];
+            const Rect old = design.blocks[i].rect;
+            b.rect.x = old.x + haloX;
+            b.rect.y = old.y + haloY;
+        }
+        if (!placementLegalAfterMove(cand, cand.blocks)) {
+            continue;
+        }
+
+        cand.hasRoutingCore = true;
+        cand.routingCoreX = haloX;
+        cand.routingCoreY = haloY;
+        cand.routingCoreW = oldW;
+        cand.routingCoreH = oldH;
+        cand.channels.clear();
+        cand.routes.clear();
+
+        bool duplicate = false;
+        for (const Design& prior : out) {
+            if (fabs(prior.outlineW - cand.outlineW) <= EPS &&
+                fabs(prior.outlineH - cand.outlineH) <= EPS) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (!duplicate) out.push_back(std::move(cand));
+    }
+    return !out.empty();
+}
+
+static bool makeCoordinateSpreadCandidatesMain(
+    const Design& design, vector<Design>& out, int maxCandidates) {
+    if (maxCandidates <= 0 || design.blocks.empty() ||
+        design.outlineW <= EPS || design.outlineH <= EPS) return false;
+
+    const vector<double> fillTargets = { 0.78, 0.90, 1.00 };
+    for (double fill : fillTargets) {
+        if (static_cast<int>(out.size()) >= maxCandidates) break;
+        const double targetW = min(design.maxOutlineW,
+            max(design.outlineW, fill * design.maxOutlineW));
+        const double targetH = min(design.maxOutlineH,
+            max(design.outlineH, fill * design.maxOutlineH));
+        const double fx = targetW / design.outlineW;
+        const double fy = targetH / design.outlineH;
+        const vector<pair<double, double>> factors = {
+            { fx, fy }, { fx, 1.0 }, { 1.0, fy }
+        };
+        for (const auto& factor : factors) {
+            if (static_cast<int>(out.size()) >= maxCandidates) break;
+            if (factor.first <= 1.0001 && factor.second <= 1.0001) continue;
+            Design candidate = design;
+            candidate.outlineW = ceilToIntegerGridMain(
+                design.outlineW * factor.first);
+            candidate.outlineH = ceilToIntegerGridMain(
+                design.outlineH * factor.second);
+            if (candidate.outlineW > candidate.maxOutlineW + EPS ||
+                candidate.outlineH > candidate.maxOutlineH + EPS) continue;
+            for (BlockInst& block : candidate.blocks) {
+                block.rect.x *= factor.first;
+                block.rect.y *= factor.second;
+            }
+            if (candidate.hasRoutingCore) {
+                candidate.routingCoreX *= factor.first;
+                candidate.routingCoreY *= factor.second;
+                candidate.routingCoreW *= factor.first;
+                candidate.routingCoreH *= factor.second;
+            }
+            if (!placementLegalAfterMove(candidate, candidate.blocks)) continue;
+            candidate.channels.clear();
+            candidate.routes.clear();
+            out.push_back(std::move(candidate));
+        }
+    }
+    return !out.empty();
+}
 static double floorToIntegerGridMain(double v) {
     if (fabs(v) < 1.0e-7) return 0.0;
     return floor(v + 1.0e-7);
 }
 
-static bool applyIntegerSeparationConstraintsMain(const vector<Rect>& oldRects, Design& design) {
+static bool applyIntegerSeparationConstraintsMain(
+    const vector<Rect>& oldRects, Design& design,
+    bool edgeAsHardBlock = true) {
     const int n = static_cast<int>(design.blocks.size());
     if (static_cast<int>(oldRects.size()) != n) return false;
 
@@ -959,7 +1073,8 @@ static bool applyIntegerSeparationConstraintsMain(const vector<Rect>& oldRects, 
             const BlockInst& b = design.blocks[i];
             pos[i] = xAxis ? b.rect.x : b.rect.y;
             size[i] = xAxis ? b.rect.w : b.rect.h;
-            const bool edge = b.spec.type == BlockType::EDGE;
+            const bool edge = b.spec.type == BlockType::EDGE &&
+                !edgeAsHardBlock;
             lowFixed[i] = edge && edgeLocationRequiresSideMain(b.spec, lowSide);
             highFixed[i] = edge && edgeLocationRequiresSideMain(b.spec, highSide);
             if (lowFixed[i]) pos[i] = 0.0;
@@ -1004,9 +1119,99 @@ static bool applyIntegerSeparationConstraintsMain(const vector<Rect>& oldRects, 
     if (!solveAxis(false, yCons, design.outlineH)) return false;
     return placementLegalAfterMove(design, design.blocks);
 }
-static bool snapPlacementCoordinatesToIntegerGridMain(Design& design, bool integerOutline, double extraW = 0.0, double extraH = 0.0) {
+
+static bool integerizeBlockDimensionsMain(Design& design) {
+    const int maxW = max(1, static_cast<int>(floor(design.maxOutlineW + EPS)));
+    const int maxH = max(1, static_cast<int>(floor(design.maxOutlineH + EPS)));
+
+    for (int id = 0; id < static_cast<int>(design.blocks.size()); ++id) {
+        BlockInst& block = design.blocks[id];
+        BlockSpec& spec = block.spec;
+
+        // Fixed blocks use the official dimensions.  Current testcases already
+        // provide integers; ceil is the specified length conversion fallback.
+        if (spec.type != BlockType::SOFT || spec.hasFixedSize) {
+            const double sourceW = spec.fixedW > EPS ? spec.fixedW : block.rect.w;
+            const double sourceH = spec.fixedH > EPS ? spec.fixedH : block.rect.h;
+            block.rect.w = ceilToIntegerGridMain(sourceW);
+            block.rect.h = ceilToIntegerGridMain(sourceH);
+            if (block.rect.w > maxW + EPS || block.rect.h > maxH + EPS) return false;
+            continue;
+        }
+
+        // SOFT dimensions are selected on the integer grid using only declared
+        // AREA/aspect ratio.  No predicted or actual FT expansion is included.
+        const double area = max(1.0, spec.area);
+        const double amin = max(1.0e-9, spec.aspectMin);
+        const double amax = max(amin, spec.aspectMax);
+        const double oldW = max(1.0, block.rect.w);
+        const double oldH = max(1.0, block.rect.h);
+
+        bool found = false;
+        int bestW = 0, bestH = 0;
+        double bestScore = numeric_limits<double>::infinity();
+        double bestExtraArea = numeric_limits<double>::infinity();
+        for (int w = 1; w <= maxW; ++w) {
+            const int minH = max(1, max(
+                static_cast<int>(ceil(area / static_cast<double>(w) - 1.0e-9)),
+                static_cast<int>(ceil(static_cast<double>(w) / amax - 1.0e-9))));
+            const int maxAspectH = min(maxH,
+                static_cast<int>(floor(static_cast<double>(w) / amin + 1.0e-9)));
+            if (minH > maxAspectH) continue;
+
+            const int roundedOldH = static_cast<int>(llround(oldH));
+            const int floorOldH = static_cast<int>(floor(oldH + 1.0e-9));
+            const int ceilOldH = static_cast<int>(ceil(oldH - 1.0e-9));
+            const int candidates[] = {
+                minH,
+                max(minH, min(maxAspectH, roundedOldH)),
+                max(minH, min(maxAspectH, floorOldH)),
+                max(minH, min(maxAspectH, ceilOldH))
+            };
+            for (int h : candidates) {
+                if (h < minH || h > maxAspectH) continue;
+                const double placedArea = static_cast<double>(w) * h;
+                if (placedArea + 1.0e-6 < area) continue;
+                const double ratio = static_cast<double>(w) / h;
+                if (ratio + 1.0e-9 < amin || ratio - 1.0e-9 > amax) continue;
+
+                const double shapeDelta =
+                    fabs(static_cast<double>(w) - oldW) / oldW +
+                    fabs(static_cast<double>(h) - oldH) / oldH;
+                const double extraArea = placedArea - area;
+                const double score = shapeDelta + 0.05 * extraArea / area;
+                if (!found || score < bestScore - 1.0e-12 ||
+                    (fabs(score - bestScore) <= 1.0e-12 && extraArea < bestExtraArea)) {
+                    found = true;
+                    bestW = w;
+                    bestH = h;
+                    bestScore = score;
+                    bestExtraArea = extraArea;
+                }
+            }
+        }
+        if (!found) return false;
+        block.rect.w = static_cast<double>(bestW);
+        block.rect.h = static_cast<double>(bestH);
+        spec.floorplanAreaOverride = 0.0;
+        if (id < static_cast<int>(design.blockSpecs.size()))
+            design.blockSpecs[id].floorplanAreaOverride = 0.0;
+    }
+    return true;
+}
+
+static bool snapPlacementCoordinatesToIntegerGridMain(
+    Design& design, bool integerOutline, double extraW = 0.0,
+    double extraH = 0.0, bool edgeAsHardBlock = true) {
     const double oldW = design.outlineW;
     const double oldH = design.outlineH;
+    const bool preserveSeparationRelations =
+        placementLegalAfterMove(design, design.blocks);
+    vector<Rect> oldRects;
+    oldRects.reserve(design.blocks.size());
+    for (const BlockInst& b : design.blocks) oldRects.push_back(b.rect);
+    if (!integerizeBlockDimensionsMain(design)) return false;
+
     double newW = integerOutline ? ceilToIntegerGridMain(oldW) + max(0.0, extraW) : oldW;
     double newH = integerOutline ? ceilToIntegerGridMain(oldH) + max(0.0, extraH) : oldH;
     for (const BlockInst& b : design.blocks) {
@@ -1018,13 +1223,11 @@ static bool snapPlacementCoordinatesToIntegerGridMain(Design& design, bool integ
     design.outlineW = newW;
     design.outlineH = newH;
     const double tol = max(2.0, 1.0e-4 * max(oldW, oldH));
-    vector<Rect> oldRects;
-    oldRects.reserve(design.blocks.size());
-    for (const BlockInst& b : design.blocks) oldRects.push_back(b.rect);
-
-    for (BlockInst& b : design.blocks) {
-        const Rect old = b.rect;
-        const bool edge = b.spec.type == BlockType::EDGE;
+    for (int id = 0; id < static_cast<int>(design.blocks.size()); ++id) {
+        BlockInst& b = design.blocks[id];
+        const Rect old = oldRects[id];
+        const bool edge = b.spec.type == BlockType::EDGE &&
+            !edgeAsHardBlock;
         const bool left = edge && (edgeLocationRequiresSideMain(b.spec, 'L') || fabs(old.x) <= tol);
         const bool right = edge && (edgeLocationRequiresSideMain(b.spec, 'R') || fabs(rectRight(old) - oldW) <= tol);
         const bool bottom = edge && (edgeLocationRequiresSideMain(b.spec, 'B') || fabs(old.y) <= tol);
@@ -1044,26 +1247,250 @@ static bool snapPlacementCoordinatesToIntegerGridMain(Design& design, bool integ
         if (rectTop(b.rect) > newH && rectTop(b.rect) < newH + EPS) b.rect.y = newH - b.rect.h;
     }
 
-    if (!applyIntegerSeparationConstraintsMain(oldRects, design)) return false;
-    if (!nudgeEdgeBlocksIntoLocationSegmentsMain(design)) return false;
+    if (!edgeAsHardBlock && !repairEdgeEdgeOverlapsMain(design)) return false;
+    if (preserveSeparationRelations &&
+        !applyIntegerSeparationConstraintsMain(
+            oldRects, design, edgeAsHardBlock)) return false;
+    if (!edgeAsHardBlock &&
+        !nudgeEdgeBlocksIntoLocationSegmentsMain(design)) return false;
+    if (!edgeAsHardBlock && !repairEdgeEdgeOverlapsMain(design)) return false;
     if (!placementLegalAfterMove(design, design.blocks) && !repairIntegerGridOverlapsMain(design)) return false;
+    if (design.hasRoutingCore) {
+        design.routingCoreX = snapToIntegerGridMain(design.routingCoreX);
+        design.routingCoreY = snapToIntegerGridMain(design.routingCoreY);
+        design.routingCoreW = ceilToIntegerGridMain(design.routingCoreW);
+        design.routingCoreH = ceilToIntegerGridMain(design.routingCoreH);
+    }
     design.channels.clear();
     design.routes.clear();
     return true;
 }
 
-static bool makeIntegerGridFloorplanCandidateMain(const Design& seed, Design& out) {
+static bool makeIntegerGridFloorplanCandidateMain(
+    const Design& seed, Design& out, bool edgeAsHardBlock = true) {
     const vector<double> slack = { 0.0, 1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0 };
     for (double extraH : slack) {
         for (double extraW : slack) {
             out = seed;
-            if (snapPlacementCoordinatesToIntegerGridMain(out, true, extraW, extraH)) return true;
+            if (snapPlacementCoordinatesToIntegerGridMain(
+                    out, true, extraW, extraH, edgeAsHardBlock)) return true;
         }
     }
     out = seed;
-    if (snapPlacementCoordinatesToIntegerGridMain(out, false)) return true;
-    out = seed;
     return false;
+}
+
+// Last-resort bounded placer used only when the normal emergency shelf cannot
+// be integer-legalized. Every fixed-shape HARD/EDGE and SOFT block is packed
+// on the same movable-object basis. The search is deliberately finite so the
+// timeout checkpoint is always attempted before quality optimization starts.
+static bool makeGreedyIntegerEmergencyPlacementMain(
+    const Design& seed, Design& out) {
+    const int n = static_cast<int>(seed.blocks.size());
+    if (n == 0) return false;
+
+    auto softRatioForMode = [](const BlockSpec& sp, int mode) {
+        const double amin = max(1.0e-9, sp.aspectMin);
+        const double amax = max(amin, sp.aspectMax);
+        if (mode == 1) return amin;
+        if (mode == 2) return amax;
+        if (mode == 3) return sqrt(amin * amax);
+        return max(amin, min(1.0, amax));
+    };
+
+    for (int shapeMode = 0; shapeMode < 4; ++shapeMode) {
+        Design shaped = seed;
+        shaped.outlineW = floorToIntegerGridMain(shaped.maxOutlineW);
+        shaped.outlineH = floorToIntegerGridMain(shaped.maxOutlineH);
+        if (shaped.outlineW < 1.0 || shaped.outlineH < 1.0) continue;
+
+        for (BlockInst& block : shaped.blocks) {
+            if (block.spec.type != BlockType::SOFT ||
+                block.spec.hasFixedSize) continue;
+            const double ratio = softRatioForMode(block.spec, shapeMode);
+            block.rect.w = sqrt(max(1.0, block.spec.area) * ratio);
+            block.rect.h = max(1.0, block.spec.area) /
+                max(1.0e-9, block.rect.w);
+        }
+        if (!integerizeBlockDimensionsMain(shaped)) continue;
+
+        vector<int> baseIds;
+        for (int id = 0; id < n; ++id) {
+            baseIds.push_back(id);
+        }
+
+        for (int orderMode = 0; orderMode < 5; ++orderMode) {
+            Design trial = shaped;
+            vector<int> order = baseIds;
+            stable_sort(order.begin(), order.end(), [&](int lhs, int rhs) {
+                const Rect& a = trial.blocks[lhs].rect;
+                const Rect& b = trial.blocks[rhs].rect;
+                const bool ah = trial.blocks[lhs].spec.type == BlockType::HARD;
+                const bool bh = trial.blocks[rhs].spec.type == BlockType::HARD;
+                if (orderMode == 0 && ah != bh) return ah > bh;
+                double ak = a.w * a.h;
+                double bk = b.w * b.h;
+                if (orderMode == 1) { ak = a.h; bk = b.h; }
+                else if (orderMode == 2) { ak = a.w; bk = b.w; }
+                else if (orderMode == 3) { ak = max(a.w, a.h); bk = max(b.w, b.h); }
+                else if (orderMode == 4) { ak = min(a.w, a.h); bk = min(b.w, b.h); }
+                if (fabs(ak - bk) > EPS) return ak > bk;
+                return lhs < rhs;
+            });
+
+            vector<Rect> placed;
+
+            bool packed = true;
+            for (int id : order) {
+                Rect block = trial.blocks[id].rect;
+                vector<double> xs = { 0.0, trial.outlineW - block.w };
+                vector<double> ys = { 0.0, trial.outlineH - block.h };
+                for (const Rect& obstacle : placed) {
+                    xs.push_back(rectRight(obstacle));
+                    xs.push_back(obstacle.x - block.w);
+                    ys.push_back(rectTop(obstacle));
+                    ys.push_back(obstacle.y - block.h);
+                }
+                auto normalize = [](vector<double>& values, double hi) {
+                    for (double& v : values)
+                        v = static_cast<double>(llround(max(0.0, min(v, hi))));
+                    sort(values.begin(), values.end());
+                    values.erase(unique(values.begin(), values.end(),
+                        [](double a, double b) { return fabs(a - b) <= EPS; }),
+                        values.end());
+                };
+                normalize(xs, max(0.0, trial.outlineW - block.w));
+                normalize(ys, max(0.0, trial.outlineH - block.h));
+
+                bool found = false;
+                Rect best;
+                tuple<double, double, double> bestKey;
+                for (double y : ys) {
+                    for (double x : xs) {
+                        Rect cand = block;
+                        cand.x = x;
+                        cand.y = y;
+                        if (!rectInsideOutlineMain(
+                                cand, trial.outlineW, trial.outlineH)) continue;
+                        bool overlaps = false;
+                        for (const Rect& old : placed) {
+                            if (rectOverlapAreaPositive(cand, old)) {
+                                overlaps = true;
+                                break;
+                            }
+                        }
+                        if (overlaps) continue;
+                        double maxR = rectRight(cand);
+                        double maxT = rectTop(cand);
+                        for (const Rect& old : placed) {
+                            maxR = max(maxR, rectRight(old));
+                            maxT = max(maxT, rectTop(old));
+                        }
+                        const tuple<double, double, double> key = {
+                            maxR * maxT, y, x
+                        };
+                        if (!found || key < bestKey) {
+                            found = true;
+                            best = cand;
+                            bestKey = key;
+                        }
+                    }
+                }
+                if (!found) {
+                    packed = false;
+                    break;
+                }
+                trial.blocks[id].rect = best;
+                placed.push_back(best);
+            }
+            if (!packed || !geometryIsIntegerMain(trial) ||
+                !placementLegalAfterMove(trial, trial.blocks)) continue;
+            trial.channels.clear();
+            trial.routes.clear();
+            out = std::move(trial);
+            return true;
+        }
+    }
+    return false;
+}
+
+struct FloorplanReachabilityProxyMain {
+    int openPairs = 0;
+    int missingAccessBlocks = 0;
+    int disconnectedPairs = 0;
+};
+
+// Cheap exact-geometry lower bound used before invoking RouterLite. It catches
+// candidates whose legal endpoint ports have no channel/SOFT access, or whose
+// accesses live in different routing components. Capacity may add penalty, but
+// it must never be the reason we spend a route slot on a guaranteed-open seed.
+static FloorplanReachabilityProxyMain floorplanReachabilityProxyMain(
+    const Design& seed) {
+    FloorplanReachabilityProxyMain result;
+    Design tmp;
+    if (!makeIntegerGridFloorplanCandidateMain(
+            seed, tmp, /*edgeAsHardBlock=*/true)) {
+        result.openPairs = 1000000;
+        result.missingAccessBlocks = 1000000;
+        result.disconnectedPairs = 1000000;
+        return result;
+    }
+
+    ChannelBuilder builder;
+    builder.build(tmp);
+    routerx::RxGraph graph;
+    graph.build(tmp, routerx::SoftRoutingPolicy{
+        /*endpointAccess=*/true, /*softSoftEdges=*/true});
+
+    vector<char> missingBlock(tmp.blocks.size(), 0);
+    const vector<int>& components = graph.components();
+    const vector<routerx::Access>& accesses = graph.accesses();
+    for (const Connection& conn : tmp.connections) {
+        if (conn.netCount <= 0 || conn.src < 0 || conn.dst < 0 ||
+            conn.src >= static_cast<int>(tmp.blocks.size()) ||
+            conn.dst >= static_cast<int>(tmp.blocks.size())) {
+            continue;
+        }
+
+        const int directEdge = routerx::facingEdge(
+            tmp.blocks[conn.src].rect, tmp.blocks[conn.dst].rect);
+        const bool directLegal = directEdge != 0 &&
+            isPortEdgeAllowed(tmp.blocks[conn.src], directEdge,
+                tmp.outlineW, tmp.outlineH) &&
+            isPortEdgeAllowed(tmp.blocks[conn.dst],
+                routerx::oppositeEdge(directEdge),
+                tmp.outlineW, tmp.outlineH);
+        if (directLegal) continue;
+
+        const vector<int>& srcAccess = graph.accessesOf(conn.src);
+        const vector<int>& dstAccess = graph.accessesOf(conn.dst);
+        if (srcAccess.empty()) missingBlock[conn.src] = 1;
+        if (dstAccess.empty()) missingBlock[conn.dst] = 1;
+
+        bool connected = false;
+        for (int sai : srcAccess) {
+            if (sai < 0 || sai >= static_cast<int>(accesses.size())) continue;
+            const int sn = accesses[sai].node;
+            if (sn < 0 || sn >= static_cast<int>(components.size())) continue;
+            for (int dai : dstAccess) {
+                if (dai < 0 || dai >= static_cast<int>(accesses.size())) continue;
+                const int dn = accesses[dai].node;
+                if (dn < 0 || dn >= static_cast<int>(components.size())) continue;
+                if (components[sn] == components[dn]) {
+                    connected = true;
+                    break;
+                }
+            }
+            if (connected) break;
+        }
+        if (!connected) {
+            ++result.openPairs;
+            ++result.disconnectedPairs;
+        }
+    }
+    result.missingAccessBlocks = static_cast<int>(count(
+        missingBlock.begin(), missingBlock.end(), static_cast<char>(1)));
+    return result;
 }
 
 static bool makeTightOutlineCandidatesMain(const Design& design, vector<Design>& out, int maxCandidates) {
@@ -1121,6 +1548,76 @@ static double placedBlockAreaMain(const Design& design) {
 static double deadspaceRatioMain(const Design& design) {
     const double outlineArea = max(1.0, design.outlineW * design.outlineH);
     return max(0.0, (outlineArea - placedBlockAreaMain(design)) / outlineArea);
+}
+
+// Largest empty coordinate-compressed cell.  Unlike total deadspace, this
+// distinguishes useful distributed routing gaps from one visually and
+// geometrically wasteful rectangular hole (for example case6's upper-right
+// void beside BLK02).
+static double largestEmptyFloorplanCellMain(const Design& design) {
+    if (design.outlineW <= EPS || design.outlineH <= EPS) return 0.0;
+    vector<double> xs = { 0.0, design.outlineW };
+    vector<double> ys = { 0.0, design.outlineH };
+    for (const BlockInst& block : design.blocks) {
+        xs.push_back(max(0.0, min(design.outlineW, block.rect.x)));
+        xs.push_back(max(0.0, min(design.outlineW, rectRight(block.rect))));
+        ys.push_back(max(0.0, min(design.outlineH, block.rect.y)));
+        ys.push_back(max(0.0, min(design.outlineH, rectTop(block.rect))));
+    }
+    auto normalize = [](vector<double>& values) {
+        sort(values.begin(), values.end());
+        values.erase(unique(values.begin(), values.end(),
+            [](double a, double b) { return fabs(a - b) <= EPS; }),
+            values.end());
+    };
+    normalize(xs);
+    normalize(ys);
+
+    double largest = 0.0;
+    for (int xi = 0; xi + 1 < static_cast<int>(xs.size()); ++xi) {
+        for (int yi = 0; yi + 1 < static_cast<int>(ys.size()); ++yi) {
+            Rect cell;
+            cell.x = xs[xi];
+            cell.y = ys[yi];
+            cell.w = xs[xi + 1] - xs[xi];
+            cell.h = ys[yi + 1] - ys[yi];
+            if (cell.w <= EPS || cell.h <= EPS) continue;
+            bool occupied = false;
+            for (const BlockInst& block : design.blocks) {
+                if (rectOverlapAreaPositive(cell, block.rect)) {
+                    occupied = true;
+                    break;
+                }
+            }
+            if (!occupied) largest = max(largest, cell.w * cell.h);
+        }
+    }
+    return largest;
+}
+
+static double centerHpwlFloorplanProxyMain(const Design& design) {
+    double total = 0.0;
+    for (const Connection& conn : design.connections) {
+        if (conn.netCount <= 0 || conn.src < 0 || conn.dst < 0 ||
+            conn.src >= static_cast<int>(design.blocks.size()) ||
+            conn.dst >= static_cast<int>(design.blocks.size())) continue;
+        const Rect& src = design.blocks[conn.src].rect;
+        const Rect& dst = design.blocks[conn.dst].rect;
+        total += static_cast<double>(conn.netCount) *
+            (fabs(rectCx(src) - rectCx(dst)) +
+             fabs(rectCy(src) - rectCy(dst)));
+    }
+    return total;
+}
+
+static int floorplanAspectBucketMain(const Design& design) {
+    const double ratio = design.outlineW / max(1.0, design.outlineH);
+    if (ratio < 0.50) return 0;
+    if (ratio < 0.72) return 1;
+    if (ratio < 0.95) return 2;
+    if (ratio < 1.30) return 3;
+    if (ratio < 1.80) return 4;
+    return 5;
 }
 
 
@@ -1257,10 +1754,6 @@ static bool tryGravityOutlineTrimMain(Design& design, double shrinkW, double shr
 
     const vector<BlockInst> oldBlocks = design.blocks;
     vector<BlockInst> next = design.blocks;
-    const double tol = max(2.0, 1.0e-4 * max(oldW, oldH));
-    vector<Rect> oldRects;
-    oldRects.reserve(design.blocks.size());
-    for (const BlockInst& b : design.blocks) oldRects.push_back(b.rect);
     vector<int> movable;
     vector<Rect> placed;
 
@@ -1270,26 +1763,7 @@ static bool tryGravityOutlineTrimMain(Design& design, double shrinkW, double shr
         b.rect = old;
         if (b.rect.w > newW + EPS || b.rect.h > newH + EPS) return false;
 
-        if (b.spec.type == BlockType::EDGE) {
-            const bool touchLeft = fabs(old.x) <= tol;
-            const bool touchBottom = fabs(old.y) <= tol;
-            const bool touchRight = fabs(rectRight(old) - oldW) <= tol;
-            const bool touchTop = fabs(rectTop(old) - oldH) <= tol;
-
-            if (touchRight) b.rect.x = newW - b.rect.w;
-            else if (touchLeft) b.rect.x = 0.0;
-            else b.rect.x = max(0.0, min(b.rect.x, newW - b.rect.w));
-
-            if (touchTop) b.rect.y = newH - b.rect.h;
-            else if (touchBottom) b.rect.y = 0.0;
-            else b.rect.y = max(0.0, min(b.rect.y, newH - b.rect.h));
-
-            if (!rectInsideOutlineMain(b.rect, newW, newH)) return false;
-            placed.push_back(b.rect);
-        }
-        else {
-            movable.push_back(i);
-        }
+        movable.push_back(i);
     }
 
     sort(movable.begin(), movable.end(), [&](int a, int b) {
@@ -1465,6 +1939,102 @@ static bool tryMoveBlocksXWithClosure(Design& design, const vector<int>& ids, do
     vector<int> expanded = expandMoveClosureX(design, ids, dx, ok);
     if (!ok) return false;
     return tryMoveBlocksX(design, expanded, dx);
+}
+
+static bool makeEndpointAccessRepairCandidatesMain(
+    const Design& design, vector<Design>& out, int maxCandidates) {
+    if (maxCandidates <= 0 || design.blocks.empty()) return false;
+
+    Design base;
+    if (!makeIntegerGridFloorplanCandidateMain(
+            design, base, /*edgeAsHardBlock=*/true)) return false;
+    ChannelBuilder builder;
+    builder.build(base);
+    routerx::RxGraph graph;
+    graph.build(base, routerx::SoftRoutingPolicy{
+        /*endpointAccess=*/true, /*softSoftEdges=*/true});
+    const FloorplanReachabilityProxyMain baseReach =
+        floorplanReachabilityProxyMain(base);
+    if (baseReach.openPairs <= 0) return false;
+
+    vector<double> endpointDemand(base.blocks.size(), 0.0);
+    vector<char> connected(base.blocks.size(), 0);
+    for (const Connection& conn : base.connections) {
+        if (conn.netCount <= 0 || conn.src < 0 || conn.dst < 0 ||
+            conn.src >= static_cast<int>(base.blocks.size()) ||
+            conn.dst >= static_cast<int>(base.blocks.size())) continue;
+        endpointDemand[conn.src] += conn.netCount;
+        endpointDemand[conn.dst] += conn.netCount;
+        connected[conn.src] = connected[conn.dst] = 1;
+    }
+
+    vector<int> missing;
+    for (int id = 0; id < static_cast<int>(base.blocks.size()); ++id) {
+        if (connected[id] && graph.accessesOf(id).empty()) missing.push_back(id);
+    }
+    sort(missing.begin(), missing.end(), [&](int a, int b) {
+        if (endpointDemand[a] != endpointDemand[b])
+            return endpointDemand[a] > endpointDemand[b];
+        return a < b;
+    });
+
+    auto sameGeometry = [](const Design& a, const Design& b) {
+        if (a.blocks.size() != b.blocks.size()) return false;
+        for (int i = 0; i < static_cast<int>(a.blocks.size()); ++i) {
+            const Rect& x = a.blocks[i].rect;
+            const Rect& y = b.blocks[i].rect;
+            if (fabs(x.x - y.x) > 0.5 || fabs(x.y - y.y) > 0.5 ||
+                fabs(x.w - y.w) > 0.5 || fabs(x.h - y.h) > 0.5) return false;
+        }
+        return true;
+    };
+    auto addIfImproved = [&](Design&& candidate) {
+        if (static_cast<int>(out.size()) >= maxCandidates) return;
+        if (!placementLegalAfterMove(candidate, candidate.blocks)) return;
+        const FloorplanReachabilityProxyMain reach =
+            floorplanReachabilityProxyMain(candidate);
+        if (reach.openPairs >= baseReach.openPairs) return;
+        for (const Design& old : out) {
+            if (sameGeometry(old, candidate)) return;
+        }
+        candidate.channels.clear();
+        candidate.routes.clear();
+        out.push_back(std::move(candidate));
+    };
+
+    for (int id : missing) {
+        vector<int> ports = base.blocks[id].spec.portEdges;
+        if (ports.empty()) ports = { 1, 2, 3, 4 };
+        const double exact = max(2.0, min(180.0,
+            endpointDemand[id] / CHANNEL_DENSITY + 1.0));
+        vector<double> steps = { 2.0, 4.0, 8.0, 16.0, 32.0,
+            min(64.0, exact), exact };
+        sort(steps.begin(), steps.end());
+        steps.erase(unique(steps.begin(), steps.end(), [](double a, double b) {
+            return fabs(a - b) < 0.5;
+        }), steps.end());
+
+        for (int port : ports) {
+            for (double step : steps) {
+                if (static_cast<int>(out.size()) >= maxCandidates) break;
+                Design trial = base;
+                bool moved = false;
+                // Move the endpoint away from the material touching its legal
+                // port side. Closure pushes only blocks encountered on the
+                // opposite side, leaving a real vacant channel at the port.
+                if (port == 1)
+                    moved = tryMoveBlocksXWithClosure(trial, { id }, step);
+                else if (port == 2)
+                    moved = tryMoveBlocksYWithClosure(trial, { id }, -step);
+                else if (port == 3)
+                    moved = tryMoveBlocksXWithClosure(trial, { id }, -step);
+                else if (port == 4)
+                    moved = tryMoveBlocksYWithClosure(trial, { id }, step);
+                if (moved) addIfImproved(std::move(trial));
+            }
+        }
+    }
+    return !out.empty();
 }
 
 static bool relieveHorizontalHotChannels(Design& design) {
@@ -2011,37 +2581,202 @@ if (blockMovableForHotRepair(design.blocks[hp.src].spec) && blockMovableForHotRe
 
     return static_cast<int>(out.size()) > startCount;
 }
+
+static int totalConnBetweenMain(const Design& design, int a, int b) {
+    if (a < 0 || b < 0 || a == b) return 0;
+    int n = 0;
+    if (a < static_cast<int>(design.connMatrix.size()) &&
+        b < static_cast<int>(design.connMatrix[a].size())) {
+        n += max(0, design.connMatrix[a][b]);
+    }
+    if (b < static_cast<int>(design.connMatrix.size()) &&
+        a < static_cast<int>(design.connMatrix[b].size())) {
+        n += max(0, design.connMatrix[b][a]);
+    }
+    if (n > 0 || design.connections.empty()) return n;
+    for (const Connection& c : design.connections) {
+        if ((c.src == a && c.dst == b) || (c.src == b && c.dst == a)) {
+            n += max(0, c.netCount);
+        }
+    }
+    return n;
+}
+
+static bool tryMoveBlocksEdgeRelaxClosureMain(Design& design, const vector<int>& seeds, double dx, double dy) {
+    if (seeds.empty() || (fabs(dx) <= EPS && fabs(dy) <= EPS)) return false;
+    const int n = static_cast<int>(design.blocks.size());
+    vector<char> selected(n, 0);
+    for (int id : seeds) {
+        if (id < 0 || id >= n) return false;
+        Rect moved = design.blocks[id].rect;
+        moved.x += dx;
+        moved.y += dy;
+        if (!rectInsideOutlineMain(moved, design.outlineW, design.outlineH)) return false;
+        selected[id] = 1;
+    }
+
+    bool changed = true;
+    while (changed) {
+        changed = false;
+        for (int i = 0; i < n; ++i) {
+            if (selected[i]) continue;
+            for (int j = 0; j < n; ++j) {
+                if (!selected[j]) continue;
+                Rect moved = design.blocks[j].rect;
+                moved.x += dx;
+                moved.y += dy;
+                if (!rectOverlapAreaPositive(moved, design.blocks[i].rect)) continue;
+                Rect follow = design.blocks[i].rect;
+                follow.x += dx;
+                follow.y += dy;
+                if (!rectInsideOutlineMain(follow, design.outlineW, design.outlineH)) return false;
+                selected[i] = 1;
+                changed = true;
+                break;
+            }
+        }
+    }
+
+    vector<BlockInst> moved = design.blocks;
+    for (int i = 0; i < n; ++i) {
+        if (!selected[i]) continue;
+        moved[i].rect.x += dx;
+        moved[i].rect.y += dy;
+    }
+    if (!placementLegalAfterMove(design, moved)) return false;
+    design.blocks.swap(moved);
+    design.channels.clear();
+    design.routes.clear();
+    return true;
+}
+
+static bool makeEdgeRelaxedHardblockCandidatesMain(const Design& design, vector<Design>& out, int maxCandidates) {
+    if (maxCandidates <= 0 || design.blocks.empty()) return false;
+
+    struct EdgeScore {
+        int id = -1;
+        int degree = 0;
+        double targetX = 0.0;
+        double targetY = 0.0;
+    };
+
+    vector<EdgeScore> edges;
+    const int n = static_cast<int>(design.blocks.size());
+    for (int i = 0; i < n; ++i) {
+        if (design.blocks[i].spec.type != BlockType::EDGE) continue;
+        int degree = 0;
+        double wx = 0.0;
+        double wy = 0.0;
+        for (int j = 0; j < n; ++j) {
+            if (i == j) continue;
+            const int nets = totalConnBetweenMain(design, i, j);
+            if (nets <= 0) continue;
+            degree += nets;
+            wx += static_cast<double>(nets) * rectCx(design.blocks[j].rect);
+            wy += static_cast<double>(nets) * rectCy(design.blocks[j].rect);
+        }
+        if (degree <= 0) continue;
+        edges.push_back({ i, degree, wx / degree, wy / degree });
+    }
+
+    sort(edges.begin(), edges.end(), [](const EdgeScore& a, const EdgeScore& b) {
+        if (a.degree != b.degree) return a.degree > b.degree;
+        return a.id < b.id;
+    });
+
+    const int startCount = static_cast<int>(out.size());
+    const int edgeLimit = min(static_cast<int>(edges.size()), n >= 20 ? 8 : 5);
+    const vector<double> normalSteps = n >= 20
+        ? vector<double>{ 16.0, 32.0, 64.0, 96.0, 128.0 }
+        : vector<double>{ 8.0, 16.0, 32.0, 64.0, 96.0 };
+    const vector<double> tangentSteps = n >= 20
+        ? vector<double>{ 16.0, 48.0, 96.0 }
+        : vector<double>{ 8.0, 24.0, 48.0 };
+
+    auto sameGeometry = [](const Design& a, const Design& b) {
+        if (a.blocks.size() != b.blocks.size()) return false;
+        for (int i = 0; i < static_cast<int>(a.blocks.size()); ++i) {
+            const Rect& ra = a.blocks[i].rect;
+            const Rect& rb = b.blocks[i].rect;
+            if (fabs(ra.x - rb.x) > 0.5 || fabs(ra.y - rb.y) > 0.5 ||
+                fabs(ra.w - rb.w) > 0.5 || fabs(ra.h - rb.h) > 0.5) return false;
+        }
+        return true;
+    };
+
+    auto addCandidate = [&](Design&& cand) {
+        if (static_cast<int>(out.size()) >= maxCandidates) return;
+        if (!placementLegalAfterMove(cand, cand.blocks)) return;
+        for (const Design& old : out) if (sameGeometry(old, cand)) return;
+        out.push_back(std::move(cand));
+    };
+
+    const double tol = max(2.0, 1.0e-4 * max(design.outlineW, design.outlineH));
+    for (int ei = 0; ei < edgeLimit && static_cast<int>(out.size()) < maxCandidates; ++ei) {
+        const EdgeScore& es = edges[ei];
+        const BlockInst& b = design.blocks[es.id];
+        const Rect& r = b.rect;
+        vector<pair<double, double>> dirs;
+        const bool left = fabs(r.x) <= tol || edgeLocationRequiresSideMain(b.spec, 'L');
+        const bool right = fabs(rectRight(r) - design.outlineW) <= tol || edgeLocationRequiresSideMain(b.spec, 'R');
+        const bool bottom = fabs(r.y) <= tol || edgeLocationRequiresSideMain(b.spec, 'B');
+        const bool top = fabs(rectTop(r) - design.outlineH) <= tol || edgeLocationRequiresSideMain(b.spec, 'T');
+        if (left) dirs.push_back({ 1.0, 0.0 });
+        if (right) dirs.push_back({ -1.0, 0.0 });
+        if (bottom) dirs.push_back({ 0.0, 1.0 });
+        if (top) dirs.push_back({ 0.0, -1.0 });
+
+        const double tx = es.targetX - rectCx(r);
+        const double ty = es.targetY - rectCy(r);
+        if (fabs(tx) > 12.0 && (top || bottom)) dirs.push_back({ tx > 0.0 ? 1.0 : -1.0, 0.0 });
+        if (fabs(ty) > 12.0 && (left || right)) dirs.push_back({ 0.0, ty > 0.0 ? 1.0 : -1.0 });
+        if (fabs(tx) > 12.0 || fabs(ty) > 12.0) {
+            const double sx = fabs(tx) > 12.0 ? (tx > 0.0 ? 1.0 : -1.0) : 0.0;
+            const double sy = fabs(ty) > 12.0 ? (ty > 0.0 ? 1.0 : -1.0) : 0.0;
+            if (sx != 0.0 || sy != 0.0) dirs.push_back({ sx, sy });
+        }
+
+        sort(dirs.begin(), dirs.end());
+        dirs.erase(unique(dirs.begin(), dirs.end()), dirs.end());
+
+        for (const auto& dir : dirs) {
+            const bool diagonal = fabs(dir.first) > 0.0 && fabs(dir.second) > 0.0;
+            const bool tangentOnly =
+                (fabs(dir.first) > 0.0 && (top || bottom) && !left && !right) ||
+                (fabs(dir.second) > 0.0 && (left || right) && !top && !bottom);
+            const vector<double>& steps = tangentOnly ? tangentSteps : normalSteps;
+            for (double baseStep : steps) {
+                if (static_cast<int>(out.size()) >= maxCandidates) break;
+                const double step = diagonal ? baseStep * 0.70 : baseStep;
+                Design trial = design;
+                const double mdx = snapToIntegerGridMain(dir.first * step);
+                const double mdy = snapToIntegerGridMain(dir.second * step);
+                if (tryMoveBlocksEdgeRelaxClosureMain(trial, { es.id }, mdx, mdy)) {
+                    addCandidate(std::move(trial));
+                }
+            }
+        }
+    }
+
+    return static_cast<int>(out.size()) > startCount;
+}
 static bool edgeCanSlideYForCapacityRelief(const Design& design, const BlockInst& b, double dy) {
     if (b.spec.type != BlockType::EDGE) return true;
     Rect moved = b.rect;
     moved.y += dy;
-    const double tol = max(2.0, 1.0e-4 * max(design.outlineW, design.outlineH));
-    const bool wasTop = fabs(rectTop(b.rect) - design.outlineH) <= tol;
-    const bool mayGrowTop = dy > 0.0 && wasTop && rectTop(moved) <= design.maxOutlineH + EPS;
-    const double effectiveH = mayGrowTop ? max(design.outlineH, ceilToIntegerGridMain(rectTop(moved))) : design.outlineH;
-    if (!rectInsideOutlineMain(moved, design.outlineW, effectiveH)) return false;
-    const bool staysLeft = fabs(b.rect.x) <= tol && fabs(moved.x) <= tol;
-    const bool staysRight = fabs(rectRight(b.rect) - design.outlineW) <= tol && fabs(rectRight(moved) - design.outlineW) <= tol;
-    const bool staysBottom = fabs(b.rect.y) <= tol && fabs(moved.y) <= tol;
-    const bool staysTop = wasTop && fabs(rectTop(moved) - effectiveH) <= tol;
-    const bool movesToTop = fabs(rectTop(moved) - effectiveH) <= tol;
-    return staysLeft || staysRight || staysBottom || staysTop || movesToTop;
+    const double effectiveH = max(
+        design.outlineH, ceilToIntegerGridMain(rectTop(moved)));
+    return effectiveH <= design.maxOutlineH + EPS &&
+        rectInsideOutlineMain(moved, design.outlineW, effectiveH);
 }
 static bool edgeCanSlideXForCapacityRelief(const Design& design, const BlockInst& b, double dx) {
     if (b.spec.type != BlockType::EDGE) return true;
     Rect moved = b.rect;
     moved.x += dx;
-    const double tol = max(2.0, 1.0e-4 * max(design.outlineW, design.outlineH));
-    const bool wasRight = fabs(rectRight(b.rect) - design.outlineW) <= tol;
-    const bool mayGrowRight = dx > 0.0 && wasRight && rectRight(moved) <= design.maxOutlineW + EPS;
-    const double effectiveW = mayGrowRight ? max(design.outlineW, ceilToIntegerGridMain(rectRight(moved))) : design.outlineW;
-    if (!rectInsideOutlineMain(moved, effectiveW, design.outlineH)) return false;
-    const bool staysBottom = fabs(b.rect.y) <= tol && fabs(moved.y) <= tol;
-    const bool staysTop = fabs(rectTop(b.rect) - design.outlineH) <= tol && fabs(rectTop(moved) - design.outlineH) <= tol;
-    const bool staysLeft = fabs(b.rect.x) <= tol && fabs(moved.x) <= tol;
-    const bool staysRight = wasRight && fabs(rectRight(moved) - effectiveW) <= tol;
-    const bool movesToRight = fabs(rectRight(moved) - effectiveW) <= tol;
-    return staysBottom || staysTop || staysLeft || staysRight || movesToRight;
+    const double effectiveW = max(
+        design.outlineW, ceilToIntegerGridMain(rectRight(moved)));
+    return effectiveW <= design.maxOutlineW + EPS &&
+        rectInsideOutlineMain(moved, effectiveW, design.outlineH);
 }
 static vector<int> expandMoveClosureYForCapacityRelief(const Design& design, const vector<int>& seeds, double dy, bool& ok) {
     ok = false;
@@ -2150,10 +2885,6 @@ static bool tryMoveBlocksYForCapacityRelief(Design& design, const vector<int>& i
     for (const BlockInst& b : moved) newH = max(newH, ceilToIntegerGridMain(rectTop(b.rect)));
     if (newH > design.maxOutlineH + EPS) return false;
     if (newH > design.outlineH + EPS) {
-        const double tol = max(2.0, 1.0e-4 * max(design.outlineW, newH));
-        for (const BlockInst& b : moved) {
-            if (b.spec.type == BlockType::EDGE && edgeLocationRequiresSideMain(b.spec, 'T') && fabs(rectTop(b.rect) - newH) > tol) return false;
-        }
         design.outlineH = newH;
     }
     if (!placementLegalAfterMove(design, moved)) return false;
@@ -2179,10 +2910,6 @@ static bool tryMoveBlocksXForCapacityRelief(Design& design, const vector<int>& i
     for (const BlockInst& b : moved) newW = max(newW, ceilToIntegerGridMain(rectRight(b.rect)));
     if (newW > design.maxOutlineW + EPS) return false;
     if (newW > design.outlineW + EPS) {
-        const double tol = max(2.0, 1.0e-4 * max(newW, design.outlineH));
-        for (const BlockInst& b : moved) {
-            if (b.spec.type == BlockType::EDGE && edgeLocationRequiresSideMain(b.spec, 'R') && fabs(rectRight(b.rect) - newW) > tol) return false;
-        }
         design.outlineW = newW;
     }
     if (!placementLegalAfterMove(design, moved)) return false;
@@ -2667,6 +3394,7 @@ int main(int argc, char** argv) {
     Router router;
     Evaluator evaluator;
     OutputWriter writer;
+    floorplanner.setRandomSeed(opt.randomSeed);
 
     bool parseOk = parser.read(opt.inputPath, design);
     if (!parseOk) {
@@ -2677,13 +3405,37 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    if (!opt.alphaOverride) {
-        const double checkerAlpha = checkerDefaultAlphaForCaseId(detectKnownCaseId(opt.inputPath));
-        opt.alpha = isfinite(checkerAlpha) ? checkerAlpha : design.alpha;
-    }
+    if (!opt.alphaOverride) opt.alpha = design.alpha;
     design.alpha = opt.alpha;
 
-    // ≈™ßπ parser ´·§~™æπD block º∆∂q°A©“•H¶b≥o∏Ã®M©wØu•ø output cfg ∏ÙÆ|°C
+    auto meetsQualityTarget = [&](const EvalReport& report) {
+        if (!opt.qualityTargetProvided) return true;
+        const bool areaPass = isfinite(opt.targetAreaMax) &&
+            report.outlineArea <= opt.targetAreaMax + 1.0e-6;
+        const bool wirePass = isfinite(opt.targetWireLengthMax) &&
+            report.totalWireLength <= opt.targetWireLengthMax + 1.0e-6;
+        return areaPass || wirePass;
+    };
+
+    // Dense all-soft matrices are the runtime stress case in the 2026-08-11
+    // suite. Connections are canonical undirected pairs at this point.
+    const bool isLargeDenseCase =
+        design.blockSpecs.size() >= 25 && design.connections.size() >= 250;
+    const bool isResourceBoundedCase =
+        design.connections.size() >= 20 &&
+        (design.blockSpecs.size() >= 20 ||
+         (design.blockSpecs.size() >= 10 && design.blockSpecs.size() <= 12));
+    const bool forcedBoundedShortcut =
+        ENABLE_FORCED_SIZE_SHORTCUTS_MAIN && isResourceBoundedCase;
+    const bool mediumBoundedCase = !isLargeDenseCase &&
+        design.connections.size() >= 20 && design.blockSpecs.size() >= 20;
+    const bool edgeAsHardBlockFloorplan = any_of(
+        design.blockSpecs.begin(), design.blockSpecs.end(),
+        [](const BlockSpec& spec) {
+            return spec.type == BlockType::EDGE;
+        });
+
+    // ËÆÄÂÆå parser ÂæåÊâçÁü•ÈÅì block Êï∏ÈáèÔºåÊâÄ‰ª•Âú®ÈÄôË£°Ê±∫ÂÆöÁúüÊ≠£ output cfg Ë∑ØÂæë„ÄÇ
     if (opt.outputPathProvided) {
         opt.outputPath = resolveOutputPath(opt.outputPath, design.blockSpecs.size());
     }
@@ -2717,17 +3469,118 @@ int main(int argc, char** argv) {
         return rpt.hasFail() ? 1 : 0;
     }
 
+    if (opt.scanCfgRootProvided) {
+        struct ScanResult {
+            fs::path path;
+            EvalReport report;
+        };
+
+        vector<ScanResult> results;
+        size_t cfgFiles = 0;
+        size_t matchingCfgs = 0;
+        error_code ec;
+        fs::recursive_directory_iterator it(
+            opt.scanCfgRoot,
+            fs::directory_options::skip_permission_denied,
+            ec);
+        const fs::recursive_directory_iterator end;
+        for (; !ec && it != end; it.increment(ec)) {
+            if (!it->is_regular_file(ec) || ec) continue;
+            fs::path path = it->path();
+            string ext = path.extension().string();
+            transform(ext.begin(), ext.end(), ext.begin(), [](unsigned char ch) {
+                return static_cast<char>(tolower(ch));
+            });
+            if (ext != ".cfg") continue;
+            ++cfgFiles;
+
+            ifstream fin(path, ios::binary);
+            if (!fin) continue;
+            stringstream cfgBuf;
+            cfgBuf << fin.rdbuf();
+
+            Design cfgBase = design;
+            cfgBase.blocks.clear();
+            cfgBase.blocks.reserve(cfgBase.blockSpecs.size());
+            for (const BlockSpec& spec : cfgBase.blockSpecs) {
+                BlockInst b;
+                b.spec = spec;
+                cfgBase.blocks.push_back(b);
+            }
+
+            Design cfgDesign;
+            const string cfgText = cfgBuf.str();
+            if (!parsePortfolioCfg(cfgText.c_str(), cfgBase, cfgDesign)) continue;
+            ++matchingCfgs;
+            EvalReport report = evaluator.evaluate(cfgDesign, opt.alpha, 0.0);
+            if (!report.hasFail() && meetsQualityTarget(report)) {
+                results.push_back({ path, report });
+            }
+        }
+
+        sort(results.begin(), results.end(), [&](const ScanResult& a, const ScanResult& b) {
+            double av = a.report.cost;
+            double bv = b.report.cost;
+            if (opt.scanSort == "wirelength" || opt.scanSort == "wl") {
+                av = a.report.totalWireLength;
+                bv = b.report.totalWireLength;
+            }
+            else if (opt.scanSort == "area") {
+                av = a.report.outlineArea;
+                bv = b.report.outlineArea;
+            }
+            if (fabs(av - bv) > 1.0e-6) {
+                return av < bv;
+            }
+            return a.path.string() < b.path.string();
+        });
+
+        cout << "scanned_cfgs=" << cfgFiles
+             << " matching_cfgs=" << matchingCfgs
+             << " legal_cfgs=" << results.size() << "\n";
+        cout << "rank,path,cost,outline_area,wire_length,warning_penalty,overflow_penalty,ft_penalty,illegal_ft_penalty,edge_penalty\n";
+        const size_t printLimit = min<size_t>(results.size(), 50);
+        cout << fixed << setprecision(6);
+        for (size_t i = 0; i < printLimit; ++i) {
+            const ScanResult& item = results[i];
+            cout << (i + 1) << ',' << quoted(item.path.string())
+                 << ',' << item.report.cost
+                 << ',' << item.report.outlineArea
+                 << ',' << item.report.totalWireLength
+                 << ',' << item.report.warningPenaltyCost
+                 << ',' << item.report.overflowPenalty
+                 << ',' << item.report.feedthroughPenalty
+                 << ',' << item.report.illegalFeedthroughPenalty
+                 << ',' << item.report.edgeLocationPenalty
+                 << '\n';
+        }
+        return results.empty() ? 1 : 0;
+    }
+
     auto totalPenalty = [](const EvalReport& r) {
         return r.warningPenaltyCost;
+        };
+
+    auto selectionCost = [](const EvalReport& r) {
+        // Candidate choice happens at one common final program runtime.  Some
+        // reports are produced before runtime is attached and some after it;
+        // comparing raw cost would unfairly freeze an early checkpoint.
+        return r.cost - r.runtimePenalty;
         };
 
     auto betterEval = [&](const EvalReport& a, const EvalReport& b) {
         if (a.hasFail() != b.hasFail()) return !a.hasFail();
         if (a.hasFail() && a.openPathCount != b.openPathCount) return a.openPathCount < b.openPathCount;
 
+        const bool aMeetsTarget = meetsQualityTarget(a);
+        const bool bMeetsTarget = meetsQualityTarget(b);
+        if (aMeetsTarget != bMeetsTarget) return aMeetsTarget;
+
         // Checker ranking is cost-based.  Warning penalties are already included
         // in cost, so do not make any nonzero overflow/FT warning dominate outline.
-        if (fabs(a.cost - b.cost) > 1.0) return a.cost < b.cost;
+        const double ac = selectionCost(a);
+        const double bc = selectionCost(b);
+        if (fabs(ac - bc) > 1.0) return ac < bc;
 
         const double ap = totalPenalty(a);
         const double bp = totalPenalty(b);
@@ -2737,13 +3590,32 @@ int main(int argc, char** argv) {
         };
 
 
-    bool forceSoftFTRelaxedRouting = false;
-
-
     auto routeCandidate = [&](const Design& seed, bool ftOverflowAware, bool softFTRelaxed, bool contactAware,
-        EvalReport& outRpt, vector<Router::FailureCertificate>* outCerts = nullptr) {
+        EvalReport& outRpt, vector<Router::FailureCertificate>* outCerts = nullptr, bool edgeAsMovableHard = false) {
             Design trial;
-            if (!makeIntegerGridFloorplanCandidateMain(seed, trial)) trial = seed;
+            if (opt.routeCfgBlocksProvided && opt.preserveCfgGeometry) {
+                trial = seed;
+            }
+            else if (!makeIntegerGridFloorplanCandidateMain(
+                         seed, trial, edgeAsMovableHard)) {
+                trial = seed;
+                trial.channels.clear();
+                trial.routes.clear();
+                outRpt = evaluator.evaluate(trial, opt.alpha);
+                outRpt.formatFailed = true;
+                cerr << "[IntegerGrid] reject candidate: integer legalization failed\n";
+                return trial;
+            }
+            if (!(opt.routeCfgBlocksProvided && opt.preserveCfgGeometry) &&
+                (!geometryIsIntegerMain(trial) ||
+                 !placementLegalAfterMove(trial, trial.blocks))) {
+                trial.channels.clear();
+                trial.routes.clear();
+                outRpt = evaluator.evaluate(trial, opt.alpha);
+                outRpt.formatFailed = true;
+                cerr << "[IntegerGrid] reject candidate: post-legalization validation failed\n";
+                return trial;
+            }
             channelBuilder.build(trial);
             
             router.setFTOverflowCostEnabled(ftOverflowAware);
@@ -2757,61 +3629,84 @@ int main(int argc, char** argv) {
         };
 
     auto bestRoutedCandidate = [&](const Design& seed, EvalReport& outRpt,
-        vector<Router::FailureCertificate>* outCerts = nullptr) {
-            vector<Router::FailureCertificate> bestCerts;
-            Design best;
-            bool haveBest = false;
-            const bool tryContactAware = static_cast<int>(seed.blockSpecs.size()) >= 16;
-
-            auto considerRoute = [&](bool ftOverflowAware, bool softFTRelaxed, bool contactAware) {
-                EvalReport candRpt;
-                vector<Router::FailureCertificate> candCerts;
-                vector<Router::FailureCertificate>* candCertOut =
-                    outCerts ? &candCerts : nullptr;
-                Design cand = routeCandidate(
-                    seed, ftOverflowAware, softFTRelaxed, contactAware, candRpt, candCertOut);
-                if (!haveBest || betterEval(candRpt, outRpt)) {
-                    best = std::move(cand);
-                    outRpt = candRpt;
-                    bestCerts = std::move(candCerts);
-                    haveBest = true;
-                }
-                };
-
-            if (forceSoftFTRelaxedRouting) {
-                considerRoute(true, true, false);
-                if (tryContactAware) considerRoute(true, true, true);
-                if (outRpt.hasFail() || totalPenalty(outRpt) > 1.0) {
-                    considerRoute(false, true, false);
-                    if (tryContactAware) considerRoute(false, true, true);
-                }
-                if (outRpt.hasFail() || totalPenalty(outRpt) > 1.0) {
-                    considerRoute(true, true, false);
-                    if (tryContactAware) considerRoute(true, true, true);
-                    considerRoute(false, true, false);
-                    if (tryContactAware) considerRoute(false, true, true);
-                }
-                if (outCerts) *outCerts = bestCerts;
-                return best;
-            }
-
-            considerRoute(false, false, false);
-            if (tryContactAware) considerRoute(false, false, true);
-
-            if (outRpt.hasFail() || totalPenalty(outRpt) > 1.0) {
-                considerRoute(false, true, false);
-                considerRoute(true, true, false);
-                if (tryContactAware) {
-                    considerRoute(false, true, true);
-                    considerRoute(true, true, true);
-                }
-            }
-
-
-
-            if (outCerts) *outCerts = bestCerts;
-            return best;
+        vector<Router::FailureCertificate>* outCerts = nullptr, bool edgeAsMovableHard = false) {
+            // RouterLite owns one fixed search/scoring policy. Its legacy
+            // toggles are API-compatible no-ops, so retrying every toggle
+            // combination only repeats the same route search.
+            return routeCandidate(seed, false, false, false, outRpt, outCerts,
+                edgeAsMovableHard || edgeAsHardBlockFloorplan);
         };
+
+    auto improveWithFourSidePerimeter = [&](Design& incumbent,
+                                             EvalReport& incumbentRpt,
+                                             const string& stage) {
+        if (programRuntimeSecondsMain() + 5.0 >= opt.timeLimitSeconds) {
+            cerr << "[FourSidePerimeter] skip stage=" << stage
+                 << " reason=deadline_reserve\n";
+            return false;
+        }
+        // An open route is exactly one of the failures the perimeter halo can
+        // repair, so do not gate this on hasFail().  Geometry/format failures
+        // are unrelated to route space and must still fail closed.
+        if (incumbentRpt.formatFailed || incumbentRpt.blockOverlap ||
+            incumbentRpt.outlineViolation) {
+            return false;
+        }
+        if (!incumbentRpt.routingOpen && totalPenalty(incumbentRpt) <= 1.0)
+            return false;
+        vector<Design> perimeterSeeds;
+        if (!makeFourSidePerimeterCandidatesMain(incumbent, perimeterSeeds, 3)) {
+            cerr << "[FourSidePerimeter] skip stage=" << stage
+                 << " reason=no_four_side_slack"
+                 << " outline=" << incumbent.outlineW << "x" << incumbent.outlineH
+                 << " max=" << incumbent.maxOutlineW << "x" << incumbent.maxOutlineH
+                 << "\n";
+            return false;
+        }
+
+        bool havePerimeter = false;
+        Design bestPerimeterDesign;
+        EvalReport bestPerimeterRpt;
+        for (int pi = 0; pi < static_cast<int>(perimeterSeeds.size()); ++pi) {
+            if (pi > 0 && programRuntimeSecondsMain() + 3.0 >=
+                    opt.timeLimitSeconds - 2.0) break;
+            EvalReport perimeterRpt;
+            Design perimeterTrial = bestRoutedCandidate(
+                perimeterSeeds[pi], perimeterRpt, nullptr,
+                /*edgeAsMovableHard=*/true);
+            cerr << fixed << setprecision(3)
+                 << "[FourSidePerimeter] trial stage=" << stage
+                 << " cand=" << pi
+                 << " core=" << perimeterSeeds[pi].routingCoreW << "x"
+                 << perimeterSeeds[pi].routingCoreH
+                 << " outline=" << perimeterSeeds[pi].outlineW << "x"
+                 << perimeterSeeds[pi].outlineH
+                 << " area=" << perimeterRpt.outlineArea
+                 << " overflow=" << perimeterRpt.totalChannelOverflow
+                 << " wl=" << perimeterRpt.totalWireLength
+                 << " cost=" << perimeterRpt.cost
+                 << " fail=" << (perimeterRpt.hasFail() ? "Y" : "N")
+                 << "\n";
+            if (perimeterRpt.hasFail()) continue;
+            if (!havePerimeter || betterEval(perimeterRpt, bestPerimeterRpt)) {
+                bestPerimeterDesign = std::move(perimeterTrial);
+                bestPerimeterRpt = perimeterRpt;
+                havePerimeter = true;
+            }
+        }
+        if (!havePerimeter || !betterEval(bestPerimeterRpt, incumbentRpt)) return false;
+        cerr << fixed << setprecision(3)
+             << "[FourSidePerimeter] accept stage=" << stage
+             << " area=" << incumbentRpt.outlineArea
+             << "->" << bestPerimeterRpt.outlineArea
+             << " overflow=" << incumbentRpt.totalChannelOverflow
+             << "->" << bestPerimeterRpt.totalChannelOverflow
+             << " cost=" << incumbentRpt.cost << "->" << bestPerimeterRpt.cost
+             << "\n";
+        incumbent = std::move(bestPerimeterDesign);
+        incumbentRpt = bestPerimeterRpt;
+        return true;
+    };
 
     if (opt.routeCfgBlocksProvided) {
         ifstream fin(opt.routeCfgBlocksPath, ios::binary);
@@ -2834,6 +3729,161 @@ int main(int argc, char** argv) {
         if (!parsePortfolioCfg(cfgText.c_str(), cfgBase, cfgSeed)) {
             cerr << "[RouteCfgBlocks] parse failed: " << opt.routeCfgBlocksPath << " detail=" << gLastPortfolioParseError << "\n";
             return 1;
+        }
+        if (opt.spreadCfgX > 1.0 || opt.spreadCfgY > 1.0) {
+            for (BlockInst& block : cfgSeed.blocks) {
+                block.rect.x = static_cast<double>(llround(block.rect.x * opt.spreadCfgX));
+                block.rect.y = static_cast<double>(llround(block.rect.y * opt.spreadCfgY));
+            }
+            cfgSeed.outlineW = ceil(cfgSeed.outlineW * opt.spreadCfgX);
+            cfgSeed.outlineH = ceil(cfgSeed.outlineH * opt.spreadCfgY);
+            cerr << fixed << setprecision(4)
+                 << "[RouteCfgBlocks] spread x=" << opt.spreadCfgX
+                 << " y=" << opt.spreadCfgY
+                 << " outline=" << cfgSeed.outlineW << "x" << cfgSeed.outlineH
+                 << "\n";
+        }
+        if (opt.padCfgX > 0.0 || opt.padCfgY > 0.0) {
+            for (BlockInst& block : cfgSeed.blocks) {
+                block.rect.x += opt.padCfgX;
+                block.rect.y += opt.padCfgY;
+            }
+            cfgSeed.outlineW += 2.0 * opt.padCfgX;
+            cfgSeed.outlineH += 2.0 * opt.padCfgY;
+            cerr << fixed << setprecision(3)
+                 << "[RouteCfgBlocks] pad x=" << opt.padCfgX
+                 << " y=" << opt.padCfgY
+                 << " outline=" << cfgSeed.outlineW << 'x' << cfgSeed.outlineH
+                 << "\n";
+        }
+        for (const Options::CfgBlockOverride& blockOverride : opt.cfgBlockOverrides) {
+            auto it = cfgSeed.blockNameToIndex.find(blockOverride.name);
+            if (it == cfgSeed.blockNameToIndex.end()) {
+                cerr << "[RouteCfgBlocks] unknown --set-cfg-block name: " << blockOverride.name << "\n";
+                return 1;
+            }
+            BlockInst& block = cfgSeed.blocks[it->second];
+            block.rect = Rect{ blockOverride.x, blockOverride.y, blockOverride.w, blockOverride.h };
+            cerr << fixed << setprecision(3)
+                 << "[RouteCfgBlocks] override " << blockOverride.name
+                 << " rect=(" << block.rect.x << ',' << block.rect.y << ','
+                 << block.rect.w << ',' << block.rect.h << ")\n";
+        }
+        if (opt.jiggleCfgIterations > 0) {
+            auto centerHpwl = [&](const vector<BlockInst>& blocks) {
+                double score = 0.0;
+                for (const Connection& conn : cfgSeed.connections) {
+                    if (conn.src < 0 || conn.dst < 0 ||
+                        conn.src >= static_cast<int>(blocks.size()) ||
+                        conn.dst >= static_cast<int>(blocks.size())) continue;
+                    score += static_cast<double>(conn.netCount) *
+                        manhattan(rectCx(blocks[conn.src].rect), rectCy(blocks[conn.src].rect),
+                                  rectCx(blocks[conn.dst].rect), rectCy(blocks[conn.dst].rect));
+                }
+                return score;
+            };
+            auto placementFits = [&](const vector<BlockInst>& blocks, int movedId) {
+                const Rect& moved = blocks[movedId].rect;
+                if (moved.x < -EPS || moved.y < -EPS ||
+                    rectRight(moved) > cfgSeed.outlineW + EPS ||
+                    rectTop(moved) > cfgSeed.outlineH + EPS) return false;
+                for (int other = 0; other < static_cast<int>(blocks.size()); ++other) {
+                    if (other == movedId) continue;
+                    if (rectOverlapAreaPositive(moved, blocks[other].rect)) return false;
+                }
+                return true;
+            };
+
+            vector<int> movable;
+            for (int id = 0; id < static_cast<int>(cfgSeed.blocks.size()); ++id) {
+                if (cfgSeed.blocks[id].spec.type != BlockType::EDGE) movable.push_back(id);
+            }
+            mt19937 rng(opt.randomSeed ^ 0xC6F1A9E5u);
+            uniform_real_distribution<double> unit(0.0, 1.0);
+            uniform_int_distribution<int> movablePick(0, max(0, static_cast<int>(movable.size()) - 1));
+            uniform_int_distribution<int> blockPick(0, max(0, static_cast<int>(cfgSeed.blocks.size()) - 1));
+            vector<BlockInst> current = cfgSeed.blocks;
+            vector<BlockInst> best = current;
+            double currentHpwl = centerHpwl(current);
+            const double initialHpwl = currentHpwl;
+            double bestHpwl = currentHpwl;
+            int accepted = 0;
+            for (int iter = 0; iter < opt.jiggleCfgIterations && !movable.empty(); ++iter) {
+                const int id = movable[movablePick(rng)];
+                const Rect oldRect = current[id].rect;
+                Rect trial = oldRect;
+                const double progress = static_cast<double>(iter) / max(1, opt.jiggleCfgIterations - 1);
+                const double jitterScale = (0.22 * (1.0 - progress) + 0.015) *
+                    min(cfgSeed.outlineW, cfgSeed.outlineH);
+                if (unit(rng) < 0.78) {
+                    double sx = 0.0, sy = 0.0, sw = 0.0;
+                    for (const Connection& conn : cfgSeed.connections) {
+                        int other = -1;
+                        if (conn.src == id) other = conn.dst;
+                        else if (conn.dst == id) other = conn.src;
+                        if (other < 0 || other >= static_cast<int>(current.size())) continue;
+                        const double w = max(1, conn.netCount);
+                        sx += w * rectCx(current[other].rect);
+                        sy += w * rectCy(current[other].rect);
+                        sw += w;
+                    }
+                    if (sw > 0.0) {
+                        trial.x = sx / sw - trial.w * 0.5 + (unit(rng) * 2.0 - 1.0) * jitterScale;
+                        trial.y = sy / sw - trial.h * 0.5 + (unit(rng) * 2.0 - 1.0) * jitterScale;
+                    }
+                }
+                else {
+                    trial.x = unit(rng) * max(0.0, cfgSeed.outlineW - trial.w);
+                    trial.y = unit(rng) * max(0.0, cfgSeed.outlineH - trial.h);
+                }
+                if (unit(rng) < 0.58) {
+                    const Rect& guide = current[blockPick(rng)].rect;
+                    const double gap = unit(rng) < 0.72 ? 0.0 : 25.0;
+                    switch (static_cast<int>(unit(rng) * 4.0)) {
+                    case 0: trial.x = guide.x; break;
+                    case 1: trial.x = rectRight(guide) + gap; break;
+                    case 2: trial.x = guide.x - trial.w - gap; break;
+                    default: trial.x = rectRight(guide) - trial.w; break;
+                    }
+                }
+                if (unit(rng) < 0.58) {
+                    const Rect& guide = current[blockPick(rng)].rect;
+                    const double gap = unit(rng) < 0.72 ? 0.0 : 25.0;
+                    switch (static_cast<int>(unit(rng) * 4.0)) {
+                    case 0: trial.y = guide.y; break;
+                    case 1: trial.y = rectTop(guide) + gap; break;
+                    case 2: trial.y = guide.y - trial.h - gap; break;
+                    default: trial.y = rectTop(guide) - trial.h; break;
+                    }
+                }
+                trial.x = static_cast<double>(llround(clamp(trial.x, 0.0, max(0.0, cfgSeed.outlineW - trial.w))));
+                trial.y = static_cast<double>(llround(clamp(trial.y, 0.0, max(0.0, cfgSeed.outlineH - trial.h))));
+                current[id].rect = trial;
+                if (!placementFits(current, id)) {
+                    current[id].rect = oldRect;
+                    continue;
+                }
+                const double trialHpwl = centerHpwl(current);
+                const double delta = trialHpwl - currentHpwl;
+                const double temperature = max(1.0, initialHpwl * (0.008 * (1.0 - progress) + 0.00002));
+                if (delta <= 0.0 || unit(rng) < exp(-min(delta / temperature, 700.0))) {
+                    currentHpwl = trialHpwl;
+                    ++accepted;
+                    if (currentHpwl < bestHpwl) {
+                        bestHpwl = currentHpwl;
+                        best = current;
+                    }
+                }
+                else {
+                    current[id].rect = oldRect;
+                }
+            }
+            cfgSeed.blocks = std::move(best);
+            cerr << fixed << setprecision(3)
+                 << "[RouteCfgBlocks/Jiggle] iterations=" << opt.jiggleCfgIterations
+                 << " accepted=" << accepted
+                 << " centerHpwl=" << initialHpwl << "->" << bestHpwl
+                 << "\n";
         }
         cfgSeed.channels.clear();
         cfgSeed.routes.clear();
@@ -2879,6 +3929,9 @@ int main(int argc, char** argv) {
                 bestCfgRpt = bestDetourRpt;
             }
         }
+        if (!opt.skipCfgPerimeter) {
+            improveWithFourSidePerimeter(bestCfgDesign, bestCfgRpt, "route-cfg-blocks");
+        }
         writer.write(opt.outputPath, bestCfgDesign);
         router.printDetourReport(bestCfgDesign);
         bestCfgRpt = evaluator.evaluate(bestCfgDesign, opt.alpha, programRuntimeSecondsMain());
@@ -2886,35 +3939,201 @@ int main(int argc, char** argv) {
         return bestCfgRpt.hasFail() ? 2 : 0;
     }
 
+    // ------------------------------------------------------------------
+    // Fail-safe checkpoint
+    // ------------------------------------------------------------------
+    // Write a complete placement before any unbounded-quality work.  If the
+    // process is externally killed while RouterLite or floorplan SA is running,
+    // OutputWriter's atomic replacement leaves this cfg intact instead of
+    // producing NO_OUTPUT_CFG or a truncated file.
+    Design checkpointSeed;
+    string checkpointSeedOrigin = "emergency-shelf";
+    bool haveLegalCheckpointPlacement = false;
+    for (int edgeMode = 0; edgeMode <= 2 && !haveLegalCheckpointPlacement; ++edgeMode) {
+        Design trial = design;
+        const vector<BlockSpec> emergencyOfficialSpecs =
+            convertEdgeToMovableHardForPackingMain(trial);
+        Floorplanner emergencyFloorplanner;
+        emergencyFloorplanner.setEdgePlacementMode(edgeMode);
+        emergencyFloorplanner.runEmergencyFallback(trial);
+        if (!restoreOfficialBlockSpecsMain(trial, emergencyOfficialSpecs))
+            continue;
 
-    const int aggressiveFastCaseId = detectKnownCaseId(opt.inputPath);
-    if (aggressiveFastCaseId >= 0 && aggressiveFastCaseId <= 4) {
-        vector<Design> aggressiveSeeds;
-        vector<string> aggressiveOrigins;
-        if (makeAggressiveClusterSeedsMain(opt.inputPath, design, aggressiveSeeds, aggressiveOrigins) && !aggressiveSeeds.empty()) {
-            EvalReport fastRpt;
-            Design fastDesign = bestRoutedCandidate(aggressiveSeeds.front(), fastRpt);
-            cerr << fixed << setprecision(3)
-                << "[AggressiveClusterFastPath] case=" << aggressiveFastCaseId
-                << " area=" << fastRpt.outlineArea
-                << " wl=" << fastRpt.totalWireLength
-                << " penalty=" << totalPenalty(fastRpt)
-                << " cost=" << fastRpt.cost
-                << " fail=" << (fastRpt.hasFail() ? "Y" : "N")
-                << "\n";
-            if (!fastRpt.hasFail()) {
-                fastRpt = evaluator.evaluate(fastDesign, opt.alpha, programRuntimeSecondsMain());
-                bool writeOk = writer.write(opt.outputPath, fastDesign);
-                if (!writeOk) {
-                    cerr << "[OutputWriter] Failed to write cfg: " << opt.outputPath << "\n";
-                    return 1;
-                }
-                router.printDetourReport(fastDesign);
-                Logger::printFinalReport(fastDesign, fastRpt, opt.alpha, opt.inputPath, opt.outputPath);
-                return fastRpt.hasFail() ? 2 : 0;
+        Design integerTrial;
+        const bool integerized =
+            makeIntegerGridFloorplanCandidateMain(
+                trial, integerTrial, /*edgeAsHardBlock=*/true) ||
+            makeGreedyIntegerEmergencyPlacementMain(trial, integerTrial);
+        if (!integerized || !geometryIsIntegerMain(integerTrial) ||
+            !placementLegalAfterMove(integerTrial, integerTrial.blocks)) continue;
+        trial = std::move(integerTrial);
+        checkpointSeed = std::move(trial);
+        checkpointSeedOrigin += "-edge-mode-" + to_string(edgeMode);
+        haveLegalCheckpointPlacement = true;
+    }
+    if (!haveLegalCheckpointPlacement) {
+        cerr << "[FailSafe] failed to construct a legal integer emergency placement\n";
+        return 1;
+    }
+    checkpointSeed.channels.clear();
+    checkpointSeed.routes.clear();
+    if (!writer.write(opt.outputPath, checkpointSeed)) {
+        cerr << "[FailSafe] failed to write initial placement checkpoint: "
+            << opt.outputPath << "\n";
+        return 1;
+    }
+    cerr << fixed << setprecision(3)
+        << "[FailSafe] placement-checkpoint"
+        << " origin=" << checkpointSeedOrigin
+        << " elapsed=" << programRuntimeSecondsMain()
+        << " output=" << opt.outputPath
+        << "\n";
+
+    auto watchdogDone = make_shared<atomic<bool>>(false);
+    const auto watchdogDeadline = PROGRAM_START_TIME_MAIN +
+        chrono::duration_cast<chrono::steady_clock::duration>(
+            chrono::duration<double>(opt.timeLimitSeconds));
+    thread([watchdogDone, watchdogDeadline]() {
+        while (!watchdogDone->load(memory_order_relaxed)) {
+            const auto now = chrono::steady_clock::now();
+            if (now >= watchdogDeadline) {
+                // Do not acquire an iostream/file lock here.  The main thread
+                // may be inside logging or atomic checkpoint serialization;
+                // _Exit leaves the last completed target file untouched.
+                std::_Exit(0);
             }
+            const auto remaining = watchdogDeadline - now;
+            this_thread::sleep_for(min(
+                chrono::duration_cast<chrono::milliseconds>(remaining),
+                chrono::milliseconds(250)));
+        }
+    }).detach();
+    cerr << fixed << setprecision(3)
+        << "[FailSafe] watchdog-armed"
+        << " deadlineSec=" << opt.timeLimitSeconds
+        << " remaining=" << max(0.0,
+            opt.timeLimitSeconds - programRuntimeSecondsMain())
+        << "\n";
+
+    // A legal placement alone is not a useful timeout fallback when a packed
+    // endpoint has no graph access.  Repair those local access cuts before the
+    // expensive floorplan search, then route and checkpoint the repaired seed.
+    // EDGE participates exactly like a movable HARD obstacle here; LOCATION is
+    // deliberately absent from the repair objective.
+    Design checkpointRouteSeed = checkpointSeed;
+    if (edgeAsHardBlockFloorplan) {
+        Design repairedSeed = checkpointSeed;
+        bool accessImproved = false;
+        int repairRounds = 0;
+        for (; repairRounds < 12; ++repairRounds) {
+            const FloorplanReachabilityProxyMain before =
+                floorplanReachabilityProxyMain(repairedSeed);
+            if (before.openPairs <= 0) break;
+
+            vector<Design> repairs;
+            if (!makeEndpointAccessRepairCandidatesMain(
+                    repairedSeed, repairs, 16)) break;
+
+            int bestIndex = -1;
+            FloorplanReachabilityProxyMain bestReach;
+            double bestHpwl = numeric_limits<double>::infinity();
+            for (int ri = 0; ri < static_cast<int>(repairs.size()); ++ri) {
+                const FloorplanReachabilityProxyMain reach =
+                    floorplanReachabilityProxyMain(repairs[ri]);
+                const double hpwl = centerHpwlFloorplanProxyMain(repairs[ri]);
+                if (bestIndex < 0 || reach.openPairs < bestReach.openPairs ||
+                    (reach.openPairs == bestReach.openPairs &&
+                     reach.missingAccessBlocks < bestReach.missingAccessBlocks) ||
+                    (reach.openPairs == bestReach.openPairs &&
+                     reach.missingAccessBlocks == bestReach.missingAccessBlocks &&
+                     hpwl < bestHpwl)) {
+                    bestIndex = ri;
+                    bestReach = reach;
+                    bestHpwl = hpwl;
+                }
+            }
+            if (bestIndex < 0 || bestReach.openPairs >= before.openPairs) break;
+            repairedSeed = std::move(repairs[bestIndex]);
+            accessImproved = true;
+        }
+        if (accessImproved) {
+            checkpointRouteSeed = std::move(repairedSeed);
+            checkpointRouteSeed.channels.clear();
+            checkpointRouteSeed.routes.clear();
+            writer.write(opt.outputPath, checkpointRouteSeed);
+            const FloorplanReachabilityProxyMain after =
+                floorplanReachabilityProxyMain(checkpointRouteSeed);
+            cerr << "[FailSafe] endpoint-access-repair"
+                 << " rounds=" << repairRounds
+                 << " graphOpen=" << after.openPairs
+                 << " missingAccessBlocks=" << after.missingAccessBlocks
+                 << "\n";
         }
     }
+
+    EvalReport checkpointRpt;
+    Design checkpointDesign = bestRoutedCandidate(checkpointRouteSeed, checkpointRpt);
+    bool checkpointHaveEvaluation = true;
+    if (!writer.write(opt.outputPath, checkpointDesign)) {
+        cerr << "[FailSafe] failed to write routed checkpoint: "
+            << opt.outputPath << "\n";
+        return 1;
+    }
+    cerr << fixed << setprecision(3)
+        << "[FailSafe] routed-checkpoint"
+        << " origin=" << checkpointSeedOrigin
+        << " fail=" << (checkpointRpt.hasFail() ? "Y" : "N")
+        << " open=" << checkpointRpt.openPathCount
+        << " cost=" << checkpointRpt.cost
+        << " elapsed=" << programRuntimeSecondsMain()
+        << "\n";
+
+    auto checkpointIfBetter = [&](const Design& candidate,
+                                  const EvalReport& candidateRpt,
+                                  const string& stage) {
+        if (candidateRpt.hasFail() ||
+            !geometryIsIntegerMain(candidate) ||
+            !placementLegalAfterMove(candidate, candidate.blocks)) {
+            cerr << "[FailSafe] checkpoint-reject stage=" << stage
+                << " reason=illegal_or_non_integer"
+                << " fail=" << (candidateRpt.hasFail() ? "Y" : "N")
+                << " open=" << candidateRpt.openPathCount << "\n";
+            return false;
+        }
+        if (checkpointHaveEvaluation &&
+            !betterEval(candidateRpt, checkpointRpt)) {
+            return false;
+        }
+        if (!writer.write(opt.outputPath, candidate)) {
+            cerr << "[FailSafe] checkpoint write failed stage=" << stage
+                << " output=" << opt.outputPath << "\n";
+            return false;
+        }
+        cerr << fixed << setprecision(3)
+            << "[FailSafe] checkpoint-update"
+            << " stage=" << stage
+            << " fail=" << (candidateRpt.hasFail() ? "Y" : "N")
+            << " open=" << candidateRpt.openPathCount
+            << " cost=" << candidateRpt.cost
+            << " elapsed=" << programRuntimeSecondsMain()
+            << "\n";
+        checkpointDesign = candidate;
+        checkpointRpt = candidateRpt;
+        checkpointHaveEvaluation = true;
+        return true;
+    };
+
+    auto failSafeRemainingSeconds = [&]() {
+        return opt.timeLimitSeconds - programRuntimeSecondsMain();
+    };
+
+    const double finalizationReserveSeconds =
+        min(10.0, max(4.0, 0.08 * opt.timeLimitSeconds));
+    auto qualitySearchAllowed = [&](double estimatedWorkSeconds = 0.0) {
+        return failSafeRemainingSeconds() >
+            finalizationReserveSeconds + max(0.0, estimatedWorkSeconds);
+    };
+
 
     auto sameFloorplanSeed = [](const Design& a, const Design& b) {
         if (a.blocks.size() != b.blocks.size()) return false;
@@ -2938,6 +4157,137 @@ int main(int argc, char** argv) {
         return true;
         };
 
+    auto prioritizeFloorplanSeeds = [&](vector<Design>& seeds,
+                                        vector<string>& origins) {
+        const int count = static_cast<int>(seeds.size());
+        if (count <= 1) return;
+        struct SeedMetric {
+            double area = 0.0;
+            double hpwl = 0.0;
+            double largestVoid = 0.0;
+            double proxy = 0.0;
+            int bucket = 0;
+            int graphOpenPairs = 0;
+            int missingAccessBlocks = 0;
+        };
+        vector<SeedMetric> metrics(count);
+        int minimumGraphOpenPairs = numeric_limits<int>::max();
+        for (int i = 0; i < count; ++i) {
+            SeedMetric& metric = metrics[i];
+            metric.area = max(1.0, seeds[i].outlineW * seeds[i].outlineH);
+            metric.hpwl = centerHpwlFloorplanProxyMain(seeds[i]);
+            metric.largestVoid = largestEmptyFloorplanCellMain(seeds[i]);
+            metric.bucket = floorplanAspectBucketMain(seeds[i]);
+            const double ratio = seeds[i].outlineW /
+                max(1.0, seeds[i].outlineH);
+            const double extreme = max(0.0,
+                fabs(log(max(1.0e-9, ratio))) - log(1.80));
+            metric.proxy = metric.area + opt.alpha * metric.hpwl
+                + 0.08 * metric.largestVoid
+                + 0.20 * metric.area * extreme * extreme;
+            const FloorplanReachabilityProxyMain reach =
+                floorplanReachabilityProxyMain(seeds[i]);
+            metric.graphOpenPairs = reach.openPairs;
+            metric.missingAccessBlocks = reach.missingAccessBlocks;
+            minimumGraphOpenPairs = min(
+                minimumGraphOpenPairs, metric.graphOpenPairs);
+        }
+
+        vector<int> order;
+        vector<char> used(count, 0);
+        auto addIndex = [&](int index) {
+            if (index < 0 || index >= count || used[index]) return;
+            used[index] = 1;
+            order.push_back(index);
+        };
+        auto bestIndex = [&](auto predicate, auto key) {
+            int best = -1;
+            double bestKey = numeric_limits<double>::infinity();
+            for (int i = 0; i < count; ++i) {
+                if (used[i] || !predicate(i)) continue;
+                const double value = key(i);
+                if (best < 0 || value < bestKey - 1.0e-9 ||
+                    (fabs(value - bestKey) <= 1.0e-9 && i < best)) {
+                    best = i;
+                    bestKey = value;
+                }
+            }
+            return best;
+        };
+
+        // Route the candidates with the fewest provably disconnected pairs
+        // first. The fail-safe checkpoint is already on disk, so the committed
+        // SA result does not get to consume the first expensive RouterLite slot
+        // merely because it was inserted first.
+        addIndex(bestIndex([](int) { return true; }, [&](int i) {
+            return 1.0e15 * metrics[i].graphOpenPairs +
+                1.0e12 * metrics[i].missingAccessBlocks + metrics[i].proxy;
+        }));
+        addIndex(bestIndex([&](int i) {
+                return metrics[i].graphOpenPairs == minimumGraphOpenPairs;
+            }, [&](int i) { return metrics[i].proxy; }));
+        addIndex(bestIndex([&](int i) {
+                return metrics[i].graphOpenPairs == minimumGraphOpenPairs;
+            },
+            [&](int i) { return metrics[i].area; }));
+        addIndex(bestIndex([&](int i) {
+                return metrics[i].graphOpenPairs == minimumGraphOpenPairs;
+            },
+            [&](int i) {
+                return metrics[i].largestVoid /
+                    max(1.0, metrics[i].area);
+            }));
+
+        const int preferredBuckets[] = { 2, 3, 1, 4, 0, 5 };
+        for (int bucket : preferredBuckets) {
+            addIndex(bestIndex([&](int i) {
+                    return metrics[i].bucket == bucket &&
+                        metrics[i].graphOpenPairs == minimumGraphOpenPairs;
+                }, [&](int i) { return metrics[i].proxy; }));
+        }
+        addIndex(0);
+        while (static_cast<int>(order.size()) < count) {
+            const int next = bestIndex([](int) { return true; },
+                [&](int i) {
+                    return 1.0e15 * metrics[i].graphOpenPairs +
+                        1.0e12 * metrics[i].missingAccessBlocks +
+                        metrics[i].proxy;
+                });
+            if (next < 0) break;
+            addIndex(next);
+        }
+
+        vector<Design> reorderedSeeds;
+        vector<string> reorderedOrigins;
+        reorderedSeeds.reserve(seeds.size());
+        reorderedOrigins.reserve(seeds.size());
+        for (int index : order) {
+            reorderedSeeds.push_back(std::move(seeds[index]));
+            reorderedOrigins.push_back(index < static_cast<int>(origins.size())
+                ? origins[index] : "unknown");
+        }
+        seeds.swap(reorderedSeeds);
+        origins.swap(reorderedOrigins);
+
+        const int printCount = min(10, static_cast<int>(seeds.size()));
+        for (int i = 0; i < printCount; ++i) {
+            const int oldIndex = order[i];
+            cerr << fixed << setprecision(3)
+                << "[FloorplanSeedPriority] rank=" << i
+                << " origin=" << origins[i]
+                << " W/H=" << seeds[i].outlineW << "x" << seeds[i].outlineH
+                << " area=" << metrics[oldIndex].area
+                << " hpwl=" << metrics[oldIndex].hpwl
+                << " largestVoid=" << metrics[oldIndex].largestVoid
+                << " aspectBucket=" << metrics[oldIndex].bucket
+                << " graphOpen=" << metrics[oldIndex].graphOpenPairs
+                << " missingAccessBlocks="
+                << metrics[oldIndex].missingAccessBlocks
+                << " proxy=" << metrics[oldIndex].proxy
+                << "\n";
+        }
+        };
+
     struct RepairPortfolioItem {
         Design routed;
         EvalReport rpt;
@@ -2947,15 +4297,36 @@ int main(int argc, char** argv) {
     };
 
     auto routeFloorplanSeeds = [&](const vector<Design>& seeds, const vector<string>& origins, EvalReport& outRpt, Design& outSeed, const string& tag,
-        vector<Router::FailureCertificate>* outCerts = nullptr, vector<RepairPortfolioItem>* repairPortfolio = nullptr) {
+        vector<Router::FailureCertificate>* outCerts = nullptr, vector<RepairPortfolioItem>* repairPortfolio = nullptr,
+        int seedLimitOverride = -1) {
             bool have = false;
             Design best;
             vector<Router::FailureCertificate> bestCerts;
-            for (int si = 0; si < static_cast<int>(seeds.size()); ++si) {
+            const bool smallAspectPortfolio =
+                !isLargeDenseCase && seeds.size() > 4 &&
+                design.blockSpecs.size() <= 12;
+            const int defaultSeedLimit = isLargeDenseCase
+                ? min(2, static_cast<int>(seeds.size()))
+                : (smallAspectPortfolio
+                    ? min(8, static_cast<int>(seeds.size()))
+                    : (isResourceBoundedCase
+                    ? min(12, static_cast<int>(seeds.size()))
+                    : min(8, static_cast<int>(seeds.size()))));
+            const int seedLimit = seedLimitOverride > 0
+                ? min(seedLimitOverride, static_cast<int>(seeds.size()))
+                : defaultSeedLimit;
+            for (int si = 0; si < seedLimit; ++si) {
+                if (si > 0 && !qualitySearchAllowed(3.0)) {
+                    cerr << "[FloorplanArchiveRoute] stop tag=" << tag
+                        << " reason=deadline_reserve tested=" << si << "\n";
+                    break;
+                }
                 const string origin = si < static_cast<int>(origins.size()) ? origins[si] : "unknown";
                 EvalReport seedRpt;
                 vector<Router::FailureCertificate> seedCerts;
-                Design routed = bestRoutedCandidate(seeds[si], seedRpt, &seedCerts);
+                vector<Router::FailureCertificate>* seedCertTarget =
+                    (outCerts || repairPortfolio) ? &seedCerts : nullptr;
+                Design routed = bestRoutedCandidate(seeds[si], seedRpt, seedCertTarget);
                 const double seedPenalty = totalPenalty(seedRpt);
                 cerr << fixed << setprecision(3)
                     << "[FloorplanArchiveRoute] tag=" << tag
@@ -2994,25 +4365,165 @@ int main(int argc, char** argv) {
                     bestCerts = std::move(seedCerts);
                     have = true;
                 }
+                const FloorplanReachabilityProxyMain seedReach =
+                    floorplanReachabilityProxyMain(seeds[si]);
+                if (edgeAsHardBlockFloorplan &&
+                    seedRpt.openPathCount == 1 &&
+                    seedReach.missingAccessBlocks > 0 &&
+                    !seedRpt.blockOverlap && !seedRpt.outlineViolation) {
+                    cerr << "[FloorplanArchiveRoute] stop tag=" << tag
+                        << " reason=targeted_endpoint_repair tested="
+                        << (si + 1) << "\n";
+                    break;
+                }
             }
             if (outCerts) *outCerts = bestCerts;
             return best;
         };
 
     // One-way architecture:    // Parser -> Floorplanner -> ChannelBuilder -> Router -> Evaluator -> OutputWriter
+    Design floorplanInputDesign = design;
+    const vector<BlockSpec> officialFloorplanSpecs =
+        floorplanInputDesign.blockSpecs;
+    auto restoreOfficialEdgeSpecs = [&](Design& candidate) {
+        return restoreOfficialBlockSpecsMain(candidate, officialFloorplanSpecs);
+        };
+    if (edgeAsHardBlockFloorplan) {
+        // Convert both the canonical specs and any populated block instances.
+        // Fixed dimensions are retained; only LOCATION-based placement behavior
+        // is removed while packing. The official EDGE specs are restored before
+        // routing/evaluation so PORT EDGE, no-feedthrough, and displacement
+        // penalty semantics stay identical to the contest evaluator.
+        convertEdgeToMovableHardForPackingMain(design);
+        cerr << "[EdgeAsHardBlock] enabled edge blocks are movable fixed-shape obstacles"
+             << " with evaluator-gated location penalty\n";
+    }
     floorplanner.setEdgePlacementMode(0);
+    const double remainingBeforeFloorplan = max(0.25, failSafeRemainingSeconds());
+    const double floorplanReserve = min(
+        finalizationReserveSeconds + 8.0,
+        max(0.5, 0.35 * remainingBeforeFloorplan));
+    const double floorplanBudgetCap = edgeAsHardBlockFloorplan
+        ? min(10.0, 0.18 * opt.timeLimitSeconds)
+        : 120.0;
+    const double floorplanBudgetSeconds = min(
+        floorplanBudgetCap,
+        max(0.25, min(
+            0.38 * opt.timeLimitSeconds,
+            remainingBeforeFloorplan - floorplanReserve)));
+    floorplanner.setTimeBudgetSeconds(floorplanBudgetSeconds);
+    cerr << fixed << setprecision(3)
+        << "[FloorplanBudget] seconds=" << floorplanBudgetSeconds
+        << " remaining=" << failSafeRemainingSeconds()
+        << " dense=" << (isLargeDenseCase ? "Y" : "N")
+        << " resourceBounded=" << (isResourceBoundedCase ? "Y" : "N")
+        << "\n";
     floorplanner.run(design);
+    if (!restoreOfficialEdgeSpecs(design)) {
+        cerr << "[EdgeAsHardBlock] failed to restore official block specs\n";
+        design = checkpointDesign;
+    }
     Design floorplannedDesign = design;
     vector<Design> floorplanSeeds;
     vector<string> floorplanSeedOrigins;
     addFloorplanSeed(floorplanSeeds, floorplanSeedOrigins, floorplannedDesign, "committed");
+    addFloorplanSeed(floorplanSeeds, floorplanSeedOrigins,
+        checkpointSeed, "emergency-movable-hard");
     const vector<Design>& archived = floorplanner.archivedCandidates();
     const vector<string>& archivedOrigins = floorplanner.archivedCandidateOrigins();
     for (int ai = 0; ai < static_cast<int>(archived.size()); ++ai) {
-        const string origin = ai < static_cast<int>(archivedOrigins.size()) ? archivedOrigins[ai] : "archive";
-        addFloorplanSeed(floorplanSeeds, floorplanSeedOrigins, archived[ai], origin);
+        const string rawOrigin = ai < static_cast<int>(archivedOrigins.size()) ? archivedOrigins[ai] : "archive";
+        Design candidate = archived[ai];
+        if (!restoreOfficialEdgeSpecs(candidate)) continue;
+        const string origin = edgeAsHardBlockFloorplan
+            ? "edge-hard-" + rawOrigin : rawOrigin;
+        addFloorplanSeed(floorplanSeeds, floorplanSeedOrigins, candidate, origin);
     }
-    makeAggressiveClusterSeedsMain(opt.inputPath, design, floorplanSeeds, floorplanSeedOrigins);
+
+    // Turn the already-safe max-outline movable-HARD checkpoint into a useful
+    // quality seed by opening one blocked legal endpoint port per round. This
+    // keeps its relatively short routing topology while removing the packed
+    // shelf's guaranteed opens; LOCATION is never consulted.
+    if (edgeAsHardBlockFloorplan) {
+        Design accessSeed = checkpointSeed;
+        for (int round = 0; round < 8; ++round) {
+            const FloorplanReachabilityProxyMain before =
+                floorplanReachabilityProxyMain(accessSeed);
+            if (before.openPairs <= 0) break;
+            vector<Design> repairs;
+            if (!makeEndpointAccessRepairCandidatesMain(
+                    accessSeed, repairs, 12)) break;
+
+            int bestIndex = -1;
+            FloorplanReachabilityProxyMain bestReach;
+            double bestHpwl = numeric_limits<double>::infinity();
+            for (int ri = 0; ri < static_cast<int>(repairs.size()); ++ri) {
+                const FloorplanReachabilityProxyMain reach =
+                    floorplanReachabilityProxyMain(repairs[ri]);
+                const double hpwl = centerHpwlFloorplanProxyMain(repairs[ri]);
+                if (bestIndex < 0 || reach.openPairs < bestReach.openPairs ||
+                    (reach.openPairs == bestReach.openPairs &&
+                     reach.missingAccessBlocks < bestReach.missingAccessBlocks) ||
+                    (reach.openPairs == bestReach.openPairs &&
+                     reach.missingAccessBlocks == bestReach.missingAccessBlocks &&
+                     hpwl < bestHpwl)) {
+                    bestIndex = ri;
+                    bestReach = reach;
+                    bestHpwl = hpwl;
+                }
+                addFloorplanSeed(floorplanSeeds, floorplanSeedOrigins,
+                    repairs[ri], "emergency-access-" + to_string(round) +
+                        "-" + to_string(ri));
+            }
+            if (bestIndex < 0 || bestReach.openPairs >= before.openPairs) break;
+            accessSeed = repairs[bestIndex];
+        }
+    }
+
+    // Four-side escape is part of the routing topology, not merely a late
+    // overflow polish. Add small perimeter-halo variants before ranking so an
+    // internally moved EDGE/HARD endpoint can reach a channel outside the
+    // compact placement core without waiting until the deadline tail.
+    if (edgeAsHardBlockFloorplan) {
+        const int coreSeedCount = min(
+            12, static_cast<int>(floorplanSeeds.size()));
+        for (int si = 0; si < coreSeedCount; ++si) {
+            vector<Design> perimeterCandidates;
+            if (!makeFourSidePerimeterCandidatesMain(
+                    floorplanSeeds[si], perimeterCandidates, 2)) {
+                continue;
+            }
+            const string baseOrigin = si < static_cast<int>(
+                floorplanSeedOrigins.size())
+                ? floorplanSeedOrigins[si] : "edge-hard";
+            for (int pi = 0; pi < static_cast<int>(
+                    perimeterCandidates.size()); ++pi) {
+                addFloorplanSeed(floorplanSeeds, floorplanSeedOrigins,
+                    perimeterCandidates[pi],
+                    baseOrigin + "-four-side-" + to_string(pi));
+            }
+        }
+
+        const int spreadSourceCount = min(
+            24, static_cast<int>(floorplanSeeds.size()));
+        for (int si = 0; si < spreadSourceCount; ++si) {
+            vector<Design> spreadCandidates;
+            if (!makeCoordinateSpreadCandidatesMain(
+                    floorplanSeeds[si], spreadCandidates, 5)) {
+                continue;
+            }
+            const string baseOrigin = si < static_cast<int>(
+                floorplanSeedOrigins.size())
+                ? floorplanSeedOrigins[si] : "edge-hard";
+            for (int spi = 0; spi < static_cast<int>(
+                    spreadCandidates.size()); ++spi) {
+                addFloorplanSeed(floorplanSeeds, floorplanSeedOrigins,
+                    spreadCandidates[spi],
+                    baseOrigin + "-spread-" + to_string(spi));
+            }
+        }
+    }
+    prioritizeFloorplanSeeds(floorplanSeeds, floorplanSeedOrigins);
 
     EvalReport rpt;
     Design selectedFloorplanSeed = floorplannedDesign;
@@ -3020,18 +4531,159 @@ int main(int argc, char** argv) {
     vector<RepairPortfolioItem> baseRepairPortfolio;
     design = routeFloorplanSeeds(floorplanSeeds, floorplanSeedOrigins, rpt, selectedFloorplanSeed, "base", &currentCerts, &baseRepairPortfolio);
     floorplannedDesign = selectedFloorplanSeed;
-    if (rpt.hasFail() || totalPenalty(rpt) > 1.0) {
-        forceSoftFTRelaxedRouting = true;
-        EvalReport relaxedStartRpt;
-        Design relaxedSeed = floorplannedDesign;
-        vector<Router::FailureCertificate> relaxedCerts;
-        Design relaxedStart = routeFloorplanSeeds(floorplanSeeds, floorplanSeedOrigins, relaxedStartRpt, relaxedSeed, "relaxed", &relaxedCerts);
-        if (betterEval(relaxedStartRpt, rpt)) {
-            design = std::move(relaxedStart);
-            rpt = relaxedStartRpt;
-            floorplannedDesign = relaxedSeed;
-            currentCerts = std::move(relaxedCerts);
+
+    if (edgeAsHardBlockFloorplan && rpt.openPathCount > 0 &&
+        rpt.openPathCount <= 2 && qualitySearchAllowed(3.0)) {
+        vector<Design> accessRepairSeeds;
+        if (makeEndpointAccessRepairCandidatesMain(
+                floorplannedDesign, accessRepairSeeds, 10)) {
+            bool haveAccessRepair = false;
+            Design bestAccessRepairDesign;
+            Design bestAccessRepairSeed;
+            EvalReport bestAccessRepairRpt;
+            vector<Router::FailureCertificate> bestAccessRepairCerts;
+            for (int ri = 0; ri < static_cast<int>(
+                    accessRepairSeeds.size()) && qualitySearchAllowed(2.0);
+                    ++ri) {
+                EvalReport repairRpt;
+                vector<Router::FailureCertificate> repairCerts;
+                Design repaired = bestRoutedCandidate(
+                    accessRepairSeeds[ri], repairRpt, &repairCerts);
+                cerr << fixed << setprecision(3)
+                    << "[EndpointAccessRepair] cand=" << ri
+                    << " open=" << repairRpt.openPathCount
+                    << " chOv=" << repairRpt.totalChannelOverflow
+                    << " ftOv=" << repairRpt.totalFeedthroughOverflow
+                    << " edgeOffset=" << repairRpt.edgeLocationOffset
+                    << " cost=" << repairRpt.cost
+                    << " fail=" << (repairRpt.hasFail() ? "Y" : "N")
+                    << "\n";
+                if (!haveAccessRepair ||
+                    betterEval(repairRpt, bestAccessRepairRpt)) {
+                    bestAccessRepairDesign = std::move(repaired);
+                    bestAccessRepairSeed = accessRepairSeeds[ri];
+                    bestAccessRepairRpt = repairRpt;
+                    bestAccessRepairCerts = std::move(repairCerts);
+                    haveAccessRepair = true;
+                }
+                if (!repairRpt.hasFail()) break;
+            }
+            if (haveAccessRepair && betterEval(bestAccessRepairRpt, rpt)) {
+                design = std::move(bestAccessRepairDesign);
+                rpt = bestAccessRepairRpt;
+                selectedFloorplanSeed = bestAccessRepairSeed;
+                floorplannedDesign = bestAccessRepairSeed;
+                currentCerts = std::move(bestAccessRepairCerts);
+            }
         }
+    }
+
+    checkpointIfBetter(design, rpt, "floorplan-base");
+
+    // The bounded warm-start is intentionally cheap, but its floorplan score is
+    // only a routing proxy.  For medium instances, let RouterLite veto warm
+    // candidates that are open or carry a real routing penalty before paying
+    // for the complete floorplan portfolio.  Dense
+    // all-pair cases keep the deterministic shelf path, while the 10-12 block
+    // cases keep their fast warm-start path when it is already routable.
+    if (forcedBoundedShortcut && mediumBoundedCase &&
+        (rpt.hasFail() || totalPenalty(rpt) > 1.0) &&
+        failSafeRemainingSeconds() > 120.0) {
+        cerr << fixed << setprecision(3)
+            << "[FloorplanRouterFallback] start"
+            << " blocks=" << design.blockSpecs.size()
+            << " connections=" << design.connections.size()
+            << " warmOpen=" << rpt.openPathCount
+            << " warmPenalty=" << totalPenalty(rpt)
+            << " warmCost=" << rpt.cost
+            << "\n";
+
+        Design portfolioInput = floorplanInputDesign;
+        const vector<BlockSpec> portfolioOfficialSpecs =
+            convertEdgeToMovableHardForPackingMain(portfolioInput);
+        Floorplanner portfolioFloorplanner;
+        portfolioFloorplanner.setEdgePlacementMode(0);
+        portfolioFloorplanner.setBoundedFastPathEnabled(false);
+        portfolioFloorplanner.run(portfolioInput);
+        restoreOfficialBlockSpecsMain(portfolioInput, portfolioOfficialSpecs);
+
+        vector<Design> portfolioSeeds;
+        vector<string> portfolioOrigins;
+        addFloorplanSeed(portfolioSeeds, portfolioOrigins,
+            portfolioInput, "router-fallback-committed");
+        const vector<Design>& portfolioArchive =
+            portfolioFloorplanner.archivedCandidates();
+        const vector<string>& portfolioArchiveOrigins =
+            portfolioFloorplanner.archivedCandidateOrigins();
+        for (int ai = 0; ai < static_cast<int>(portfolioArchive.size()); ++ai) {
+            const string origin = ai < static_cast<int>(portfolioArchiveOrigins.size())
+                ? "router-fallback-" + portfolioArchiveOrigins[ai]
+                : "router-fallback-archive";
+            Design candidate = portfolioArchive[ai];
+            if (restoreOfficialBlockSpecsMain(candidate, portfolioOfficialSpecs))
+                addFloorplanSeed(portfolioSeeds, portfolioOrigins,
+                    candidate, origin);
+        }
+
+        if (!portfolioSeeds.empty()) {
+            EvalReport portfolioRpt;
+            Design portfolioSelectedSeed = portfolioSeeds.front();
+            Design portfolioRouted = routeFloorplanSeeds(
+                portfolioSeeds, portfolioOrigins, portfolioRpt,
+                portfolioSelectedSeed, "router-fallback",
+                nullptr, nullptr, 8);
+            cerr << fixed << setprecision(3)
+                << "[FloorplanRouterFallback] result"
+                << " candidates=" << portfolioSeeds.size()
+                << " tested=" << min(8, static_cast<int>(portfolioSeeds.size()))
+                << " open=" << portfolioRpt.openPathCount
+                << " cost=" << portfolioRpt.cost
+                << " fail=" << (portfolioRpt.hasFail() ? "Y" : "N")
+                << "\n";
+            if (betterEval(portfolioRpt, rpt)) {
+                cerr << fixed << setprecision(3)
+                    << "[FloorplanRouterFallback] accept"
+                    << " open=" << rpt.openPathCount << "->"
+                    << portfolioRpt.openPathCount
+                    << " cost=" << rpt.cost << "->" << portfolioRpt.cost
+                    << "\n";
+                design = std::move(portfolioRouted);
+                rpt = portfolioRpt;
+                floorplannedDesign = std::move(portfolioSelectedSeed);
+                currentCerts.clear();
+            }
+            else {
+                cerr << "[FloorplanRouterFallback] retain warm-start\n";
+            }
+        }
+    }
+    else if (forcedBoundedShortcut && mediumBoundedCase &&
+        (rpt.hasFail() || totalPenalty(rpt) > 1.0)) {
+        cerr << fixed << setprecision(3)
+            << "[FloorplanRouterFallback] skip"
+            << " reason=deadline_guard"
+            << " remaining=" << failSafeRemainingSeconds()
+            << " checkpointOpen=" << checkpointRpt.openPathCount
+            << " checkpointCost=" << checkpointRpt.cost
+            << "\n";
+    }
+    checkpointIfBetter(design, rpt, "floorplan-selected");
+
+    // Hundreds of physical pairs make the generic repair portfolio multiply
+    // runtime dramatically. The dense path performs one bounded floorplan and
+    // one complete RouterLite pass, then emits the best result found.
+    if (forcedBoundedShortcut) {
+        design = checkpointDesign;
+        rpt = evaluator.evaluate(design, opt.alpha, programRuntimeSecondsMain());
+        const bool writeOk = writer.write(opt.outputPath, design);
+        if (!writeOk) {
+            cerr << "[OutputWriter] Failed to write cfg: " << opt.outputPath << "\n";
+            return 1;
+        }
+        router.printDetourReport(design);
+        Logger::printFinalReport(design, rpt, opt.alpha, opt.inputPath, opt.outputPath);
+        watchdogDone->store(true, memory_order_relaxed);
+        return rpt.hasFail() ? 2 : 0;
     }
 
 
@@ -3039,14 +4691,14 @@ int main(int argc, char** argv) {
     EvalReport bestRpt = rpt;
     vector<Router::FailureCertificate> bestCerts = currentCerts;
     if (!bestRpt.hasFail() && totalPenalty(bestRpt) <= 1.0) {
-        for (int detourIter = 0; detourIter < 5; ++detourIter) {
+        for (int detourIter = 0; detourIter < 5 && qualitySearchAllowed(3.0); ++detourIter) {
             vector<Design> detourSeeds;
             if (!makeDetourMoveCandidates(bestDesign, detourSeeds, 20)) break;
 
             bool haveDetour = false;
             Design bestDetourDesign;
             EvalReport bestDetourRpt;
-            for (int di = 0; di < static_cast<int>(detourSeeds.size()); ++di) {
+            for (int di = 0; di < static_cast<int>(detourSeeds.size()) && qualitySearchAllowed(3.0); ++di) {
                 EvalReport detourRpt;
                 Design detourTrial = bestRoutedCandidate(detourSeeds[di], detourRpt);
                 cerr << fixed << setprecision(3)
@@ -3092,7 +4744,7 @@ int main(int argc, char** argv) {
             });
 
         const int portfolioLimit = min(4, static_cast<int>(portfolio.size()));
-        for (int pi = 0; pi < portfolioLimit; ++pi) {
+        for (int pi = 0; pi < portfolioLimit && qualitySearchAllowed(3.0); ++pi) {
             RepairPortfolioItem& item = portfolio[pi];
             vector<Design> reliefSeeds;
             const bool made = makeCertificateReliefCandidates(item.routed, item.certs, reliefSeeds, 12);
@@ -3113,7 +4765,7 @@ int main(int argc, char** argv) {
             Design bestRepairDesign;
             EvalReport bestRepairRpt;
             vector<Router::FailureCertificate> bestRepairCerts;
-            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()); ++ri) {
+            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()) && qualitySearchAllowed(3.0); ++ri) {
                 EvalReport repairRpt;
                 vector<Router::FailureCertificate> repairCerts;
                 Design repairTrial = bestRoutedCandidate(reliefSeeds[ri], repairRpt, &repairCerts);
@@ -3158,7 +4810,7 @@ int main(int argc, char** argv) {
         << " fail=" << (bestRpt.hasFail() ? "Y" : "N")
         << " penalty=" << totalPenalty(bestRpt)
         << "\n";
-    for (int certReliefIter = 0; bestRpt.openPathCount > 0 && certReliefIter < 4; ++certReliefIter) {
+    for (int certReliefIter = 0; bestRpt.openPathCount > 0 && certReliefIter < 4 && qualitySearchAllowed(3.0); ++certReliefIter) {
         if (bestCerts.empty()) {
             cerr << "[CertificateRelief] skip reason=no_certificate open=" << bestRpt.openPathCount << "\n";
             break;
@@ -3171,7 +4823,7 @@ int main(int argc, char** argv) {
         EvalReport bestReliefRpt;
         vector<Router::FailureCertificate> bestReliefCerts;
 
-        for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()); ++ri) {
+        for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()) && qualitySearchAllowed(3.0); ++ri) {
             EvalReport reliefRpt;
             vector<Router::FailureCertificate> reliefCerts;
             Design reliefTrial = bestRoutedCandidate(reliefSeeds[ri], reliefRpt, &reliefCerts);
@@ -3206,7 +4858,7 @@ int main(int argc, char** argv) {
         rpt = bestRpt;
     }
 
-    for (int hotRepairIter = 0; hotRepairIter < 8; ++hotRepairIter) {
+    for (int hotRepairIter = 0; !isLargeDenseCase && hotRepairIter < 8 && qualitySearchAllowed(3.0); ++hotRepairIter) {
         bool tried = false;
         bool hasTrial = false;
         Design bestHotTrial;
@@ -3251,7 +4903,7 @@ int main(int argc, char** argv) {
     auto runFTFeedback = [&](const string& stage, int refloorplanSeedLimit) {
         bool improvedAny = false;
         const int ftResizeLimit = ftResizeIterationLimit(bestDesign);
-        for (int ftResizeIter = 0; ftResizeIter < ftResizeLimit; ++ftResizeIter) {
+        for (int ftResizeIter = 0; ftResizeIter < ftResizeLimit && qualitySearchAllowed(3.0); ++ftResizeIter) {
             bool triedFTFeedback = false;
             bool haveFTFeedback = false;
             Design bestFTDesign;
@@ -3313,7 +4965,7 @@ int main(int argc, char** argv) {
 
             vector<Design> refloorplanSeeds;
             if (stage == "pre" && makeFeedthroughReFloorplanCandidates(bestDesign, refloorplanSeeds, refloorplanSeedLimit, ftResizeIter == 0)) {
-                for (int fi = 0; fi < static_cast<int>(refloorplanSeeds.size()); ++fi) {
+                for (int fi = 0; fi < static_cast<int>(refloorplanSeeds.size()) && qualitySearchAllowed(3.0); ++fi) {
                     tryFTFeedbackSeed(refloorplanSeeds[fi], "refloorplan", fi);
                 }
             }
@@ -3353,7 +5005,7 @@ int main(int argc, char** argv) {
 
                     bool haveRoundBest = false;
                     RepairPortfolioItem roundBest;
-                    for (int ri = 0; ri < static_cast<int>(repairSeeds.size()); ++ri) {
+                    for (int ri = 0; ri < static_cast<int>(repairSeeds.size()) && qualitySearchAllowed(3.0); ++ri) {
                         EvalReport repairRpt;
                         vector<Router::FailureCertificate> repairCerts;
                         Design repairTrial = bestRoutedCandidate(repairSeeds[ri], repairRpt, &repairCerts);
@@ -3521,9 +5173,10 @@ int main(int argc, char** argv) {
         return improvedAny;
         };
 
-    runFTFeedback("pre", 8);
-    if (!bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
-        for (int reliefIter = 0; reliefIter < 4; ++reliefIter) {
+    if (!isLargeDenseCase && qualitySearchAllowed(3.0))
+        runFTFeedback("pre", 8);
+    if (!isLargeDenseCase && !bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
+        for (int reliefIter = 0; reliefIter < 4 && qualitySearchAllowed(3.0); ++reliefIter) {
             vector<Design> reliefSeeds;
             if (!makeCapacityReliefCandidates(bestDesign, reliefSeeds, 10)) break;
 
@@ -3531,7 +5184,7 @@ int main(int argc, char** argv) {
             Design bestReliefDesign;
             EvalReport bestReliefRpt;
 
-            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()); ++ri) {
+            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()) && qualitySearchAllowed(3.0); ++ri) {
                 EvalReport reliefRpt;
                 Design reliefTrial = bestRoutedCandidate(reliefSeeds[ri], reliefRpt);
                 cerr << fixed << setprecision(3)
@@ -3567,7 +5220,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!bestRpt.hasFail() && deadspaceRatioMain(bestDesign) > 0.35) {
+    if (!isLargeDenseCase && !bestRpt.hasFail() && deadspaceRatioMain(bestDesign) > 0.35) {
         const bool largeDeadspaceTrimCase = bestDesign.blocks.size() >= 20;
         vector<pair<double, double>> shrinkFractions;
         vector<vector<pair<double, double>>> largeDeadspaceShrinkSchedule;
@@ -3663,7 +5316,7 @@ int main(int argc, char** argv) {
             return a.totalWireLength < b.totalWireLength;
         };
         const int trimPassLimit = largeDeadspaceTrimCase ? static_cast<int>(largeDeadspaceShrinkSchedule.size()) : 8;
-        for (int trimPass = 0; trimPass < trimPassLimit; ++trimPass) {
+        for (int trimPass = 0; trimPass < trimPassLimit && qualitySearchAllowed(3.0); ++trimPass) {
             bool improved = false;
             Design bestTrimDesign;
             EvalReport bestTrimRpt;
@@ -3675,11 +5328,8 @@ int main(int argc, char** argv) {
                 Design candidate = bestDesign;
                 const double shrinkW = candidate.outlineW * sf.first;
                 const double shrinkH = candidate.outlineH * sf.second;
-                bool trimGeometryOk = tryEdgeOnlyOutlineTrimMain(candidate, shrinkW, shrinkH);
-                if (!trimGeometryOk) {
-                    candidate = bestDesign;
-                    trimGeometryOk = tryGravityOutlineTrimMain(candidate, shrinkW, shrinkH);
-                }
+                const bool trimGeometryOk =
+                    tryGravityOutlineTrimMain(candidate, shrinkW, shrinkH);
                 if (!trimGeometryOk) {
                     cerr << fixed << setprecision(3)
                         << "[DeadspaceTrim] skipGeometry pass=" << trimPass
@@ -3693,7 +5343,7 @@ int main(int argc, char** argv) {
                 Design routed = bestRoutedCandidate(candidate, trimRpt);
 
                 if (!largeDeadspaceTrimCase && !trimRpt.hasFail() && totalPenalty(trimRpt) <= trimPenaltyBudget + 2500.0) {
-                    for (int trimRepairIter = 0; trimRepairIter < 2; ++trimRepairIter) {
+                    for (int trimRepairIter = 0; trimRepairIter < 2 && qualitySearchAllowed(3.0); ++trimRepairIter) {
                         bool haveRepair = false;
                         Design bestRepairDesign;
                         EvalReport bestRepairRpt;
@@ -3756,8 +5406,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
-        for (int reliefIter = 0; reliefIter < 3; ++reliefIter) {
+    if (!isLargeDenseCase && !bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
+        for (int reliefIter = 0; reliefIter < 3 && qualitySearchAllowed(3.0); ++reliefIter) {
             vector<Design> reliefSeeds;
             if (!makeCapacityReliefCandidates(bestDesign, reliefSeeds, 8)) break;
 
@@ -3765,7 +5415,7 @@ int main(int argc, char** argv) {
             Design bestReliefDesign;
             EvalReport bestReliefRpt;
 
-            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()); ++ri) {
+            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()) && qualitySearchAllowed(3.0); ++ri) {
                 EvalReport reliefRpt;
                 Design reliefTrial = bestRoutedCandidate(reliefSeeds[ri], reliefRpt);
                 cerr << fixed << setprecision(3)
@@ -3803,7 +5453,7 @@ int main(int argc, char** argv) {
     }
     const bool enableCommonEdgeSnapPost = true;
     if (enableCommonEdgeSnapPost && !bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
-        for (int snapIter = 0; snapIter < 1; ++snapIter) {
+        for (int snapIter = 0; snapIter < 1 && qualitySearchAllowed(3.0); ++snapIter) {
             vector<Design> snapSeeds;
             if (!makeCommonEdgeSnapCandidates(bestDesign, snapSeeds, 3)) break;
 
@@ -3811,7 +5461,7 @@ int main(int argc, char** argv) {
             Design bestSnapDesign;
             EvalReport bestSnapRpt;
 
-            for (int si = 0; si < static_cast<int>(snapSeeds.size()); ++si) {
+            for (int si = 0; si < static_cast<int>(snapSeeds.size()) && qualitySearchAllowed(3.0); ++si) {
                 EvalReport snapRpt;
                 Design snapTrial = bestRoutedCandidate(snapSeeds[si], snapRpt);
                 cerr << fixed << setprecision(3)
@@ -3846,8 +5496,8 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
-        for (int reliefIter = 0; reliefIter < 2; ++reliefIter) {
+    if (!isLargeDenseCase && !bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
+        for (int reliefIter = 0; reliefIter < 2 && qualitySearchAllowed(3.0); ++reliefIter) {
             vector<Design> reliefSeeds;
             if (!makeCapacityReliefCandidates(bestDesign, reliefSeeds, 8)) break;
 
@@ -3855,7 +5505,7 @@ int main(int argc, char** argv) {
             Design bestReliefDesign;
             EvalReport bestReliefRpt;
 
-            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()); ++ri) {
+            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()) && qualitySearchAllowed(3.0); ++ri) {
                 EvalReport reliefRpt;
                 Design reliefTrial = bestRoutedCandidate(reliefSeeds[ri], reliefRpt);
                 cerr << fixed << setprecision(3)
@@ -3891,7 +5541,7 @@ int main(int argc, char** argv) {
             rpt = bestRpt;
         }
     }
-    if (!bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
+    if (!isLargeDenseCase && !bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0 && qualitySearchAllowed(3.0)) {
         runFTFeedback("post-snap", 6);
     }
     auto betterThinAlignment = [&](const EvalReport& a, const Design& ad, const EvalReport& b, const Design& bd) {
@@ -3914,7 +5564,7 @@ int main(int argc, char** argv) {
         const bool enableThinChannelAlign = alignBlockCount <= 14 && bestDesign.connections.size() >= 50;
         const int alignIterLimit = enableThinChannelAlign ? 1 : 0;
         const int alignCandidateLimit = enableThinChannelAlign ? 8 : 0;
-        for (int alignIter = 0; alignIter < alignIterLimit; ++alignIter) {
+        for (int alignIter = 0; alignIter < alignIterLimit && qualitySearchAllowed(3.0); ++alignIter) {
             vector<Design> alignSeeds;
             if (!makeThinChannelAlignmentCandidates(bestDesign, alignSeeds, alignCandidateLimit)) break;
 
@@ -3924,7 +5574,7 @@ int main(int argc, char** argv) {
             const double basePenalty = totalPenalty(bestRpt);
             const double alignPenaltyBudget = basePenalty <= 1.0 ? 0.0 : basePenalty + max(50.0, 0.05 * basePenalty);
 
-            for (int ai = 0; ai < static_cast<int>(alignSeeds.size()); ++ai) {
+            for (int ai = 0; ai < static_cast<int>(alignSeeds.size()) && qualitySearchAllowed(3.0); ++ai) {
                 EvalReport alignRpt;
                 Design alignTrial = bestRoutedCandidate(alignSeeds[ai], alignRpt);
                 const double alignPenalty = totalPenalty(alignRpt);
@@ -3985,7 +5635,7 @@ int main(int argc, char** argv) {
         return routedStructureScoreMain(ad) + 1.0 < routedStructureScoreMain(bd);
         };
 
-    if (!bestRpt.hasFail() && deadspaceRatioMain(bestDesign) > 0.28) {
+    if (!isLargeDenseCase && !bestRpt.hasFail() && deadspaceRatioMain(bestDesign) > 0.28) {
         vector<pair<double, double>> utilShrinkFractions = {
             { 0.0000, 0.0050 },
             { 0.0000, 0.0010 },
@@ -4014,7 +5664,7 @@ int main(int argc, char** argv) {
         const int utilBlockCount = static_cast<int>(bestDesign.blocks.size());
         const bool largeUtilCase = utilBlockCount >= 20;
         const int utilIterLimit = largeUtilCase ? static_cast<int>(largeUtilShrinkSchedule.size()) : 6;
-        for (int utilIter = 0; utilIter < utilIterLimit; ++utilIter) {
+        for (int utilIter = 0; utilIter < utilIterLimit && qualitySearchAllowed(3.0); ++utilIter) {
             bool haveUtil = false;
             Design bestUtilDesign;
             EvalReport bestUtilRpt;
@@ -4026,7 +5676,7 @@ int main(int argc, char** argv) {
                 Design candidate = bestDesign;
                 const double shrinkW = candidate.outlineW * sf.first;
                 const double shrinkH = candidate.outlineH * sf.second;
-                if (!tryEdgeOnlyOutlineTrimMain(candidate, shrinkW, shrinkH)) continue;
+                if (!tryGravityOutlineTrimMain(candidate, shrinkW, shrinkH)) continue;
 
                 EvalReport utilRpt;
                 Design utilTrial = bestRoutedCandidate(candidate, utilRpt);
@@ -4088,8 +5738,8 @@ int main(int argc, char** argv) {
             rpt = bestRpt;
         }
     }
-    if (!bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
-        for (int reliefIter = 0; reliefIter < 4; ++reliefIter) {
+    if (!isLargeDenseCase && !bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
+        for (int reliefIter = 0; reliefIter < 4 && qualitySearchAllowed(3.0); ++reliefIter) {
             vector<Design> reliefSeeds;
             if (!makeCapacityReliefCandidates(bestDesign, reliefSeeds, 12)) break;
 
@@ -4098,7 +5748,7 @@ int main(int argc, char** argv) {
             EvalReport bestReliefRpt;
 
 
-            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()); ++ri) {
+            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()) && qualitySearchAllowed(3.0); ++ri) {
                 EvalReport reliefRpt;
                 Design reliefTrial = bestRoutedCandidate(reliefSeeds[ri], reliefRpt);
                 cerr << fixed << setprecision(3)
@@ -4135,7 +5785,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
+    if (!isLargeDenseCase && !bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0 && qualitySearchAllowed(3.0)) {
         runFTFeedback("post-final-capacity", 6);
     }
     if (bestRpt.openPathCount > 0) {
@@ -4151,7 +5801,7 @@ int main(int argc, char** argv) {
             bestCerts = finalCerts;
         }
 
-        for (int certReliefIter = 0; bestRpt.openPathCount > 0 && certReliefIter < 4; ++certReliefIter) {
+        for (int certReliefIter = 0; bestRpt.openPathCount > 0 && certReliefIter < 4 && qualitySearchAllowed(3.0); ++certReliefIter) {
             if (bestCerts.empty()) {
                 cerr << "[FinalCertificateRelief] skip reason=no_certificate open=" << bestRpt.openPathCount << "\n";
                 break;
@@ -4193,7 +5843,7 @@ int main(int argc, char** argv) {
             Design bestReliefDesign;
             EvalReport bestReliefRpt;
             vector<Router::FailureCertificate> bestReliefCerts;
-            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()); ++ri) {
+            for (int ri = 0; ri < static_cast<int>(reliefSeeds.size()) && qualitySearchAllowed(3.0); ++ri) {
                 EvalReport reliefRpt;
                 vector<Router::FailureCertificate> reliefCerts;
                 Design reliefTrial = bestRoutedCandidate(reliefSeeds[ri], reliefRpt, &reliefCerts);
@@ -4228,13 +5878,18 @@ int main(int argc, char** argv) {
     }
 
 
-    if (!bestRpt.hasFail()) {
+    if (improveWithFourSidePerimeter(bestDesign, bestRpt, "final")) {
+        design = bestDesign;
+        rpt = bestRpt;
+    }
+
+    if (!bestRpt.hasFail() && !bestDesign.hasRoutingCore) {
         vector<Design> tightSeeds;
         if (makeTightOutlineCandidatesMain(bestDesign, tightSeeds, 8)) {
             bool haveTight = false;
             Design bestTightDesign;
             EvalReport bestTightRpt;
-            for (int ti = 0; ti < static_cast<int>(tightSeeds.size()); ++ti) {
+            for (int ti = 0; ti < static_cast<int>(tightSeeds.size()) && qualitySearchAllowed(3.0); ++ti) {
                 EvalReport tightRpt;
                 Design tightTrial = bestRoutedCandidate(tightSeeds[ti], tightRpt);
                 cerr << fixed << setprecision(3)
@@ -4267,7 +5922,7 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!bestRpt.hasFail()) {
+    if (!isLargeDenseCase && !bestRpt.hasFail() && qualitySearchAllowed(3.0)) {
         EvalReport finalRerouteRpt;
         Design finalReroute = bestRoutedCandidate(bestDesign, finalRerouteRpt);
         cerr << fixed << setprecision(3)
@@ -4289,11 +5944,13 @@ int main(int argc, char** argv) {
         }
     }
 
-    if (!bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0) {
+    if (!isLargeDenseCase && !bestRpt.hasFail() && totalPenalty(bestRpt) > 1.0 && qualitySearchAllowed(3.0)) {
         runFTFeedback("final", 6);
     }
     // Disabled: final quality must come from floorplan/router search, not known-case cfg portfolio.
     design = bestDesign;
+    checkpointIfBetter(design, bestRpt, "final-best");
+    design = checkpointDesign;
     rpt = evaluator.evaluate(design, opt.alpha, programRuntimeSecondsMain());
     bool writeOk = writer.write(opt.outputPath, design);
     if (!writeOk) {
@@ -4304,6 +5961,7 @@ int main(int argc, char** argv) {
     router.printDetourReport(design);
     Logger::printFinalReport(design, rpt, opt.alpha, opt.inputPath, opt.outputPath);
 
+    watchdogDone->store(true, memory_order_relaxed);
     if (rpt.hasFail()) return 2;
     return 0;
 }

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <set>
 #include <unordered_map>
 
@@ -295,13 +296,22 @@ vector<double> Parser::parsePercentRatesFromColumns(const vector<string>& row, i
     vector<double> rates;
     if (startCol < 0) return rates;
 
-    for (int i = startCol; i < static_cast<int>(row.size()) && rates.size() < 4; ++i) {
-        string t = trim(row[i]);
-        if (t.empty()) continue;
-
+    // FT conversion is positional.  In the Beta case6/case7 files an empty
+    // first bucket is a real 0-rate bucket; later percentages must not slide
+    // left to fill it. Read exactly the four declared bucket columns.
+    rates.reserve(4);
+    for (int offset = 0; offset < 4; ++offset) {
+        const int i = startCol + offset;
         double v = 0.0;
-        if (!tryParseDouble(t, v)) continue;
-        if (t.find('%') != string::npos || v > 1.0) v /= 100.0;
+        if (i < static_cast<int>(row.size())) {
+            const string t = trim(row[i]);
+            if (tryParseDouble(t, v)) {
+                if (t.find('%') != string::npos || v > 1.0) v /= 100.0;
+            }
+            else {
+                v = 0.0;
+            }
+        }
         rates.push_back(v);
     }
 
@@ -548,50 +558,42 @@ void Parser::parseConnectionMatrix(const vector<vector<string>>& rows, Design& d
             }
         }
     }
+
+    // Official Q&A Q44: connectivity-matrix diagonal entries are testcase
+    // errors, not routable demand.  Zero them once so RouterX, Evaluator and
+    // floorplanner-side demand accounting all see the same model.
+    int zeroedDiagonal = 0;
+    long long zeroedNets = 0;
+    for (int i = 0; i < n && i < static_cast<int>(design.connMatrix.size()); ++i) {
+        if (i >= static_cast<int>(design.connMatrix[i].size())) continue;
+        if (design.connMatrix[i][i] > 0) {
+            ++zeroedDiagonal;
+            zeroedNets += design.connMatrix[i][i];
+            design.connMatrix[i][i] = 0;
+        }
+    }
+    if (zeroedDiagonal > 0) {
+        cerr << "[Parser] zeroed " << zeroedDiagonal
+             << " self-connection(s) totalling " << zeroedNets
+             << " nets (matrix diagonal is not demand; Q&A Q44)\n";
+    }
 }
 
 void Parser::buildConnections(Design& design) {
     design.connections.clear();
-    int n = static_cast<int>(design.connMatrix.size());
-    int pairCount = 0;
-    int symmetricPairCount = 0;
+    const int n = min(static_cast<int>(design.blockSpecs.size()),
+                      static_cast<int>(design.connMatrix.size()));
     for (int i = 0; i < n; ++i) {
-        for (int j = i + 1; j < static_cast<int>(design.connMatrix[i].size()); ++j) {
-            int fwd = max(0, design.connMatrix[i][j]);
-            int rev = 0;
-            if (j < static_cast<int>(design.connMatrix.size()) &&
-                i < static_cast<int>(design.connMatrix[j].size())) {
-                rev = max(0, design.connMatrix[j][i]);
-            }
-            if (fwd > 0 || rev > 0) {
-                ++pairCount;
-                if (fwd > 0 && rev > 0) ++symmetricPairCount;
-            }
-        }
-    }
-
-    const bool mostlySymmetric =
-        pairCount > 0 &&
-        symmetricPairCount * 100 >= pairCount * 65;
-
-    if (mostlySymmetric) {
-        for (int i = 0; i < n; ++i) {
-            for (int j = i + 1; j < static_cast<int>(design.connMatrix[i].size()); ++j) {
-                int nets = max(0, design.connMatrix[i][j]);
-                if (j < static_cast<int>(design.connMatrix.size()) &&
-                    i < static_cast<int>(design.connMatrix[j].size())) {
-                    nets += max(0, design.connMatrix[j][i]);
-                }
-                if (nets > 0) design.connections.push_back({ i, j, nets });
-            }
-        }
-        return;
-    }
-
-    for (int i = 0; i < n; ++i) {
-        for (int j = 0; j < static_cast<int>(design.connMatrix[i].size()); ++j) {
-            int nets = design.connMatrix[i][j];
-            if (nets > 0) design.connections.push_back({ i, j, nets });
+        for (int j = i + 1; j < n; ++j) {
+            long long nets = 0;
+            if (j < static_cast<int>(design.connMatrix[i].size()))
+                nets += max(0, design.connMatrix[i][j]);
+            if (i < static_cast<int>(design.connMatrix[j].size()))
+                nets += max(0, design.connMatrix[j][i]);
+            if (nets <= 0) continue;
+            design.connections.push_back({
+                i, j, static_cast<int>(min<long long>(nets, numeric_limits<int>::max()))
+            });
         }
     }
 }

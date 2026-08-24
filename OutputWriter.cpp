@@ -1,17 +1,28 @@
 #include "OutputWriter.hpp"
 
 #include <cmath>
+#include <cstdio>
 #include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <string>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 using namespace std;
 
 namespace {
 
-    // ÃD¥Ø½d¨Ò¬O¾ã¼Æ´N¿é¥X¾ã¼Æ¡A¤p¼Æ¤~¿é¥X¤p¼Æ¡C
-    // ¨Ò¦p¡G800.000 -> 800, 300.500 -> 300.5
+    // é¡Œç›®ç¯„ä¾‹æ˜¯æ•´æ•¸å°±è¼¸å‡ºæ•´æ•¸ï¼Œå°æ•¸æ‰è¼¸å‡ºå°æ•¸ã€‚
+    // ä¾‹å¦‚ï¼š800.000 -> 800, 300.500 -> 300.5
     string fmt(double v) {
         if (fabs(v) < 1e-9) v = 0.0;
         double rounded = round(v);
@@ -31,10 +42,14 @@ namespace {
 } // namespace
 
 bool OutputWriter::write(const string& outputPath, const Design& design) {
-    ofstream fout(outputPath);
+    // Always keep the previous complete checkpoint intact while serializing the
+    // next one.  The final rename/replace is atomic, so an external timeout can
+    // never leave a half-written official cfg in outputPath.
+    const string tempPath = outputPath + ".tmp";
+    ofstream fout(tempPath, ios::binary | ios::trunc);
     if (!fout) return false;
 
-    // ÃD¥Ø cfg ®æ¦¡¡G
+    // é¡Œç›® cfg æ ¼å¼ï¼š
     //
     // Outline <width> <height>
     //
@@ -66,11 +81,32 @@ bool OutputWriter::write(const string& outputPath, const Design& design) {
 
     writePaths(fout, design);
 
+    fout.flush();
+    if (!fout) {
+        fout.close();
+        std::remove(tempPath.c_str());
+        return false;
+    }
+    fout.close();
+
+#ifdef _WIN32
+    if (!MoveFileExA(tempPath.c_str(), outputPath.c_str(),
+        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        std::remove(tempPath.c_str());
+        return false;
+    }
+#else
+    if (std::rename(tempPath.c_str(), outputPath.c_str()) != 0) {
+        std::remove(tempPath.c_str());
+        return false;
+    }
+#endif
+
     return true;
 }
 
 void OutputWriter::writeOutline(ostream& os, const Design& design) const {
-    // ª`·N¡GÃD¥Ø½d¨Ò Outline ¬O³æ¦æ¡A¨S¦³ END Outline¡C
+    // æ³¨æ„ï¼šé¡Œç›®ç¯„ä¾‹ Outline æ˜¯å–®è¡Œï¼Œæ²’æœ‰ END Outlineã€‚
     os << "Outline "
         << fmt(design.outlineW) << " "
         << fmt(design.outlineH) << "\n";

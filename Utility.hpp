@@ -20,6 +20,9 @@ bool containsToken(const std::vector<std::string>& row, const std::string& token
 int firstNonEmptyIndex(const std::vector<std::string>& row);
 std::string firstNonEmptyCell(const std::vector<std::string>& row);
 int edgeOpposite(int e);
+bool isPortEdgeAllowed(const BlockInst& block, int edge,
+                       double outlineW, double outlineH,
+                       double eps = 1.0e-3);
 double feedthroughRateForNets(const BlockSpec& spec, double ftNets);
 double requiredSoftAreaWithFeedthrough(const BlockInst& b, double ftNets);
 double requiredSoftAreaWithFeedthrough(const BlockInst& b);
